@@ -84,9 +84,11 @@ DEL name
 - Advanced data structures
 - Redis-inspired optimizations
 - C implementation after architecture validation
-🤝 Contributing
+  
+# 🤝 Contributing
 This is primarily a personal learning project, but ideas, suggestions, and improvements are welcome.
+
 📌 Author
 V SS Karthik
-Quote
-“Built to understand systems, not just use them.”
+  
+"Built to understand systems, not just use them.”
