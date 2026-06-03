@@ -17,6 +17,7 @@ class CommandHandler:
             "TTL": self._handle_ttl,
             "FLUSHALL": self._handle_flushall,
             "SAVE": self._handle_save,
+            "COMPACT": self._handle_compact,
         }
 
     def execute(self, tokens: list[str]) -> str:
@@ -103,3 +104,13 @@ class CommandHandler:
             return "(error) ERR wrong number of arguments for 'SAVE' command"
         success = self.store.save()
         return "OK" if success else "(error) ERR failed to save data"
+
+    def _handle_compact(self, tokens: list[str]) -> str:
+        if len(tokens) > 1:
+            return "-ERR wrong number of arguments for 'compact' command"
+
+        success = self.store.compact_aof()
+        if success:
+            return "+OK AOF log compacted successfully"
+        else:
+            return "-ERR Failed to compact AOF log"
