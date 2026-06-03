@@ -223,3 +223,62 @@ class KedisStore:
                 f"\n✅ Recovery complete. Memory currently holds {len(self._data)} keys."
             )
             print("=" * 40 + "\n")
+
+    def compact_aof(self):
+        """
+        Compacts the AOF size down to only active and living keys
+        """
+
+        temp_file = f"temp_{self.aof_filename}"
+
+        try:
+            with open(temp_file, "w") as f:
+                for key, value in self._data.items():
+                    f.write(f"SET {key} {value}\n")
+
+                if hasattr(self, "_expires"):
+                    current_time = time.time()
+                    for key, exp_time in self._expires.items():
+                        ttl = int(exp_time - current_time)
+                        if ttl > 0:
+                            f.write(f"EXPIRE {key} {ttl}\n")
+
+            # -----------------------------------
+            # The OS Routing Fork
+            # -----------------------------------
+            if os.name == "nt":
+                # Windows DriveTrain: Explicit Close, delete and rename required
+                if hasattr(self, "aof_file") and not self.aof_file.closed:
+                    self.aof_file.close()
+
+                # Micro-pausing to let the OS-Level file lock fully clear
+                time.sleep(0.1)
+
+                if os.path.exists(self.aof_filename):
+                    os.remove(self.aof_filename)
+
+                os.rename(temp_file, self.aof_filename)
+
+                self.aof_file = open(self.aof_filename, "a")
+
+            else:
+                # Linux / UNIX drivetrain: Atomic OS-Level Hotswap
+                os.replace(temp_file, self.aof_filename)
+
+                # Refresh the file pointer so it writes to the new file, not the ghost inode
+                if hasattr(self, "file") and not self.file.closed:
+                    self.file.close()
+                self.file = open(self.aof_filename, "a")
+
+            return True
+
+        except Exception as e:
+            # Clean the wrekage if crashed mid build
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+            if hasattr(self, "file") and self.file.closed:
+                self.file = open(self.aof_filename, "a")
+
+            print(f"Compaction failed: {e}")
+            return False
