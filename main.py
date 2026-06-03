@@ -27,7 +27,7 @@ def main():
         Panel.fit(
             f"[bold cyan]{logo}[/bold cyan]"
             "\n[yellow]Codename: Echo[/yellow]"
-            "\n[green]Version: 0.1.0[/green]",
+            "\n[green]Version: 0.2.0[/green]",
             title="Database Client",
             border_style="cyan",
         )
@@ -180,8 +180,10 @@ def main():
                 console.print(f"🔧 Diagnostic telemetry is now {status}")
                 continue
 
+            # ----------------------------------------------------
+            # Upgraded Telemetry Panels
+            # ----------------------------------------------------
             if cmd == "MODE":
-                # Check current debug state
                 current_debug = (
                     getattr(store, "debug_mode", False) if local_mode else debug_mode
                 )
@@ -197,25 +199,117 @@ def main():
                     )
                     key_count = len(store._data) if store else 0
 
-                    console.print(
-                        "\n[bold purple]Kedis Status[/bold purple]\n"
-                        "[dim]────────────[/dim]\n"
+                    mode_text = (
                         f"Mode:            [purple]Standalone[/purple]\n"
                         f"Persistence:     [yellow]Local Disk[/yellow]\n"
                         f"Reconnect Radar: {radar_status}\n"
                         f"Debug:           {debug_status}\n"
-                        f"Keys Loaded:     [cyan]{key_count}[/cyan]\n"
+                        f"Keys Loaded:     [cyan]{key_count}[/cyan]"
+                    )
+                    console.print(
+                        Panel(
+                            mode_text,
+                            title="[bold purple]Kedis Status[/bold purple]",
+                            border_style="purple",
+                            expand=False,
+                        )
                     )
                 else:
-                    console.print(
-                        "\n[bold blue]Kedis Status[/bold blue]\n"
-                        "[dim]────────────[/dim]\n"
+                    mode_text = (
                         f"Mode:       [blue]TCP[/blue]\n"
                         f"Host:       [cyan]{HOST}[/cyan]\n"
                         f"Port:       [cyan]{PORT}[/cyan]\n"
                         f"Connection: [green]Active[/green]\n"
-                        f"Debug:      {debug_status}\n"
+                        f"Debug:      {debug_status}"
                     )
+                    console.print(
+                        Panel(
+                            mode_text,
+                            title="[bold blue]Kedis Status[/bold blue]",
+                            border_style="blue",
+                            expand=False,
+                        )
+                    )
+                continue
+
+            if cmd == "INFO":
+                version = "0.2.0"
+                codename = "Echo"
+
+                if local_mode:
+                    key_count = len(getattr(store, "_data", {})) if store else 0
+                    exp_count = len(getattr(store, "_expires", {})) if store else 0
+                    aof_file = getattr(store, "aof_filename", "kedis.aof")
+                    aof_size = (
+                        f"{os.path.getsize(aof_file) / 1024:.1f} KB"
+                        if os.path.exists(aof_file)
+                        else "0.0 KB"
+                    )
+
+                    persistence = "AOF"
+                    current_mode = "Standalone"
+                else:
+                    key_count = "N/A (Server)"
+                    exp_count = "N/A (Server)"
+                    aof_size = "N/A (Server)"
+
+                    persistence = "TCP Stream"
+                    current_mode = "TCP"
+
+                current_debug = (
+                    getattr(store, "debug_mode", False) if local_mode else debug_mode
+                )
+                debug_status = (
+                    "[bold green]ON[/bold green]" if current_debug else "[dim]OFF[/dim]"
+                )
+
+                info_text = (
+                    f"Version        : [green]{version}[/green]\n"
+                    f"Codename       : [yellow]{codename}[/yellow]\n\n"
+                    f"Keys           : [cyan]{key_count}[/cyan]\n"
+                    f"Expiring Keys  : [cyan]{exp_count}[/cyan]\n\n"
+                    f"Persistence    : [yellow]{persistence}[/yellow]\n"
+                    f"AOF Size       : [magenta]{aof_size}[/magenta]\n\n"
+                    f"Mode           : [purple]{current_mode}[/purple]\n"
+                    f"Debug          : {debug_status}"
+                )
+                console.print(
+                    Panel(
+                        info_text,
+                        title="[bold blue]Kedis Information[/bold blue]",
+                        border_style="blue",
+                        expand=False,
+                    )
+                )
+                continue
+
+            if cmd == "HELP":
+                help_text = (
+                    "[bold cyan]Engine Commands (Database)[/bold cyan]\n"
+                    "  [green]SET[/green] key value      : Store a string value\n"
+                    "  [green]GET[/green] key            : Retrieve a value\n"
+                    "  [green]DELETE[/green] key         : Remove a key\n"
+                    "  [green]EXPIRE[/green] key seconds : Set a time-to-live (TTL)\n"
+                    "  [green]TTL[/green] key            : Check remaining lifespan\n"
+                    "  [green]FLUSHALL[/green]          : Wipe the entire database\n\n"
+                    "[bold purple]Client Commands (Dashboard)[/bold purple]\n"
+                    "  [yellow]COMPACT[/yellow]            : Compress the AOF log file\n"
+                    "  [yellow]MODE[/yellow]               : View current drivetrain (TCP/Local)\n"
+                    "  [yellow]INFO[/yellow]               : View engine telemetry and version\n"
+                    "  [yellow]HELP[/yellow]               : Show this command reference\n"
+                    "  [yellow]DEBUG[/yellow]              : Toggle diagnostic logs\n"
+                    "  [yellow]RECONNECT[/yellow]          : Manually reconnect to TCP server\n"
+                    "  [yellow]CLEAR / CLS[/yellow]        : Clear the terminal screen\n"
+                    "  [yellow]EXIT / QUIT[/yellow]        : Shut down the client\n"
+                )
+                console.print(
+                    Panel(
+                        help_text,
+                        title="[bold yellow]Kedis Command Reference[/bold yellow]",
+                        border_style="yellow",
+                        expand=False,
+                    )
+                )
                 continue
 
             if cmd == "RECONNECT":
@@ -264,7 +358,29 @@ def main():
                     continue
 
                 response = handler.execute(tokens)
-                console.print(response)
+
+                # --- NEW COMPACT PANEL INTERCEPTOR ---
+                if cmd == "COMPACT":
+                    if "+OK" in response:
+                        console.print(
+                            Panel(
+                                f"[bold green]Compaction Successful[/bold green]\n{response}",
+                                title="🧹 AOF Cleaner",
+                                border_style="green",
+                                expand=False,
+                            )
+                        )
+                    else:
+                        console.print(
+                            Panel(
+                                f"[bold red]Compaction Failed[/bold red]\n{response}",
+                                title="❌ Error",
+                                border_style="red",
+                                expand=False,
+                            )
+                        )
+                else:
+                    console.print(response)
 
             else:
                 # TCP MODE
@@ -275,15 +391,45 @@ def main():
                     if not data:
                         raise OSError("Server silently dropped connection")
 
-                    console.print(data.decode("utf-8").strip())
+                    response = data.decode("utf-8").strip()
+
+                    # --- NEW COMPACT PANEL INTERCEPTOR ---
+                    if cmd == "COMPACT":
+                        if "+OK" in response:
+                            console.print(
+                                Panel(
+                                    f"[bold green]Compaction Successful[/bold green]\n{response}",
+                                    title="🧹 AOF Cleaner",
+                                    border_style="green",
+                                    expand=False,
+                                )
+                            )
+                        else:
+                            console.print(
+                                Panel(
+                                    f"[bold red]Compaction Failed[/bold red]\n{response}",
+                                    title="❌ Error",
+                                    border_style="red",
+                                    expand=False,
+                                )
+                            )
+                    else:
+                        console.print(response)
 
                 except OSError:
                     # THE MID-SESSION HOT-SWAP CONSENT CHECK
-                    console.print(
-                        "\n[bold yellow]⚠️ FATAL: TCP Link Severed Mid-Session![/bold yellow]"
+                    crash_text = (
+                        "[bold yellow]⚠️ FATAL: TCP Link Severed Mid-Session![/bold yellow]\n\n"
+                        "[white]Do you want to engage emergency hot-swap to the Local Engine?[/white]\n"
+                        "[dim](Data saved here will not sync to the server)[/dim]"
                     )
                     console.print(
-                        "[white]Do you want to engage emergency hot-swap to the Local Engine?[/white]\n[dim](Data saved here will not sync to the server)[/dim]"
+                        Panel(
+                            crash_text,
+                            title="🚨 Connection Lost",
+                            border_style="red",
+                            expand=False,
+                        )
                     )
 
                     choice = (
@@ -306,12 +452,20 @@ def main():
                     handler = CommandHandler(store)
                     store.debug_mode = debug_mode
 
-                    console.print(
-                        "\n[green]✓ Local Engine Hot-Swapped Successfully[/green]"
+                    # Added a sleek success panel for the hot-swap completion
+                    success_text = (
+                        "[green]✓ Local Engine Hot-Swapped Successfully[/green]\n"
+                        f"[cyan]Loaded {len(store._data)} keys from local persistence.[/cyan]"
                     )
                     console.print(
-                        f"[cyan]Loaded {len(store._data)} keys from local persistence.[/cyan]\n"
+                        Panel(
+                            success_text,
+                            title="🔧 Emergency Override",
+                            border_style="green",
+                            expand=False,
+                        )
                     )
+                    print()  # Blank line for spacing
                     continue
 
         except KeyboardInterrupt:
