@@ -64,10 +64,11 @@ python main.py
 
 
 # 💡 Example Usage
-SET name Karthik
-GET name
-EXISTS name
-DEL name
+
+- SET name Karthik
+- GET name
+- EXISTS name
+- DEL name
 
 
 # 🎯 Learning Goals
