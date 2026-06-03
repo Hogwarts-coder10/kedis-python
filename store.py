@@ -237,11 +237,9 @@ class KedisStore:
                     f.write(f"SET {key} {value}\n")
 
                 if hasattr(self, "_expires"):
-                    current_time = time.time()
                     for key, exp_time in self._expires.items():
-                        ttl = int(exp_time - current_time)
-                        if ttl > 0:
-                            f.write(f"EXPIRE {key} {ttl}\n")
+                    if exp_time > time.time():
+                        f.write(f"EXPIREAT {key} {exp_time}\n")
 
             # -----------------------------------
             # The OS Routing Fork
