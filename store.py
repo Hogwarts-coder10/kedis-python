@@ -266,9 +266,9 @@ class KedisStore:
                 os.replace(temp_file, self.aof_filename)
 
                 # Refresh the file pointer so it writes to the new file, not the ghost inode
-                if hasattr(self, "file") and not self.file.closed:
-                    self.file.close()
-                self.file = open(self.aof_filename, "a")
+                if hasattr(self, "aof_file") and not self.aof_file.closed:
+                    self.aof_file.close()
+                self.aof_file = open(self.aof_filename, "a")
 
             return True
 
