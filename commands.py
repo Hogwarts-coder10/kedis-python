@@ -18,6 +18,17 @@ class CommandHandler:
             "FLUSHALL": self._handle_flushall,
             "SAVE": self._handle_save,
             "COMPACT": self._handle_compact,
+            "LPUSH": self._handle_lpush,
+            "LRANGE": self._handle_lrange,
+            "RPUSH": self._handle_rpush,
+            "LPOP": self._handle_lpop,
+            "RPOP": self._handle_rpop,
+            "SADD": self._handle_sadd,
+            "SMEMBERS": self._handle_smembers,
+            "SREM": self._handle_srem,
+            "HSET": self._handle_hset,
+            "HGET": self._handle_hget,
+            "HGETALL": self._handle_hgetall,
         }
 
     def execute(self, tokens: list[str]) -> str:
@@ -78,13 +89,17 @@ class CommandHandler:
     def _handle_keys(self, tokens: list[str]) -> str:
         if len(tokens) != 1:
             return "(error) ERR wrong number of arguments for 'KEYS' command"
+
         all_keys = self.store.keys()
 
         if not all_keys:
             return "(empty array)"
 
-        # Refactored to a clean list comprehension
-        response_lines = [f'{i}) "{key}"' for i, key in enumerate(all_keys, 1)]
+        # Formats output securely: 1) "user" | hash | -1 | 3
+        response_lines = [
+            f'{i}) "{k}" | {data["type"]} | {data["ttl"]} | {data["length"]}'
+            for i, (k, data) in enumerate(all_keys.items(), 1)
+        ]
         return "\n".join(response_lines)
 
     def _handle_ttl(self, tokens: list[str]) -> str:
@@ -114,3 +129,116 @@ class CommandHandler:
             return "+OK AOF log compacted successfully"
         else:
             return "-ERR Failed to compact AOF log"
+
+    def _handle_lpush(self, tokens: list[str]) -> str:
+        if len(tokens) < 3:
+            return "-ERR wrong number of arguments for 'lpush' command"
+        try:
+            length = self.store.lpush(tokens[1], *tokens[2:])
+            return f"(integer) {length}"
+        except TypeError as e:
+            return f"-{str(e)}"
+
+    def _handle_lrange(self, tokens: list[str]) -> str:
+        if len(tokens) != 4:
+            return "-ERR wrong number of arguments for 'lrange' command"
+        try:
+            result = self.store.lrange(tokens[1], int(tokens[2]), int(tokens[3]))
+            if not result:
+                return "(empty array)"
+            return "\n".join(f'{i + 1}) "{val}"' for i, val in enumerate(result))
+        except (TypeError, ValueError) as e:
+            return f"-{str(e)}"
+
+    def _handle_rpush(self, tokens: list[str]) -> str:
+        if len(tokens) < 3:
+            return "-ERR wrong number of arguments for 'rpush' command"
+        try:
+            length = self.store.rpush(tokens[1], *tokens[2:])
+            return f"(integer) {length}"
+        except TypeError as e:
+            return f"-{str(e)}"
+
+    def _handle_lpop(self, tokens: list[str]) -> str:
+        if len(tokens) != 2:
+            return "-ERR wrong number of arguments for 'lpop' command"
+        try:
+            result = self.store.lpop(tokens[1])
+            return f'"{result}"' if result is not None else "(nil)"
+        except TypeError as e:
+            return f"-{str(e)}"
+
+    def _handle_rpop(self, tokens: list[str]) -> str:
+        if len(tokens) != 2:
+            return "-ERR wrong number of arguments for 'rpop' command"
+        try:
+            result = self.store.rpop(tokens[1])
+            return f'"{result}"' if result is not None else "(nil)"
+        except TypeError as e:
+            return f"-{str(e)}"
+
+    def _handle_sadd(self, tokens: list[str]) -> str:
+        if len(tokens) < 3:
+            return "-ERR wrong number of arguments for 'sadd' command"
+        try:
+            added = self.store.sadd(tokens[1], *tokens[2:])
+            return f"(integer) {added}"
+        except TypeError as e:
+            return f"-{str(e)}"
+
+    def _handle_smembers(self, tokens: list[str]) -> str:
+        if len(tokens) != 2:
+            return "-ERR wrong number of arguments for 'smembers' command"
+        try:
+            members = self.store.smembers(tokens[1])
+            if not members:
+                return "(empty array)"
+            return "\n".join(f'{i + 1}) "{val}"' for i, val in enumerate(members))
+        except TypeError as e:
+            return f"-{str(e)}"
+
+    def _handle_srem(self, tokens: list[str]) -> str:
+        if len(tokens) < 3:
+            return "-ERR wrong number of arguments for 'srem' command"
+        try:
+            removed = self.store.srem(tokens[1], *tokens[2:])
+            return f"(integer) {removed}"
+        except TypeError as e:
+            return f"-{str(e)}"
+
+    def _handle_hset(self, tokens: list[str]) -> str:
+        if len(tokens) < 4:
+            return "-ERR wrong number of arguments for 'hset' command"
+        try:
+            # We join the remaining tokens in case the value has spaces
+            val = " ".join(tokens[3:])
+            result = self.store.hset(tokens[1], tokens[2], val)
+            return f"(integer) {result}"
+        except TypeError as e:
+            return f"-{str(e)}"
+
+    def _handle_hget(self, tokens: list[str]) -> str:
+        if len(tokens) != 3:
+            return "-ERR wrong number of arguments for 'hget' command"
+        try:
+            val = self.store.hget(tokens[1], tokens[2])
+            return f'"{val}"' if val is not None else "(nil)"
+        except TypeError as e:
+            return f"-{str(e)}"
+
+    def _handle_hgetall(self, tokens: list[str]) -> str:
+        if len(tokens) != 2:
+            return "-ERR wrong number of arguments for 'hgetall' command"
+        try:
+            data = self.store.hgetall(tokens[1])
+            if not data:
+                return "(empty hash)"
+
+            # Format: field \n value \n field \n value
+            lines = []
+            for i, (k, v) in enumerate(data.items()):
+                lines.append(f'{i * 2 + 1}) "{k}"')
+                lines.append(f'{i * 2 + 2}) "{v}"')
+            return "\n".join(lines)
+        except TypeError as e:
+            return f"-{str(e)}"
