@@ -1,14 +1,14 @@
 import json
 import os
 import time
-from typing import Optional
+from typing import Any, Optional
 
 
 class KedisStore:
     def __init__(self, aof_filename="kedis.aof"):
         self.debug_mode = False
         # The primary hash map for storing key-value pairs
-        self._data: dict[str, str] = {}
+        self._data: dict[str, Any] = {}
         # A secondary hash map to track expiration timestamps (Unix time)
         self._expires: dict[str, float] = {}
 
@@ -91,18 +91,36 @@ class KedisStore:
         self._expires[key] = absolute_expire_time
         return 1
 
-    def keys(self) -> list[str]:
-        """
-        Returns a list of all active keys.
-        """
-
-        active_keys = []
+    def keys(self) -> dict[str, dict[str, str]]:
+        """Returns a dictionary of all active keys with their Type, TTL, and Length."""
+        # Tell Pylance exactly what this dictionary will hold
+        active_keys: dict[str, dict[str, str]] = {}
 
         for k in list(self._data.keys()):
             self._evict_if_expired(k)
 
             if k in self._data:
-                active_keys.append(k)
+                val = self._data[k]
+
+                # 1. Grab the TTL
+                k_ttl = self.ttl(k)
+
+                # 2. Inspect the Type and measure the Length
+                if isinstance(val, list):
+                    k_type = "list"
+                    k_len = str(len(val))
+                elif isinstance(val, set):
+                    k_type = "set"
+                    k_len = str(len(val))
+                elif isinstance(val, dict):
+                    k_type = "hash"
+                    k_len = str(len(val))
+                else:
+                    k_type = "string"
+                    k_len = f"{len(str(val))} B"
+
+                # Bundle the telemetry packet
+                active_keys[k] = {"type": k_type, "ttl": str(k_ttl), "length": k_len}
 
         return active_keys
 
@@ -218,6 +236,64 @@ class KedisStore:
                     if self.debug_mode:
                         print("     🔥 FLUSHED ALL DATA")
 
+                # --- NEW LIST PARSERS ---
+                elif cmd == "LPUSH" and len(tokens) >= 3:
+                    key = tokens[1]
+                    if key not in self._data:
+                        self._data[key] = []
+                    for val in tokens[2:]:
+                        self._data[key].insert(0, val)
+
+                elif cmd == "RPUSH" and len(tokens) >= 3:
+                    key = tokens[1]
+                    if key not in self._data:
+                        self._data[key] = []
+                    self._data[key].extend(tokens[2:])
+
+                elif cmd == "LPOP" and len(tokens) >= 2:
+                    key = tokens[1]
+                    if (
+                        key in self._data
+                        and isinstance(self._data[key], list)
+                        and self._data[key]
+                    ):
+                        self._data[key].pop(0)
+                        if len(self._data[key]) == 0:
+                            del self._data[key]
+
+                elif cmd == "RPOP" and len(tokens) >= 2:
+                    key = tokens[1]
+                    if (
+                        key in self._data
+                        and isinstance(self._data[key], list)
+                        and self._data[key]
+                    ):
+                        self._data[key].pop(-1)
+                        if len(self._data[key]) == 0:
+                            del self._data[key]
+
+                elif cmd == "SADD" and len(tokens) >= 3:
+                    key = tokens[1]
+                    if key not in self._data:
+                        self._data[key] = set()
+                    self._data[key].update(tokens[2:])
+
+                elif cmd == "SREM" and len(tokens) >= 3:
+                    key = tokens[1]
+                    if key in self._data and isinstance(self._data[key], set):
+                        self._data[key].difference_update(tokens[2:])
+                        if len(self._data[key]) == 0:
+                            del self._data[key]
+
+                    # --- NEW HASH PARSER ---
+                elif cmd == "HSET" and len(tokens) >= 4:
+                    key = tokens[1]
+                    field = tokens[2]
+                    value = " ".join(tokens[3:])
+                    if key not in self._data:
+                        self._data[key] = {}
+                    self._data[key][field] = value
+
         if self.debug_mode:
             print(
                 f"\n✅ Recovery complete. Memory currently holds {len(self._data)} keys."
@@ -234,12 +310,25 @@ class KedisStore:
         try:
             with open(temp_file, "w") as f:
                 for key, value in self._data.items():
-                    f.write(f"SET {key} {value}\n")
+                    if isinstance(value, list):
+                        # Write lists back as an RPUSH so they rebuild perfectly
+                        f.write(f"RPUSH {key} {' '.join(value)}\n")
+
+                    # --- THE SET COMPACTOR BARRIER ---
+                    elif isinstance(value, set):
+                        f.write(f"SADD {key} {' '.join(value)}\n")
+
+                    elif isinstance(value, dict):
+                        for h_field, h_val in value.items():
+                            f.write(f"HSET {key} {h_field} {h_val}\n")
+
+                    else:
+                        f.write(f"SET {key} {value}\n")
 
                 if hasattr(self, "_expires"):
                     for key, exp_time in self._expires.items():
-                    if exp_time > time.time():
-                        f.write(f"EXPIREAT {key} {exp_time}\n")
+                        if exp_time > time.time():
+                            f.write(f"EXPIREAT {key} {exp_time}\n")
 
             # -----------------------------------
             # The OS Routing Fork
@@ -280,3 +369,240 @@ class KedisStore:
 
             print(f"Compaction failed: {e}")
             return False
+
+    # LIST OPERATIONS
+    def lpush(self, key: str, *values: str) -> int:
+        """
+        Inserts all specified values at the head of the list
+        stored at key. Returns the length of the list after push operations
+        """
+
+        self._evict_if_expired(key)
+
+        # TYPE BARRIER: if key exists but isn't a list, throw an error (telemetry glitch)
+        if key in self._data and not isinstance(self._data[key], list):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        if key not in self._data:
+            self._data[key] = []
+
+        for val in values:
+            self._data[key].insert(0, val)
+
+        # LPUSH inserts at the head (index 0).
+        # Pushing multiple values happens one by one from left to right.
+
+        self._log_operation("LPUSH", key, *values)
+
+        return len(self._data[key])
+
+    def lrange(self, key: str, start: int, stop: int) -> list:
+        """
+        Returns the specified Elements of the list stored at key
+        """
+
+        self._evict_if_expired(key)
+
+        if key not in self._data:
+            return []
+
+        if not isinstance(self._data[key], list):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        if stop == -1:
+            return self._data[key][start:]
+        else:
+            return self._data[key][start : stop + 1]
+
+    def rpush(self, key: str, *values: str) -> int:
+        """Inserts all specified values at the tail of the list."""
+        self._evict_if_expired(key)
+
+        if key in self._data and not isinstance(self._data[key], list):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        if key not in self._data:
+            self._data[key] = []
+
+        # RPUSH appends to the tail. Using extend adds them in the exact order provided.
+        self._data[key].extend(values)
+        self._log_operation("RPUSH", key, *values)
+
+        return len(self._data[key])
+
+    def lpop(self, key: str) -> Optional[str]:
+        """Removes and returns the first element of the list."""
+        self._evict_if_expired(key)
+
+        if key not in self._data:
+            return None
+
+        if not isinstance(self._data[key], list):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        if not self._data[key]:  # Empty list fallback
+            return None
+
+        # Pop the head (index 0)
+        popped_value = self._data[key].pop(0)
+        self._log_operation("LPOP", key)
+
+        # Redis standard: If the list is empty after popping, delete the key entirely
+        if len(self._data[key]) == 0:
+            del self._data[key]
+            self._expires.pop(key, None)
+
+        return popped_value
+
+    def rpop(self, key: str) -> Optional[str]:
+        """Removes and returns the last element of the list."""
+        self._evict_if_expired(key)
+
+        if key not in self._data:
+            return None
+
+        if not isinstance(self._data[key], list):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        if not self._data[key]:
+            return None
+
+        # Pop the tail (index -1)
+        popped_value = self._data[key].pop(-1)
+        self._log_operation("RPOP", key)
+
+        if len(self._data[key]) == 0:
+            del self._data[key]
+            self._expires.pop(key, None)
+
+        return popped_value
+
+    # SET OPERATIONS
+    def sadd(self, key: str, *members: str) -> int:
+        """
+        Adds one or more members to a set,
+        returns the number of members added
+        """
+
+        self._evict_if_expired(key)
+
+        if key in self._data and not isinstance(self._data[key], set):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        if key not in self._data:
+            self._data[key] = set()
+
+        initial_len = len(self._data[key])
+
+        self._data[key].update(members)
+
+        added_count = len(self._data[key]) - initial_len
+
+        if added_count > 0:
+            self._log_operation("SADD", key, *members)
+
+        return added_count
+
+    def smembers(self, key: str) -> list[str]:
+        """
+        Returns all members of the set value stored at key.
+        """
+
+        self._evict_if_expired(key)
+
+        if key not in self._data:
+            return []
+
+        if not isinstance(self._data[key], set):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        # Convert the native Python set back into a list so the router can print it cleanly
+        return list(self._data[key])
+
+    def srem(self, key: str, *members: str) -> int:
+        """
+        Removes the specified members from the set. Returns the number of members removed.
+        """
+
+        self._evict_if_expired(key)
+
+        if key not in self._data:
+            return 0
+
+        if not isinstance(self._data[key], set):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        initial_len = len(self._data[key])
+
+        # .difference_update() cleanly removes items from a Python set
+        self._data[key].difference_update(members)
+        removed_count = initial_len - len(self._data[key])
+
+        if removed_count > 0:
+            self._log_operation("SREM", key, *members)
+
+        # Clean up the garage: if the set is empty, delete the key entirely
+        if len(self._data[key]) == 0:
+            del self._data[key]
+            self._expires.pop(key, None)
+
+        return removed_count
+
+    def hset(self, key: str, field: str, value: str) -> int:
+        """Sets field in the hash stored at key to value."""
+        self._evict_if_expired(key)
+
+        if key in self._data and not isinstance(self._data[key], dict):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        if key not in self._data:
+            self._data[key] = {}
+
+        # Returns 1 if field is a new field, 0 if it was just updated
+        is_new = 1 if field not in self._data[key] else 0
+        self._data[key][field] = value
+
+        self._log_operation("HSET", key, field, value)
+        return is_new
+
+    # HASH Operations
+    def hget(self, key: str, field: str) -> Optional[str]:
+        """Returns the value associated with field in the hash stored at key."""
+        self._evict_if_expired(key)
+
+        if key not in self._data or not isinstance(self._data[key], dict):
+            return None
+
+        return self._data[key].get(field)
+
+    def hgetall(self, key: str) -> dict:
+        """Returns all fields and values of the hash stored at key."""
+        self._evict_if_expired(key)
+
+        if key not in self._data:
+            return {}
+
+        if not isinstance(self._data[key], dict):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        return self._data[key]
