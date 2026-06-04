@@ -1,485 +1,608 @@
+import json
 import os
-import socket
-import sys
-
-from pyfiglet import Figlet
-from rich.console import Console
-from rich.panel import Panel
-
-from commands import CommandHandler
-from parser import CommandParser
-from store import KedisStore
-
-console = Console()
-
-HOST = "127.0.0.1"
-PORT = 6379
+import time
+from typing import Any, Optional
 
 
-def main():
-    # ----------------------------------------------------
-    # Startup Banner
-    # ----------------------------------------------------
-    fig = Figlet(font="big")
-    logo = fig.renderText("KEDIS")
+class KedisStore:
+    def __init__(self, aof_filename="kedis.aof"):
+        self.debug_mode = False
+        # The primary hash map for storing key-value pairs
+        self._data: dict[str, Any] = {}
+        # A secondary hash map to track expiration timestamps (Unix time)
+        self._expires: dict[str, float] = {}
 
-    console.print(
-        Panel.fit(
-            f"[bold cyan]{logo}[/bold cyan]"
-            "\n[yellow]Codename: Echo[/yellow]"
-            "\n[green]Version: 0.2.0[/green]",
-            title="Database Client",
-            border_style="cyan",
-        )
-    )
+        self.aof_filename = aof_filename
+        self.recover_from_aof()
+        self.aof_file = open(self.aof_filename, "a")
 
-    # ----------------------------------------------------
-    # The Auto-Detect Ignition (Network First, Local Fallback)
-    # ----------------------------------------------------
-    local_mode = False
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    def _log_operation(self, *tokens):
+        """
+        Appends the raw command to AOF and forces it to the physical disk
+        """
 
-    store = None
-    handler = None
+        command_string = " ".join(str(t) for t in tokens)
+        self.aof_file.write(command_string + "\n")
+        self.aof_file.flush()
+        os.fsync(self.aof_file.fileno())
 
-    try:
-        s.connect((HOST, PORT))
-        console.print("[green]✓ Network Link Established[/green]")
-        console.print(
-            f"[bold blue]Ready (TCP Network Mode) - Connected to {HOST}:{PORT}[/bold blue]\n"
-        )
+    def _evict_if_expired(self, key: str) -> bool:
+        """
+        Helper to passively check and evict an expired key. Returns True if evicted.
+        """
 
-    except ConnectionRefusedError:
-        # THE BOOT-UP CONSENT CHECK
-        console.print(
-            Panel(
-                "[bold yellow]⚠️ Network database unavailable.[/bold yellow]\n\n"
-                "[white]Switching to standalone mode will create or use\n"
-                "a local database instance.\n\n"
-                "Data may differ from the server.[/white]",
-                border_style="yellow",
+        if key in self._expires:
+            # If the current time has passed the expiration time
+            if time.time() >= self._expires[key]:
+                del self._data[key]
+                del self._expires[key]
+                return True
+        return False
+
+    def set(self, key: str, value: str) -> None:
+        """
+        Sets a key to hold a string value.
+        """
+        self._log_operation("SET", key, value)
+        self._data[key] = value
+        # If the key is overwritten, any previous TTL should be cleared
+        if key in self._expires:
+            del self._expires[key]
+
+    def get(self, key: str) -> Optional[str]:
+        """Gets the value of a key, returning None if it doesn't exist (or expired)."""
+        if self.debug_mode:
+            print(f"\n🕵️  DEBUG REPL: Engine asked for key -> '{key}'")
+
+            print(
+                f"🕵️  DEBUG MEMORY: Keys currently in memory -> {list(self._data.keys())}\n"
             )
-        )
 
-        choice = (
-            console.input("[bold yellow]Continue? [Y/n]: [/bold yellow]")
-            .strip()
-            .lower()
-        )
-        if choice == "n":
-            console.print("\n[bold red]Aborting. Shutting down Kedis CLI...[/bold red]")
-            sys.exit(0)
+        self._evict_if_expired(key)
+        return self._data.get(key)
 
-        local_mode = True
+    def delete(self, key: str) -> int:
+        """Removes the specified key. Returns 1 if deleted, 0 if not found."""
+        self._evict_if_expired(key)
+        if key in self._data:
+            self._log_operation("DEL", key)
+            del self._data[key]
+            # No need to check if it's in _expires, pop handles it safely
+            self._expires.pop(key, None)
+            return 1
+        return 0
 
-        store = KedisStore()
-        handler = CommandHandler(store)
+    def exists(self, key: str) -> int:
+        """Returns 1 if the key exists, 0 otherwise."""
+        self._evict_if_expired(key)
+        return 1 if key in self._data else 0
 
-        console.print("\n[green]✓ Local Storage Engine Online[/green]")
-        console.print("[green]✓ Command Router Online[/green]")
-        console.print("[green]✓ Persistence Layer Online[/green]")
-        console.print(
-            f"[cyan]Loaded {len(store._data)} keys from local persistence.[/cyan]"
-        )
-        console.print("[bold purple]Ready (Standalone Local Mode).[/bold purple]\n")
+    def set_expire(self, key: str, seconds: int) -> int:
+        """Sets a timeout on key. Returns 1 if set, 0 if key does not exist."""
+        # Evict first just in case they try to set an expiry on an already-expired key
+        if self._evict_if_expired(key) or key not in self._data:
+            return 0
 
-    console.print("[dim]Type 'exit', 'quit', or press Ctrl+C to shut down.[/dim]\n")
+        absolute_expire_time = time.time() + seconds
 
-    debug_mode = False
-    suppress_reconnect = False
+        self._log_operation("EXPIREAT", key, absolute_expire_time)
 
-    # ----------------------------------------------------
-    # Main Event Loop
-    # ----------------------------------------------------
-    while True:
+        # time.time() gets the current epoch time in seconds
+        self._expires[key] = absolute_expire_time
+        return 1
+
+    def keys(self) -> dict[str, dict[str, str]]:
+        """Returns a dictionary of all active keys with their Type, TTL, and Length."""
+        # Tell Pylance exactly what this dictionary will hold
+        active_keys: dict[str, dict[str, str]] = {}
+
+        for k in list(self._data.keys()):
+            self._evict_if_expired(k)
+
+            if k in self._data:
+                val = self._data[k]
+
+                # 1. Grab the TTL
+                k_ttl = self.ttl(k)
+
+                # 2. Inspect the Type and measure the Length
+                if isinstance(val, list):
+                    k_type = "list"
+                    k_len = str(len(val))
+                elif isinstance(val, set):
+                    k_type = "set"
+                    k_len = str(len(val))
+                elif isinstance(val, dict):
+                    k_type = "hash"
+                    k_len = str(len(val))
+                else:
+                    k_type = "string"
+                    k_len = f"{len(str(val))} B"
+
+                # Bundle the telemetry packet
+                active_keys[k] = {"type": k_type, "ttl": str(k_ttl), "length": k_len}
+
+        return active_keys
+
+    def ttl(self, key: str) -> int:
+        """
+        Returns the remaining  time to live of a key in seconds
+        """
+
+        self._evict_if_expired(key)
+        if key not in self._data:  # key doesn't exists
+            return -2
+
+        if key not in self._expires:  # key is there but no expiry time
+            return -1
+
+        # Key has expiry time , hence calcuate seconds
+        remaining_secs = int(self._expires[key] - time.time())
+
+        return remaining_secs
+
+    def flushall(self) -> None:
+        """
+        Removes all keys and expirations,
+        completely resetting the database."
+        """
+        self._log_operation("FLUSHALL")
+        self._data.clear()
+        self._expires.clear()
+
+    def save(self, filename: str = "dump.json") -> bool:
+        """
+        Snapshots the current memory state to a JSON file
+        """
+
         try:
-            # ----------------------------------------------------
-            # THE AUTO-RECONNECT RADAR
-            # ----------------------------------------------------
-            if local_mode and not suppress_reconnect:
-                radar = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                radar.settimeout(0.05)  # 50ms silent ping
+            # Bundling states to dictionaries
+            state = {"data": self._data, "expires": self._expires}
 
-                try:
-                    radar.connect((HOST, PORT))
-                    radar.close()  # Port is alive! Close the radar ping.
+            with open(filename, "w") as f:
+                json.dump(state, f)
 
-                    console.print(
-                        Panel(
-                            f"[bold yellow]⚠️ Kedis Server detected at {HOST}:{PORT}[/bold yellow]\n\n"
-                            "[white]You are currently using a standalone database.\n\n"
-                            "Switching to TCP mode will connect to the server database.\n\n"
-                            "Local and server data may differ.[/white]",
-                            border_style="yellow",
-                        )
-                    )
+            return True
 
-                    choice = (
-                        console.input("[bold yellow]Switch? [Y/n]: [/bold yellow]")
-                        .strip()
-                        .lower()
-                    )
+        except Exception as e:
+            print(f"DEBUG: SAVE FAILED -{e}")
+            return False
 
-                    if choice == "n":
-                        suppress_reconnect = True
-                        console.print(
-                            "[dim]Staying in Standalone Mode. Reconnect radar disabled.[/dim]\n"
-                        )
-                    else:
-                        # Re-engage the main TCP socket
-                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        s.connect((HOST, PORT))
-                        local_mode = False
+    def load(self, filename: str = "dump.json") -> None:
+        """Loads the memory state from disk on startup."""
+        if os.path.exists(filename):
+            try:
+                with open(filename, "r") as f:
+                    state = json.load(f)
+                    self._data = state.get("data", {})
+                    self._expires = state.get("expires", {})
+            except Exception as e:
+                print(f"DEBUG: Load failed - {e}")
 
-                        console.print("\n[green]✓ Network Link Re-Established[/green]")
-                        console.print(
-                            f"[bold blue]Ready (TCP Network Mode) - Connected to {HOST}:{PORT}[/bold blue]\n"
-                        )
+    def recover_from_aof(self):
+        """Reads the AOF file on startup and cleanly rebuilds the database memory."""
 
-                except (socket.timeout, ConnectionRefusedError, OSError):
-                    pass  # Server is still down, move along silently
+        # 1. ALWAYS check if the file exists before trying to read it!
+        if not os.path.exists(self.aof_filename):
+            if self.debug_mode:
+                print("⚠️  No AOF found. Starting with a clean slate.\n")
+            return
 
-            # ----------------------------------------------------
-            # Dynamic Prompt
-            # ----------------------------------------------------
-            current_debug = (
-                getattr(store, "debug_mode", False) if local_mode else debug_mode
-            )
-            prompt = (
-                "[bold red]echo-debug[/bold red] ❯ "
-                if current_debug
-                else "[bold cyan]echo[/bold cyan] ❯ "
-            )
+        if self.debug_mode:
+            print("\n" + "=" * 40)
+            print("🛠️  INITIATING RESURRECTION SEQUENCE")
+            print("=" * 40)
+            full_path = os.path.abspath(self.aof_filename)
+            print(f"🔍 Checking for AOF at: {full_path}")
+            print(f"🔧 Found {self.aof_filename}! Reading telemetry...\n")
 
-            raw_input = console.input(prompt).strip()
+        # 2. Read the log line by line
+        with open(self.aof_filename, "r") as f:
+            for line in f:
+                if self.debug_mode:
+                    print(f"  -> Raw line found: '{line.strip()}'")
 
-            if not raw_input:
-                continue
-
-            cmd = raw_input.split()[0].upper()
-
-            # Client-side Commands
-            if cmd in ["CLS", "CLEAR"]:
-                os.system("cls" if os.name == "nt" else "clear")
-                continue
-
-            if cmd == "DEBUG":
-                if local_mode:
-                    store.debug_mode = not getattr(store, "debug_mode", False)
-                    debug_mode = store.debug_mode
-                else:
-                    debug_mode = not debug_mode
-                    s.sendall(raw_input.encode("utf-8"))
-                    s.recv(1024)
-
-                status = (
-                    "[bold red]ON 🔴[/bold red]"
-                    if debug_mode
-                    else "[bold green]OFF ⚪[/bold green]"
-                )
-                console.print(f"🔧 Diagnostic telemetry is now {status}")
-                continue
-
-            # ----------------------------------------------------
-            # Upgraded Telemetry Panels
-            # ----------------------------------------------------
-            if cmd == "MODE":
-                current_debug = (
-                    getattr(store, "debug_mode", False) if local_mode else debug_mode
-                )
-                debug_status = (
-                    "[bold green]ON[/bold green]" if current_debug else "[dim]OFF[/dim]"
-                )
-
-                if local_mode:
-                    radar_status = (
-                        "[dim]Disabled[/dim]"
-                        if suppress_reconnect
-                        else "[green]Scanning[/green]"
-                    )
-                    key_count = len(store._data) if store else 0
-
-                    mode_text = (
-                        f"Mode:            [purple]Standalone[/purple]\n"
-                        f"Persistence:     [yellow]Local Disk[/yellow]\n"
-                        f"Reconnect Radar: {radar_status}\n"
-                        f"Debug:           {debug_status}\n"
-                        f"Keys Loaded:     [cyan]{key_count}[/cyan]"
-                    )
-                    console.print(
-                        Panel(
-                            mode_text,
-                            title="[bold purple]Kedis Status[/bold purple]",
-                            border_style="purple",
-                            expand=False,
-                        )
-                    )
-                else:
-                    mode_text = (
-                        f"Mode:       [blue]TCP[/blue]\n"
-                        f"Host:       [cyan]{HOST}[/cyan]\n"
-                        f"Port:       [cyan]{PORT}[/cyan]\n"
-                        f"Connection: [green]Active[/green]\n"
-                        f"Debug:      {debug_status}"
-                    )
-                    console.print(
-                        Panel(
-                            mode_text,
-                            title="[bold blue]Kedis Status[/bold blue]",
-                            border_style="blue",
-                            expand=False,
-                        )
-                    )
-                continue
-
-            if cmd == "INFO":
-                version = "0.2.0"
-                codename = "Echo"
-
-                if local_mode:
-                    key_count = len(getattr(store, "_data", {})) if store else 0
-                    exp_count = len(getattr(store, "_expires", {})) if store else 0
-                    aof_file = getattr(store, "aof_filename", "kedis.aof")
-                    aof_size = (
-                        f"{os.path.getsize(aof_file) / 1024:.1f} KB"
-                        if os.path.exists(aof_file)
-                        else "0.0 KB"
-                    )
-
-                    persistence = "AOF"
-                    current_mode = "Standalone"
-                else:
-                    key_count = "N/A (Server)"
-                    exp_count = "N/A (Server)"
-                    aof_size = "N/A (Server)"
-
-                    persistence = "TCP Stream"
-                    current_mode = "TCP"
-
-                current_debug = (
-                    getattr(store, "debug_mode", False) if local_mode else debug_mode
-                )
-                debug_status = (
-                    "[bold green]ON[/bold green]" if current_debug else "[dim]OFF[/dim]"
-                )
-
-                info_text = (
-                    f"Version        : [green]{version}[/green]\n"
-                    f"Codename       : [yellow]{codename}[/yellow]\n\n"
-                    f"Keys           : [cyan]{key_count}[/cyan]\n"
-                    f"Expiring Keys  : [cyan]{exp_count}[/cyan]\n\n"
-                    f"Persistence    : [yellow]{persistence}[/yellow]\n"
-                    f"AOF Size       : [magenta]{aof_size}[/magenta]\n\n"
-                    f"Mode           : [purple]{current_mode}[/purple]\n"
-                    f"Debug          : {debug_status}"
-                )
-                console.print(
-                    Panel(
-                        info_text,
-                        title="[bold blue]Kedis Information[/bold blue]",
-                        border_style="blue",
-                        expand=False,
-                    )
-                )
-                continue
-
-            if cmd == "HELP":
-                help_text = (
-                    "[bold cyan]Engine Commands (Database)[/bold cyan]\n"
-                    "  [green]SET[/green] key value      : Store a string value\n"
-                    "  [green]GET[/green] key            : Retrieve a value\n"
-                    "  [green]DELETE[/green] key         : Remove a key\n"
-                    "  [green]EXPIRE[/green] key seconds : Set a time-to-live (TTL)\n"
-                    "  [green]TTL[/green] key            : Check remaining lifespan\n"
-                    "  [green]FLUSHALL[/green]          : Wipe the entire database\n\n"
-                    "[bold purple]Client Commands (Dashboard)[/bold purple]\n"
-                    "  [yellow]COMPACT[/yellow]            : Compress the AOF log file\n"
-                    "  [yellow]MODE[/yellow]               : View current drivetrain (TCP/Local)\n"
-                    "  [yellow]INFO[/yellow]               : View engine telemetry and version\n"
-                    "  [yellow]HELP[/yellow]               : Show this command reference\n"
-                    "  [yellow]DEBUG[/yellow]              : Toggle diagnostic logs\n"
-                    "  [yellow]RECONNECT[/yellow]          : Manually reconnect to TCP server\n"
-                    "  [yellow]CLEAR / CLS[/yellow]        : Clear the terminal screen\n"
-                    "  [yellow]EXIT / QUIT[/yellow]        : Shut down the client\n"
-                )
-                console.print(
-                    Panel(
-                        help_text,
-                        title="[bold yellow]Kedis Command Reference[/bold yellow]",
-                        border_style="yellow",
-                        expand=False,
-                    )
-                )
-                continue
-
-            if cmd == "RECONNECT":
-                if not local_mode:
-                    console.print(
-                        "[yellow]You are already connected to the Kedis TCP Engine.[/yellow]"
-                    )
-                else:
-                    console.print(
-                        "[white]Attempting manual TCP network re-engagement...[/white]"
-                    )
-                    try:
-                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        s.connect((HOST, PORT))
-
-                        local_mode = False
-                        suppress_reconnect = False
-
-                        console.print("[green]✓ Network Link Re-Established[/green]")
-                        console.print(
-                            f"[bold blue]Ready (TCP Network Mode) - Connected to {HOST}:{PORT}[/bold blue]\n"
-                        )
-
-                    except ConnectionRefusedError:
-                        console.print(
-                            "[bold red]❌ Connection failed. Kedis Server is still offline.[/bold red]"
-                        )
-                continue
-
-            if cmd in ["EXIT", "QUIT"]:
-                console.print("[bold red]Shutting down Kedis...[/bold red]")
-                break
-
-            # ----------------------------------------------------
-            # The Routing Fork
-            # ----------------------------------------------------
-            if local_mode:
-                # STANDALONE MODE
-                tokens = CommandParser.parse(raw_input)
-
-                if tokens and tokens[0] == "ERROR":
-                    console.print(f"[red]{tokens[1]}[/red]")
-                    continue
-
+                tokens = line.strip().split()
                 if not tokens:
                     continue
 
-                response = handler.execute(tokens)
+                cmd = tokens[0].upper()
 
-                # --- NEW COMPACT PANEL INTERCEPTOR ---
-                if cmd == "COMPACT":
-                    if "+OK" in response:
-                        console.print(
-                            Panel(
-                                f"[bold green]Compaction Successful[/bold green]\n{response}",
-                                title="🧹 AOF Cleaner",
-                                border_style="green",
-                                expand=False,
-                            )
+                if cmd == "SET" and len(tokens) >= 3:
+                    value = " ".join(tokens[2:])
+                    self._data[tokens[1]] = value
+                    self._expires.pop(tokens[1], None)
+                    if self.debug_mode:
+                        print(f"     ✅ INJECTED: {tokens[1]} = {value}")
+
+                elif cmd == "DEL" and len(tokens) >= 2:
+                    self._data.pop(tokens[1], None)
+                    self._expires.pop(tokens[1], None)
+                    if self.debug_mode:
+                        print(f"     🗑️  DELETED: {tokens[1]}")
+
+                # --- THE MISSING EXPIREAT PARSER ---
+                elif cmd == "EXPIREAT" and len(tokens) >= 3:
+                    absolute_time = float(tokens[2])
+                    self._expires[tokens[1]] = absolute_time
+                    if self.debug_mode:
+                        print(
+                            f"     ⏱️  EXPIRY SET: {tokens[1]} will die at {absolute_time}"
                         )
+
+                elif cmd == "FLUSHALL":
+                    self._data.clear()
+                    self._expires.clear()
+                    if self.debug_mode:
+                        print("     🔥 FLUSHED ALL DATA")
+
+                # --- NEW LIST PARSERS ---
+                elif cmd == "LPUSH" and len(tokens) >= 3:
+                    key = tokens[1]
+                    if key not in self._data:
+                        self._data[key] = []
+                    for val in tokens[2:]:
+                        self._data[key].insert(0, val)
+
+                elif cmd == "RPUSH" and len(tokens) >= 3:
+                    key = tokens[1]
+                    if key not in self._data:
+                        self._data[key] = []
+                    self._data[key].extend(tokens[2:])
+
+                elif cmd == "LPOP" and len(tokens) >= 2:
+                    key = tokens[1]
+                    if (
+                        key in self._data
+                        and isinstance(self._data[key], list)
+                        and self._data[key]
+                    ):
+                        self._data[key].pop(0)
+                        if len(self._data[key]) == 0:
+                            del self._data[key]
+
+                elif cmd == "RPOP" and len(tokens) >= 2:
+                    key = tokens[1]
+                    if (
+                        key in self._data
+                        and isinstance(self._data[key], list)
+                        and self._data[key]
+                    ):
+                        self._data[key].pop(-1)
+                        if len(self._data[key]) == 0:
+                            del self._data[key]
+
+                elif cmd == "SADD" and len(tokens) >= 3:
+                    key = tokens[1]
+                    if key not in self._data:
+                        self._data[key] = set()
+                    self._data[key].update(tokens[2:])
+
+                elif cmd == "SREM" and len(tokens) >= 3:
+                    key = tokens[1]
+                    if key in self._data and isinstance(self._data[key], set):
+                        self._data[key].difference_update(tokens[2:])
+                        if len(self._data[key]) == 0:
+                            del self._data[key]
+
+                    # --- NEW HASH PARSER ---
+                elif cmd == "HSET" and len(tokens) >= 4:
+                    key = tokens[1]
+                    field = tokens[2]
+                    value = " ".join(tokens[3:])
+                    if key not in self._data:
+                        self._data[key] = {}
+                    self._data[key][field] = value
+
+        if self.debug_mode:
+            print(
+                f"\n✅ Recovery complete. Memory currently holds {len(self._data)} keys."
+            )
+            print("=" * 40 + "\n")
+
+    def compact_aof(self):
+        """
+        Compacts the AOF size down to only active and living keys
+        """
+
+        temp_file = f"temp_{self.aof_filename}"
+
+        try:
+            with open(temp_file, "w") as f:
+                for key, value in self._data.items():
+                    if isinstance(value, list):
+                        # Write lists back as an RPUSH so they rebuild perfectly
+                        f.write(f"RPUSH {key} {' '.join(value)}\n")
+
+                    # --- THE SET COMPACTOR BARRIER ---
+                    elif isinstance(value, set):
+                        f.write(f"SADD {key} {' '.join(value)}\n")
+
+                    elif isinstance(value, dict):
+                        for h_field, h_val in value.items():
+                            f.write(f"HSET {key} {h_field} {h_val}\n")
+
                     else:
-                        console.print(
-                            Panel(
-                                f"[bold red]Compaction Failed[/bold red]\n{response}",
-                                title="❌ Error",
-                                border_style="red",
-                                expand=False,
-                            )
-                        )
-                else:
-                    console.print(response)
+                        f.write(f"SET {key} {value}\n")
+
+                if hasattr(self, "_expires"):
+                    for key, exp_time in self._expires.items():
+                        if exp_time > time.time():
+                            f.write(f"EXPIREAT {key} {exp_time}\n")
+
+            # -----------------------------------
+            # The OS Routing Fork
+            # -----------------------------------
+            if os.name == "nt":
+                # Windows DriveTrain: Explicit Close, delete and rename required
+                if hasattr(self, "aof_file") and not self.aof_file.closed:
+                    self.aof_file.close()
+
+                # Micro-pausing to let the OS-Level file lock fully clear
+                time.sleep(0.1)
+
+                if os.path.exists(self.aof_filename):
+                    os.remove(self.aof_filename)
+
+                os.rename(temp_file, self.aof_filename)
+
+                self.aof_file = open(self.aof_filename, "a")
 
             else:
-                # TCP MODE
-                try:
-                    s.sendall(raw_input.encode("utf-8"))
-                    data = s.recv(1024)
+                # Linux / UNIX drivetrain: Atomic OS-Level Hotswap
+                os.replace(temp_file, self.aof_filename)
 
-                    if not data:
-                        raise OSError("Server silently dropped connection")
+                # Refresh the file pointer so it writes to the new file, not the ghost inode
+                if hasattr(self, "aof_file") and not self.aof_file.closed:
+                    self.aof_file.close()
+                self.aof_file = open(self.aof_filename, "a")
 
-                    response = data.decode("utf-8").strip()
-
-                    # --- NEW COMPACT PANEL INTERCEPTOR ---
-                    if cmd == "COMPACT":
-                        if "+OK" in response:
-                            console.print(
-                                Panel(
-                                    f"[bold green]Compaction Successful[/bold green]\n{response}",
-                                    title="🧹 AOF Cleaner",
-                                    border_style="green",
-                                    expand=False,
-                                )
-                            )
-                        else:
-                            console.print(
-                                Panel(
-                                    f"[bold red]Compaction Failed[/bold red]\n{response}",
-                                    title="❌ Error",
-                                    border_style="red",
-                                    expand=False,
-                                )
-                            )
-                    else:
-                        console.print(response)
-
-                except OSError:
-                    # THE MID-SESSION HOT-SWAP CONSENT CHECK
-                    crash_text = (
-                        "[bold yellow]⚠️ FATAL: TCP Link Severed Mid-Session![/bold yellow]\n\n"
-                        "[white]Do you want to engage emergency hot-swap to the Local Engine?[/white]\n"
-                        "[dim](Data saved here will not sync to the server)[/dim]"
-                    )
-                    console.print(
-                        Panel(
-                            crash_text,
-                            title="🚨 Connection Lost",
-                            border_style="red",
-                            expand=False,
-                        )
-                    )
-
-                    choice = (
-                        console.input(
-                            "\n[bold yellow]Continue in Standalone Mode? [Y/n]: [/bold yellow]"
-                        )
-                        .strip()
-                        .lower()
-                    )
-                    if choice == "n":
-                        console.print(
-                            "\n[bold red]Aborting. Shutting down Kedis CLI...[/bold red]"
-                        )
-                        break
-
-                    local_mode = True
-                    suppress_reconnect = False
-
-                    store = KedisStore()
-                    handler = CommandHandler(store)
-                    store.debug_mode = debug_mode
-
-                    # Added a sleek success panel for the hot-swap completion
-                    success_text = (
-                        "[green]✓ Local Engine Hot-Swapped Successfully[/green]\n"
-                        f"[cyan]Loaded {len(store._data)} keys from local persistence.[/cyan]"
-                    )
-                    console.print(
-                        Panel(
-                            success_text,
-                            title="🔧 Emergency Override",
-                            border_style="green",
-                            expand=False,
-                        )
-                    )
-                    print()  # Blank line for spacing
-                    continue
-
-        except KeyboardInterrupt:
-            console.print("\n[bold red]Shutting down Kedis...[/bold red]")
-            break
+            return True
 
         except Exception as e:
-            console.print(
-                f"[bold red](error) ERR internal server error: {str(e)}[/bold red]"
+            # Clean the wrekage if crashed mid build
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+            if hasattr(self, "file") and self.file.closed:
+                self.file = open(self.aof_filename, "a")
+
+            print(f"Compaction failed: {e}")
+            return False
+
+    # LIST OPERATIONS
+    def lpush(self, key: str, *values: str) -> int:
+        """
+        Inserts all specified values at the head of the list
+        stored at key. Returns the length of the list after push operations
+        """
+
+        self._evict_if_expired(key)
+
+        # TYPE BARRIER: if key exists but isn't a list, throw an error (telemetry glitch)
+        if key in self._data and not isinstance(self._data[key], list):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
             )
 
-    if not local_mode:
-        s.close()
+        if key not in self._data:
+            self._data[key] = []
 
+        for val in values:
+            self._data[key].insert(0, val)
 
-if __name__ == "__main__":
-    main()
+        # LPUSH inserts at the head (index 0).
+        # Pushing multiple values happens one by one from left to right.
+
+        self._log_operation("LPUSH", key, *values)
+
+        return len(self._data[key])
+
+    def lrange(self, key: str, start: int, stop: int) -> list:
+        """
+        Returns the specified Elements of the list stored at key
+        """
+
+        self._evict_if_expired(key)
+
+        if key not in self._data:
+            return []
+
+        if not isinstance(self._data[key], list):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        if stop == -1:
+            return self._data[key][start:]
+        else:
+            return self._data[key][start : stop + 1]
+
+    def rpush(self, key: str, *values: str) -> int:
+        """Inserts all specified values at the tail of the list."""
+        self._evict_if_expired(key)
+
+        if key in self._data and not isinstance(self._data[key], list):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        if key not in self._data:
+            self._data[key] = []
+
+        # RPUSH appends to the tail. Using extend adds them in the exact order provided.
+        self._data[key].extend(values)
+        self._log_operation("RPUSH", key, *values)
+
+        return len(self._data[key])
+
+    def lpop(self, key: str) -> Optional[str]:
+        """Removes and returns the first element of the list."""
+        self._evict_if_expired(key)
+
+        if key not in self._data:
+            return None
+
+        if not isinstance(self._data[key], list):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        if not self._data[key]:  # Empty list fallback
+            return None
+
+        # Pop the head (index 0)
+        popped_value = self._data[key].pop(0)
+        self._log_operation("LPOP", key)
+
+        # Redis standard: If the list is empty after popping, delete the key entirely
+        if len(self._data[key]) == 0:
+            del self._data[key]
+            self._expires.pop(key, None)
+
+        return popped_value
+
+    def rpop(self, key: str) -> Optional[str]:
+        """Removes and returns the last element of the list."""
+        self._evict_if_expired(key)
+
+        if key not in self._data:
+            return None
+
+        if not isinstance(self._data[key], list):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        if not self._data[key]:
+            return None
+
+        # Pop the tail (index -1)
+        popped_value = self._data[key].pop(-1)
+        self._log_operation("RPOP", key)
+
+        if len(self._data[key]) == 0:
+            del self._data[key]
+            self._expires.pop(key, None)
+
+        return popped_value
+
+    # SET OPERATIONS
+    def sadd(self, key: str, *members: str) -> int:
+        """
+        Adds one or more members to a set,
+        returns the number of members added
+        """
+
+        self._evict_if_expired(key)
+
+        if key in self._data and not isinstance(self._data[key], set):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        if key not in self._data:
+            self._data[key] = set()
+
+        initial_len = len(self._data[key])
+
+        self._data[key].update(members)
+
+        added_count = len(self._data[key]) - initial_len
+
+        if added_count > 0:
+            self._log_operation("SADD", key, *members)
+
+        return added_count
+
+    def smembers(self, key: str) -> list[str]:
+        """
+        Returns all members of the set value stored at key.
+        """
+
+        self._evict_if_expired(key)
+
+        if key not in self._data:
+            return []
+
+        if not isinstance(self._data[key], set):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        # Convert the native Python set back into a list so the router can print it cleanly
+        return list(self._data[key])
+
+    def srem(self, key: str, *members: str) -> int:
+        """
+        Removes the specified members from the set. Returns the number of members removed.
+        """
+
+        self._evict_if_expired(key)
+
+        if key not in self._data:
+            return 0
+
+        if not isinstance(self._data[key], set):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        initial_len = len(self._data[key])
+
+        # .difference_update() cleanly removes items from a Python set
+        self._data[key].difference_update(members)
+        removed_count = initial_len - len(self._data[key])
+
+        if removed_count > 0:
+            self._log_operation("SREM", key, *members)
+
+        # Clean up the garage: if the set is empty, delete the key entirely
+        if len(self._data[key]) == 0:
+            del self._data[key]
+            self._expires.pop(key, None)
+
+        return removed_count
+
+    def hset(self, key: str, field: str, value: str) -> int:
+        """Sets field in the hash stored at key to value."""
+        self._evict_if_expired(key)
+
+        if key in self._data and not isinstance(self._data[key], dict):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        if key not in self._data:
+            self._data[key] = {}
+
+        # Returns 1 if field is a new field, 0 if it was just updated
+        is_new = 1 if field not in self._data[key] else 0
+        self._data[key][field] = value
+
+        self._log_operation("HSET", key, field, value)
+        return is_new
+
+    # HASH Operations
+    def hget(self, key: str, field: str) -> Optional[str]:
+        """Returns the value associated with field in the hash stored at key."""
+        self._evict_if_expired(key)
+
+        if key not in self._data or not isinstance(self._data[key], dict):
+            return None
+
+        return self._data[key].get(field)
+
+    def hgetall(self, key: str) -> dict:
+        """Returns all fields and values of the hash stored at key."""
+        self._evict_if_expired(key)
+
+        if key not in self._data:
+            return {}
+
+        if not isinstance(self._data[key], dict):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        return self._data[key]
