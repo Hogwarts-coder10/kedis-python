@@ -29,6 +29,9 @@ class CommandHandler:
             "HSET": self._handle_hset,
             "HGET": self._handle_hget,
             "HGETALL": self._handle_hgetall,
+            "ZADD": self._handle_zadd,
+            "ZRANGE": self._handle_zrange,
+            "TYPE": self._handle_type,
         }
 
     def execute(self, tokens: list[str]) -> str:
@@ -242,3 +245,58 @@ class CommandHandler:
             return "\n".join(lines)
         except TypeError as e:
             return f"-{str(e)}"
+
+    def _handle_zadd(self, tokens: list[str]) -> str:
+        # Expected: ZADD key score member [score member ...]
+        if len(tokens) < 4 or len(tokens) % 2 != 0:
+            return "(error) ERR wrong number of arguments for 'zadd' command"
+
+        key = tokens[1]
+        added = 0
+        try:
+            # Loop through in pairs so we can add multiple cars at once!
+            for i in range(2, len(tokens), 2):
+                score = float(tokens[i])
+                member = tokens[i + 1]
+                added += self.store.zadd(key, score, member)
+            return f"(integer) {added}"
+        except ValueError:
+            return "(error) ERR value is not a valid float"
+        except TypeError as e:
+            return f"(error) {str(e)}"
+
+    def _handle_zrange(self, tokens: list[str]) -> str:
+        # Expected: ZRANGE key start stop [WITHSCORES]
+        if len(tokens) < 4 or len(tokens) > 5:
+            return "(error) ERR wrong number of arguments for 'zrange' command"
+
+        key = tokens[1]
+        withscores = False
+
+        if len(tokens) == 5:
+            if tokens[4].upper() == "WITHSCORES":
+                withscores = True
+            else:
+                return "(error) ERR syntax error"
+
+        try:
+            start = int(tokens[2])
+            stop = int(tokens[3])
+            result = self.store.zrange(key, start, stop, withscores)
+
+            if not result:
+                return "(empty array)"
+
+            return "\n".join(f'{i + 1}) "{val}"' for i, val in enumerate(result))
+        except ValueError:
+            return "(error) ERR value is not an integer or out of range"
+        except TypeError as e:
+            return f"(error) {str(e)}"
+
+    def _handle_type(self, tokens: list[str]) -> str:
+        # Expected: TYPE key
+        if len(tokens) != 2:
+            return "(error) ERR wrong number of arguments for 'type' command"
+
+        key = tokens[1]
+        return self.store.type_of(key)
