@@ -3,6 +3,8 @@ import os
 import time
 from typing import Any, Optional
 
+from skiplist import SkipList
+
 
 class KedisStore:
     def __init__(self, aof_filename="kedis.aof"):
@@ -38,6 +40,30 @@ class KedisStore:
                 del self._expires[key]
                 return True
         return False
+
+    def _evict_all_expired(self) -> None:
+        """
+        The Active Sweeper: Scans the entire engine for expired keys
+        and safely unloads them from memory and the AOF log.
+        """
+        current_time = time.time()
+        keys_to_delete = []
+
+        # 1. Build the Hit-List (Avoids RuntimeError from changing dict size during loop)
+        for key, exp_time in self._expires.items():
+            if current_time > exp_time:
+                keys_to_delete.append(key)
+
+        # 2. Execute the Deletions
+        for key in keys_to_delete:
+            if key in self._data:
+                del self._data[key]
+
+            if key in self._expires:
+                del self._expires[key]
+
+            # 3. Tell the Persistence Layer so it doesn't resurrect on reboot
+            self._log_operation("DEL", key)
 
     def set(self, key: str, value: str) -> None:
         """
@@ -91,38 +117,40 @@ class KedisStore:
         self._expires[key] = absolute_expire_time
         return 1
 
-    def keys(self) -> dict[str, dict[str, str]]:
-        """Returns a dictionary of all active keys with their Type, TTL, and Length."""
-        # Tell Pylance exactly what this dictionary will hold
-        active_keys: dict[str, dict[str, str]] = {}
+    def keys(self) -> dict:
+        """Returns metadata for all active keys (The Radar)."""
+        self._evict_all_expired()
+        result = {}
 
-        for k in list(self._data.keys()):
-            self._evict_if_expired(k)
+        for k, val in self._data.items():
+            if k in self._expires and self._expires[k] < time.time():
+                continue
 
-            if k in self._data:
-                val = self._data[k]
+            # --- THE RADAR SIGNATURES ---
+            if isinstance(val, list):
+                k_type = "list"
+                k_len = str(len(val))
+            elif isinstance(val, set):
+                k_type = "set"
+                k_len = str(len(val))
+            elif isinstance(val, dict):
+                k_type = "hash"
+                k_len = str(len(val))
+            elif isinstance(val, SkipList):
+                k_type = "zset"
+                k_len = str(len(val))
+            else:
+                k_type = "string"
+                k_len = str(len(str(val)))
 
-                # 1. Grab the TTL
-                k_ttl = self.ttl(k)
+            # Calculate TTL
+            ttl = -1
+            if k in self._expires:
+                ttl = int(self._expires[k] - time.time())
 
-                # 2. Inspect the Type and measure the Length
-                if isinstance(val, list):
-                    k_type = "list"
-                    k_len = str(len(val))
-                elif isinstance(val, set):
-                    k_type = "set"
-                    k_len = str(len(val))
-                elif isinstance(val, dict):
-                    k_type = "hash"
-                    k_len = str(len(val))
-                else:
-                    k_type = "string"
-                    k_len = f"{len(str(val))} B"
+            result[k] = {"type": k_type, "ttl": ttl, "length": k_len}
 
-                # Bundle the telemetry packet
-                active_keys[k] = {"type": k_type, "ttl": str(k_ttl), "length": k_len}
-
-        return active_keys
+        return result
 
     def ttl(self, key: str) -> int:
         """
@@ -293,6 +321,14 @@ class KedisStore:
                     if key not in self._data:
                         self._data[key] = {}
                     self._data[key][field] = value
+
+                elif cmd == "ZADD" and len(tokens) >= 4:
+                    key = tokens[1]
+                    score = float(tokens[2])
+                    member = " ".join(tokens[3:])
+                    if key not in self._data:
+                        self._data[key] = SkipList()
+                    self._data[key].insert(score, member)
 
         if self.debug_mode:
             print(
@@ -606,3 +642,61 @@ class KedisStore:
             )
 
         return self._data[key]
+
+    # ---------------------------------------------------------
+    # SORTED SET OPERATIONS (The API)
+    # ---------------------------------------------------------
+    def zadd(self, key: str, score: float, member: str) -> int:
+        self._evict_if_expired(key)
+
+        if key in self._data and not isinstance(self._data[key], SkipList):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        if key not in self._data:
+            self._data[key] = SkipList()
+
+        is_new = self._data[key].insert(float(score), member)
+        self._log_operation("ZADD", key, score, member)
+        return is_new
+
+    def zrange(self, key: str, start: int, stop: int, withscores: bool = False) -> list:
+        self._evict_if_expired(key)
+
+        if key not in self._data:
+            return []
+
+        if not isinstance(self._data[key], SkipList):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
+        return self._data[key].get_range(start, stop, withscores)
+
+    def type_of(self, key: str) -> str:
+        """
+        Returns the internal data-structure of a given key
+        """
+
+        self._evict_if_expired(key)
+
+        if key not in self._data:
+            return "None"
+
+        val = self._data[key]
+
+        if isinstance(val, list):
+            return "List"
+
+        elif isinstance(val, set):
+            return "Set"
+
+        elif isinstance(val, dict):
+            return "hash"
+
+        elif isinstance(val, SkipList):
+            return "zset"
+
+        else:
+            return "string"
