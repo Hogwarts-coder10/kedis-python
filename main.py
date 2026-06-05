@@ -1,3 +1,4 @@
+import difflib
 import os
 import socket
 import sys
@@ -5,16 +6,68 @@ import sys
 from pyfiglet import Figlet
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table  # <-- The new UI component
+from rich.table import Table
 
 from commands import CommandHandler
 from parser import CommandParser
 from store import KedisStore
 
+# --- The Command History Hook ---
+try:
+    import atexit
+    import readline
+
+    histfile = os.path.join(os.path.expanduser("~"), ".kedis_history")
+
+    try:
+        readline.read_history_file(histfile)
+        readline.set_history_length(1000)
+    except FileNotFoundError:
+        pass
+
+    atexit.register(readline.write_history_file, histfile)
+except ImportError:
+    pass
+
 console = Console()
 
 HOST = "127.0.0.1"
 PORT = 6379
+
+# --- The Dictionary of Valid Commands ---
+VALID_COMMANDS = [
+    "SET",
+    "GET",
+    "DEL",
+    "EXPIRE",
+    "TTL",
+    "FLUSHALL",
+    "LPUSH",
+    "RPUSH",
+    "LPOP",
+    "RPOP",
+    "LRANGE",
+    "SADD",
+    "SMEMBERS",
+    "SREM",
+    "HSET",
+    "HGET",
+    "HGETALL",
+    "ZADD",
+    "ZRANGE",
+    "KEYS",
+    "TYPE",
+    "COMPACT",
+    "MODE",
+    "INFO",
+    "HELP",
+    "DEBUG",
+    "RECONNECT",
+    "CLEAR",
+    "CLS",
+    "EXIT",
+    "QUIT",
+]
 
 
 def main():
@@ -35,7 +88,7 @@ def main():
     )
 
     # ----------------------------------------------------
-    # The Auto-Detect Ignition (Network First, Local Fallback)
+    # The Auto-Detect Ignition
     # ----------------------------------------------------
     local_mode = False
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -51,7 +104,6 @@ def main():
         )
 
     except ConnectionRefusedError:
-        # THE BOOT-UP CONSENT CHECK
         console.print(
             Panel(
                 "[bold yellow]⚠️ Network database unavailable.[/bold yellow]\n\n"
@@ -72,7 +124,6 @@ def main():
             sys.exit(0)
 
         local_mode = True
-
         store = KedisStore()
         handler = CommandHandler(store)
 
@@ -99,11 +150,11 @@ def main():
             # ----------------------------------------------------
             if local_mode and not suppress_reconnect:
                 radar = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                radar.settimeout(0.05)  # 50ms silent ping
+                radar.settimeout(0.05)
 
                 try:
                     radar.connect((HOST, PORT))
-                    radar.close()  # Port is alive! Close the radar ping.
+                    radar.close()
 
                     console.print(
                         Panel(
@@ -127,18 +178,16 @@ def main():
                             "[dim]Staying in Standalone Mode. Reconnect radar disabled.[/dim]\n"
                         )
                     else:
-                        # Re-engage the main TCP socket
                         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         s.connect((HOST, PORT))
                         local_mode = False
-
                         console.print("\n[green]✓ Network Link Re-Established[/green]")
                         console.print(
                             f"[bold blue]Ready (TCP Network Mode) - Connected to {HOST}:{PORT}[/bold blue]\n"
                         )
 
                 except (socket.timeout, ConnectionRefusedError, OSError):
-                    pass  # Server is still down, move along silently
+                    pass
 
             # ----------------------------------------------------
             # Dynamic Prompt
@@ -178,12 +227,9 @@ def main():
                     if debug_mode
                     else "[bold green]OFF ⚪[/bold green]"
                 )
-                console.print(f"🔧 Diagnostic telemetry is now {status}")
+                console.print(f"\n[dim]🔧 Diagnostic telemetry is now {status}[/dim]\n")
                 continue
 
-            # ----------------------------------------------------
-            # Upgraded Telemetry Panels
-            # ----------------------------------------------------
             if cmd == "MODE":
                 current_debug = (
                     getattr(store, "debug_mode", False) if local_mode else debug_mode
@@ -199,7 +245,6 @@ def main():
                         else "[green]Scanning[/green]"
                     )
                     key_count = len(store._data) if store else 0
-
                     mode_text = (
                         f"Mode:            [purple]Standalone[/purple]\n"
                         f"Persistence:     [yellow]Local Disk[/yellow]\n"
@@ -247,19 +292,23 @@ def main():
                         else "0.0 KB"
                     )
 
-                    # --- NEW: TYPE RADAR ---
-                    str_c = list_c = set_c = hash_c = 0
+                    # Type Radar
+                    str_c = list_c = set_c = hash_c = zset_c = 0
                     if store:
                         for val in store._data.values():
-                            if isinstance(val, list):
+                            val_type = type(val).__name__
+                            if val_type == "list":
                                 list_c += 1
-                            elif isinstance(val, set):
+                            elif val_type == "set":
                                 set_c += 1
-                            elif isinstance(val, dict):
+                            elif val_type == "dict":
                                 hash_c += 1
+                            elif val_type == "SkipList":
+                                zset_c += 1
                             else:
                                 str_c += 1
-                    type_breakdown = f"[dim]Str: {str_c} | Lst: {list_c} | Set: {set_c} | Hsh: {hash_c}[/dim]"
+
+                    type_breakdown = f"[dim]Str: {str_c} | Lst: {list_c} | Set: {set_c} | Hsh: {hash_c} | ZSet: {zset_c}[/dim]"
 
                     persistence = "AOF"
                     current_mode = "Standalone"
@@ -268,7 +317,6 @@ def main():
                     exp_count = "N/A (Server)"
                     aof_size = "N/A (Server)"
                     type_breakdown = "[dim]N/A (Server)[/dim]"
-
                     persistence = "TCP Stream"
                     current_mode = "TCP"
 
@@ -321,6 +369,9 @@ def main():
                     "  [green]HSET[/green] key field val   : Set a hash field\n"
                     "  [green]HGET[/green] key field       : Get a hash field\n"
                     "  [green]HGETALL[/green] key          : Get the full dossier\n\n"
+                    "[bold cyan]Sorted Set Commands (Leaderboard)[/bold cyan]\n"
+                    "  [green]ZADD[/green] key score val     : Add scored members\n"
+                    "  [green]ZRANGE[/green] key start stop  : Get the sorted leaderboard\n\n"
                     "[bold purple]Client Commands (Dashboard)[/bold purple]\n"
                     "  [yellow]KEYS[/yellow]                 : Radar of all active keys\n"
                     "  [yellow]COMPACT[/yellow]              : Compress the AOF log file\n"
@@ -345,27 +396,40 @@ def main():
             if cmd == "RECONNECT":
                 if not local_mode:
                     console.print(
-                        "[yellow]You are already connected to the Kedis TCP Engine.[/yellow]"
+                        Panel(
+                            "[white]You are already connected to the Kedis TCP Engine.[/white]",
+                            title="[bold yellow]⚠ NETWORK STATUS[/bold yellow]",
+                            border_style="yellow",
+                            expand=False,
+                        )
                     )
                 else:
                     console.print(
-                        "[white]Attempting manual TCP network re-engagement...[/white]"
+                        "[dim]Attempting manual TCP network re-engagement...[/dim]"
                     )
                     try:
                         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         s.connect((HOST, PORT))
-
                         local_mode = False
                         suppress_reconnect = False
 
-                        console.print("[green]✓ Network Link Re-Established[/green]")
                         console.print(
-                            f"[bold blue]Ready (TCP Network Mode) - Connected to {HOST}:{PORT}[/bold blue]\n"
+                            Panel(
+                                "[bold green]✓ Reconnected successfully[/bold green]\n"
+                                f"[blue]Mode: TCP Network ({HOST}:{PORT})[/blue]",
+                                title="[bold green]🔌 CONNECTION RESTORED[/bold green]",
+                                border_style="green",
+                                expand=False,
+                            )
                         )
-
                     except ConnectionRefusedError:
                         console.print(
-                            "[bold red]❌ Connection failed. Kedis Server is still offline.[/bold red]"
+                            Panel(
+                                "[bold red]✖ Recovery failed. Server is still offline.[/bold red]",
+                                title="[bold red]✖ CONNECTION FAILED[/bold red]",
+                                border_style="red",
+                                expand=False,
+                            )
                         )
                 continue
 
@@ -410,10 +474,88 @@ def main():
                             )
                         )
 
-                elif cmd in ["HGETALL", "LRANGE", "SMEMBERS", "KEYS"]:
+                # THE TYPO INTERCEPTOR
+                elif (
+                    "unknown command" in response.lower()
+                    or "err command not found" in response.lower()
+                ):
+                    bad_cmd = cmd
+                    matches = difflib.get_close_matches(
+                        bad_cmd, VALID_COMMANDS, n=1, cutoff=0.5
+                    )
+
+                    if matches:
+                        console.print(
+                            Panel(
+                                f"[bold red]❌ Unknown command:[/bold red] '{bad_cmd}'\n"
+                                f"[bold yellow]💡 Did you mean:[/bold yellow] [green]{matches[0]}[/green]?",
+                                title="Syntax Error",
+                                border_style="red",
+                                expand=False,
+                            )
+                        )
+                    else:
+                        console.print(f"[bold red]{response}[/bold red]")
+
+                # THE WRONGTYPE INTERCEPTOR
+                elif "WRONGTYPE" in response:
+                    if "Expected" in response and "Found" in response:
+                        parts = response.replace("WRONGTYPE Expected ", "").split(
+                            ", Found "
+                        )
+                        if len(parts) == 2:
+                            expected = parts[0].strip()
+                            found = parts[1].strip()
+
+                            console.print(
+                                Panel(
+                                    "[bold red]❌ Operation against a key holding the wrong kind of value[/bold red]\n\n"
+                                    f"Expected: [green]{expected}[/green]\n"
+                                    f"Found:    [yellow]{found}[/yellow]",
+                                    title="Type Mismatch",
+                                    border_style="red",
+                                    expand=False,
+                                )
+                            )
+                        else:
+                            console.print(f"[bold red]{response}[/bold red]")
+                    else:
+                        console.print(
+                            Panel(
+                                f"[bold red]❌ {response.lstrip('-')}[/bold red]\n\n"
+                                "[white]You attempted to run a command on a key that is built for a different data type.[/white]\n"
+                                f"[dim]Tip: Use 'TYPE {raw_input.split()[1] if len(raw_input.split()) > 1 else 'key'}' to check the current structure.[/dim]",
+                                title="Type Mismatch",
+                                border_style="red",
+                                expand=False,
+                            )
+                        )
+
+                # ---> THE COMPLIANT TYPE INTERCEPTOR <---
+                elif cmd == "TYPE":
+                    if "error" in response.lower():
+                        console.print(response)
+                    else:
+                        target_name = (
+                            raw_input.split()[1]
+                            if len(raw_input.split()) > 1
+                            else "unknown"
+                        )
+
+                        console.print(
+                            Panel(
+                                f"Key  : [bold white]{target_name}[/bold white]\n"
+                                f"Type : [bold cyan]{response}[/bold cyan]",
+                                title="[bold blue]🔍 DATATYPE SENSOR[/bold blue]",
+                                border_style="blue",
+                                expand=False,
+                            )
+                        )
+
+                elif cmd in ["HGETALL", "LRANGE", "SMEMBERS", "KEYS", "ZRANGE"]:
                     if (
                         "error" in response.lower()
-                        or "WRONGTYPE" in response
+                        or "wrongtype" in response.lower()
                         or "(empty" in response
                     ):
                         console.print(response)
@@ -423,9 +565,16 @@ def main():
                         )
                         lines = response.split("\n")
 
-                        if cmd == "HGETALL":
+                        if cmd == "HGETALL" or (
+                            cmd == "ZRANGE" and "WITHSCORES" in raw_input.upper()
+                        ):
+                            panel_title = (
+                                "🏎️ Telemetry Dossier"
+                                if cmd == "HGETALL"
+                                else "⏱️ Live Leaderboard"
+                            )
                             table = Table(
-                                title=f"🏎️ Telemetry Dossier: [cyan]{target_name}[/cyan]",
+                                title=f"{panel_title}: [cyan]{target_name}[/cyan]",
                                 border_style="cyan",
                                 title_justify="left",
                             )
@@ -445,6 +594,7 @@ def main():
                                 "LRANGE": "List Grid",
                                 "SMEMBERS": "VIP Paddock",
                                 "KEYS": "Active Key Radar",
+                                "ZRANGE": "Leaderboard Grid",
                             }
                             table = Table(
                                 title=f"📋 {title_map[cmd]}: [cyan]{target_name}[/cyan]",
@@ -518,10 +668,88 @@ def main():
                                 )
                             )
 
-                    elif cmd in ["HGETALL", "LRANGE", "SMEMBERS", "KEYS"]:
+                    # THE TYPO INTERCEPTOR
+                    elif (
+                        "unknown command" in response.lower()
+                        or "err command not found" in response.lower()
+                    ):
+                        bad_cmd = cmd
+                        matches = difflib.get_close_matches(
+                            bad_cmd, VALID_COMMANDS, n=1, cutoff=0.5
+                        )
+
+                        if matches:
+                            console.print(
+                                Panel(
+                                    f"[bold red]❌ Unknown command:[/bold red] '{bad_cmd}'\n"
+                                    f"[bold yellow]💡 Did you mean:[/bold yellow] [green]{matches[0]}[/green]?",
+                                    title="Syntax Error",
+                                    border_style="red",
+                                    expand=False,
+                                )
+                            )
+                        else:
+                            console.print(f"[bold red]{response}[/bold red]")
+
+                    # THE WRONGTYPE INTERCEPTOR
+                    elif "WRONGTYPE" in response:
+                        if "Expected" in response and "Found" in response:
+                            parts = response.replace("WRONGTYPE Expected ", "").split(
+                                ", Found "
+                            )
+                            if len(parts) == 2:
+                                expected = parts[0].strip()
+                                found = parts[1].strip()
+
+                                console.print(
+                                    Panel(
+                                        "[bold red]❌ Operation against a key holding the wrong kind of value[/bold red]\n\n"
+                                        f"Expected: [green]{expected}[/green]\n"
+                                        f"Found:    [yellow]{found}[/yellow]",
+                                        title="Type Mismatch",
+                                        border_style="red",
+                                        expand=False,
+                                    )
+                                )
+                            else:
+                                console.print(f"[bold red]{response}[/bold red]")
+                        else:
+                            console.print(
+                                Panel(
+                                    f"[bold red]❌ {response.lstrip('-')}[/bold red]\n\n"
+                                    "[white]You attempted to run a command on a key that is built for a different data type.[/white]\n"
+                                    f"[dim]Tip: Use 'TYPE {raw_input.split()[1] if len(raw_input.split()) > 1 else 'key'}' to check the current structure.[/dim]",
+                                    title="Type Mismatch",
+                                    border_style="red",
+                                    expand=False,
+                                )
+                            )
+
+                    # ---> THE COMPLIANT TYPE INTERCEPTOR <---
+                    elif cmd == "TYPE":
+                        if "error" in response.lower():
+                            console.print(response)
+                        else:
+                            target_name = (
+                                raw_input.split()[1]
+                                if len(raw_input.split()) > 1
+                                else "unknown"
+                            )
+
+                            console.print(
+                                Panel(
+                                    f"Key  : [bold white]{target_name}[/bold white]\n"
+                                    f"Type : [bold cyan]{response}[/bold cyan]",
+                                    title="[bold blue]🔍 DATATYPE SENSOR[/bold blue]",
+                                    border_style="blue",
+                                    expand=False,
+                                )
+                            )
+
+                    elif cmd in ["HGETALL", "LRANGE", "SMEMBERS", "KEYS", "ZRANGE"]:
                         if (
                             "error" in response.lower()
-                            or "WRONGTYPE" in response
+                            or "wrongtype" in response.lower()
                             or "(empty" in response
                         ):
                             console.print(response)
@@ -533,9 +761,16 @@ def main():
                             )
                             lines = response.split("\n")
 
-                            if cmd == "HGETALL":
+                            if cmd == "HGETALL" or (
+                                cmd == "ZRANGE" and "WITHSCORES" in raw_input.upper()
+                            ):
+                                panel_title = (
+                                    "🏎️ Telemetry Dossier"
+                                    if cmd == "HGETALL"
+                                    else "⏱️ Live Leaderboard"
+                                )
                                 table = Table(
-                                    title=f"🏎️ Telemetry Dossier: [cyan]{target_name}[/cyan]",
+                                    title=f"{panel_title}: [cyan]{target_name}[/cyan]",
                                     border_style="cyan",
                                     title_justify="left",
                                 )
@@ -557,6 +792,7 @@ def main():
                                     "LRANGE": "List Grid",
                                     "SMEMBERS": "VIP Paddock",
                                     "KEYS": "Active Key Radar",
+                                    "ZRANGE": "Leaderboard Grid",
                                 }
                                 table = Table(
                                     title=f"📋 {title_map[cmd]}: [cyan]{target_name}[/cyan]",
@@ -607,7 +843,6 @@ def main():
                         console.print(response)
 
                 except OSError:
-                    # THE MID-SESSION HOT-SWAP CONSENT CHECK
                     crash_text = (
                         "[bold yellow]⚠️ FATAL: TCP Link Severed Mid-Session![/bold yellow]\n\n"
                         "[white]Do you want to engage emergency hot-swap to the Local Engine?[/white]\n"
@@ -642,7 +877,6 @@ def main():
                     handler = CommandHandler(store)
                     store.debug_mode = debug_mode
 
-                    # Added a sleek success panel for the hot-swap completion
                     success_text = (
                         "[green]✓ Local Engine Hot-Swapped Successfully[/green]\n"
                         f"[cyan]Loaded {len(store._data)} keys from local persistence.[/cyan]"
@@ -655,18 +889,40 @@ def main():
                             expand=False,
                         )
                     )
-                    print()  # Blank line for spacing
+                    print()
                     continue
 
         except KeyboardInterrupt:
             console.print("\n[bold red]Shutting down Kedis...[/bold red]")
             break
 
+        except TypeError as e:
+            error_msg = str(e)
+            if "WRONGTYPE" in error_msg:
+                parts = error_msg.replace("WRONGTYPE Expected ", "").split(", Found ")
+                if len(parts) == 2:
+                    expected = parts[0].strip()
+                    found = parts[1].strip()
+
+                    console.print(
+                        Panel(
+                            "[bold red]❌ WRONGTYPE Operation against a key holding the wrong kind of value[/bold red]\n\n"
+                            f"Expected: [green]{expected}[/green]\n"
+                            f"Found:    [yellow]{found}[/yellow]",
+                            title="Type Mismatch",
+                            border_style="red",
+                            expand=False,
+                        )
+                    )
+                else:
+                    console.print(f"[bold red](error) {error_msg}[/bold red]")
+            else:
+                console.print(f"[bold red](error) ERR {error_msg}[/bold red]")
+
         except Exception as e:
             console.print(
                 f"[bold red](error) ERR internal server error: {str(e)}[/bold red]"
             )
-
     if not local_mode:
         s.close()
 
