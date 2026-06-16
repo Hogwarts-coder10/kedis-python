@@ -1,95 +1,319 @@
-## 🚀 Kedis-Python — Redis-Inspired Architecture Prototype
-Overview
-Kedis-Python is a lightweight Redis-inspired in-memory key-value store built in Python to explore system architecture and internal design concepts behind modern in-memory databases.
+# 🚀 Kedis-Python
 
-This project focuses on understanding:
-- command parsing
-- modular system design
-- storage abstraction
-- execution flow
-- extensible architecture
+**A Redis-inspired in-memory datastore built in pure Python to explore storage engines, networking, persistence, caching, and systems architecture.**
 
-before moving toward a lower-level implementation in C.
+> Built to understand systems, not just use them.
 
-# 🧠 Motivation
-Modern systems heavily rely on fast in-memory databases like Redis for caching, message brokering, and high-speed data access.
+---
 
-Kedis-Python is designed as an architecture-first prototype to understand how such systems work internally by implementing core components from scratch.
+# 📖 Overview
 
-The goal is not to clone Redis completely, but to deeply understand:
-- how commands flow through a system
-- how storage layers interact
-- how modular architectures are structured
-- how scalable backend systems are designed
+Kedis-Python is a Redis-inspired in-memory datastore implemented from scratch in Python.
 
-# ⚙️ Features (Planned)
-🔑 Core Key-Value Operations
-- SET key value
-- GET key
-- DEL key
-- EXISTS key
+The project was created to explore how modern in-memory databases work internally by implementing core components such as:
 
-⏳ Expiry Support
-- EXPIRE key seconds
-- TTL key
+* storage engines
+* command routing
+* networking
+* persistence
+* memory management
+* transactions
+* data structures
 
-🧩 Modular Architecture
-- Parser Layer
-- Command Execution Layer
-- Storage Layer
-- Utility Layer
+Rather than focusing on Redis compatibility, Kedis focuses on understanding the architectural and engineering principles behind high-performance backend systems.
 
-💾 Persistence (Optional)
-- Save in-memory data to disk
-- Reload saved data during startup
+---
+
+# ✨ Features
+
+## 🔑 Core Key-Value Operations
+
+* SET
+* GET
+* DEL
+* EXISTS
+
+---
+
+## 📦 Multiple Data Structures
+
+### Strings
+
+```bash
+SET user karthik
+GET user
+```
+
+### Lists
+
+```bash
+LPUSH tasks coding
+RPUSH tasks testing
+LPOP tasks
+```
+
+### Sets
+
+```bash
+SADD skills python
+SADD skills systems
+SMEMBERS skills
+```
+
+### Hashes
+
+```bash
+HSET user name karthik
+HGET user name
+```
+
+### Sorted Sets (Skip Lists)
+
+```bash
+ZADD leaderboard 100 karthik
+ZRANGE leaderboard
+```
+
+Implemented using a custom Skip List inspired by Redis sorted set internals.
+
+---
+
+## ⏳ Expiration Support
+
+```bash
+EXPIRE session 60
+TTL session
+```
+
+Supports automatic key expiration.
+
+---
+
+## 💾 Persistence
+
+Append-Only File (AOF) persistence:
+
+* durable write logging
+* automatic recovery on startup
+* AOF compaction support
+
+---
+
+## 🧠 Memory Management
+
+LRU-based eviction support:
+
+* tracks key usage
+* evicts least recently used entries when limits are reached
+
+---
+
+## 🔄 Transactions
+
+Supports transactional execution:
+
+```bash
+MULTI
+SET a 1
+SET b 2
+EXEC
+```
+
+---
+
+## 🌐 Networking
+
+TCP server implementation supporting:
+
+* multiple client connections
+* command execution over sockets
+* standalone local mode fallback
+
+---
+
+## 📊 Observability
+
+Built-in INFO command exposing:
+
+* key counts
+* data type statistics
+* persistence information
+* expiration information
+* runtime metadata
+
+---
+
+## 📴 Offline / Standalone Mode
+
+When the server becomes unavailable:
+
+* users can switch to standalone mode
+* local operations continue
+* users are warned about possible state divergence
+* reconnection remains user-controlled
+
+This feature was added to explore failure handling and graceful degradation.
+
+---
 
 # 🏗️ Architecture
-User Input → Parser → Command Handler → In-Memory Store → Response
-📁 Project Structure
-kedis-python/
-│
-├── main.py          # Entry point / CLI loop
-├── parser.py        # Command parser
-├── commands.py      # Command implementations
-├── store.py         # In-memory storage engine
-├── utils.py         # Utility/helper functions
-└── README.md
 
-# 🚦 Getting Started
-Prerequisites:
-- Python 3.x
+```text
+Client
+   │
+   ▼
+TCP Server
+   │
+   ▼
+Command Parser
+   │
+   ▼
+Command Router
+   │
+   ▼
+Storage Engine
+   ├── Strings
+   ├── Lists
+   ├── Sets
+   ├── Hashes
+   └── Sorted Sets (Skip Lists)
+   │
+   ▼
+Persistence Layer (AOF)
+```
 
-Run the project:
-python main.py
+The architecture is intentionally modular to make experimentation and future rewrites easier.
+
+---
 
 
-# 💡 Example Usage
 
-- SET name Karthik
-- GET name
-- EXISTS name
-- DEL name
+# ⚡ Benchmark
 
+Current benchmark results:
 
-# 🎯 Learning Goals
-- understanding in-memory data systems
-- designing modular software architecture
-- implementing command-driven systems
-- exploring backend system design
-- preparing for lower-level systems implementation
-  
-# 🚀 Future Improvements
-- TCP server support
-- Multi-client handling
-- Concurrency support
-- Advanced data structures
-- Redis-inspired optimizations
-- C implementation after architecture validation
-  
+```text
+~5300 requests/sec
+```
+
+Environment:
+
+* Python 3.x
+* TCP networking enabled
+* Concurrent client workload
+* Mixed GET / SET operations
+* AOF persistence enabled
+
+Benchmarking is ongoing as persistence and networking layers continue to evolve.
+
+---
+
+# 🧪 Testing
+
+The project includes automated tests covering:
+
+* command execution
+* data structures
+* persistence recovery
+* expiration behavior
+
+Additional coverage is actively being expanded as the project evolves.
+
+---
+
+# 🎯 Design Goals
+
+Kedis was created to explore:
+
+* storage engine design
+* command-driven architectures
+* networking fundamentals
+* persistence strategies
+* memory management
+* data structure implementation
+* systems engineering tradeoffs
+
+---
+
+# 🤔 Why Skip Lists?
+
+Sorted Sets are implemented using Skip Lists.
+
+Reasons:
+
+* expected O(log N) insertion
+* expected O(log N) lookup
+* natural ordered traversal
+* simpler implementation than self-balancing trees
+
+This mirrors the design approach used by Redis for sorted sets.
+
+---
+
+# ⚠ Known Limitations
+
+Kedis is an educational systems project and is **not intended for production use**.
+
+Current limitations include:
+
+* custom text protocol (RESP not implemented)
+* thread-based concurrency model
+* simplified memory accounting
+* limited fault tolerance compared to production databases
+
+These limitations are intentional learning opportunities and areas of active development.
+
+---
+
+# 🛣️ Roadmap
+
+Planned improvements:
+
+* Buffered AOF persistence
+* RESP protocol support
+* Async networking
+* Improved observability
+* Memory-based eviction
+* Enhanced benchmark tooling
+* Additional persistence optimizations
+
+---
+
+# 📚 Learning Outcomes
+
+This project explores concepts commonly found in modern backend systems:
+
+* Redis-style architecture
+* command dispatch systems
+* persistence mechanisms
+* cache eviction policies
+* TCP networking
+* transaction processing
+* skip lists
+* systems performance analysis
+
+---
+
+# 🚀 Future Direction
+
+Kedis serves as an architecture and systems-design exploration platform before moving toward lower-level implementations and more advanced storage engine designs.
+
+The long-term goal is to understand how production systems are engineered, optimized, and maintained.
+
+---
+
 # 🤝 Contributing
-This is primarily a personal learning project, but ideas, suggestions, and improvements are welcome.
 
-📌 Author
-V SS Karthik
-  
->"Built to understand systems, not just use them.”
+Suggestions, issues, and discussions are welcome.
+
+This project is primarily a learning and exploration platform, but contributions are appreciated.
+
+---
+
+# 👨‍💻 Author
+
+**V SS Karthik**
+
+AI/ML Student • Systems Enthusiast • Builder of developer tools and infrastructure projects
+
+> "Built to understand systems, not just use them."
