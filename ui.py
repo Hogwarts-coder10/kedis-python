@@ -3,13 +3,12 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-# Global console for the entire app to share
 console = Console()
 
 
 class UI:
     @staticmethod
-    def print_banner(version="0.2.0", codename="Echo"):
+    def print_banner(version="0.3.0", codename="Echo"):
         fig = Figlet(font="big")
         logo = fig.renderText("KEDIS")
         console.print(
@@ -42,16 +41,21 @@ class UI:
 
     @staticmethod
     def render_stats(response):
+        """Beautifully renders the Engine Stats with the new LRU subsystem divider."""
         lines = response.split("\n")
         if len(lines) > 1:
-            stat_text = "\n".join(
-                [
-                    f"[cyan]{line.split(':')[0].ljust(15)}[/cyan]: [yellow]{line.split(':')[1]}[/yellow]"
-                    for line in lines
-                    if ":" in line
-                ]
-            )
-            UI.print_panel(stat_text, "🔧 DEEP MEMORY MAP", "blue")
+            formatted_lines = []
+            for line in lines:
+                if line == "---":
+                    # Create a slick divider for the LRU sub-system
+                    formatted_lines.append("[dim]" + "─" * 30 + "[/dim]")
+                elif ":" in line:
+                    key, val = line.split(":", 1)
+                    formatted_lines.append(
+                        f"[cyan]{key.ljust(15)}[/cyan]: [yellow]{val}[/yellow]"
+                    )
+
+            UI.print_panel("\n".join(formatted_lines), "🔧 DEEP MEMORY MAP", "blue")
         else:
             console.print(f"[bold red]{response}[/bold red]")
 
