@@ -32,6 +32,7 @@ class CommandHandler:
             "ZADD": self._handle_zadd,
             "ZRANGE": self._handle_zrange,
             "TYPE": self._handle_type,
+            "STATS": self._handle_stats,
         }
 
     def execute(self, tokens: list[str]) -> str:
@@ -300,3 +301,22 @@ class CommandHandler:
 
         key = tokens[1]
         return self.store.type_of(key)
+
+    def _handle_stats(self, tokens: list[str]) -> str:
+        """Pulls both Global Data Stats and LRU Telemetry from the engine"""
+        stats = self.store.get_engine_stats()
+        lru = stats.get("lru_cache", {})
+
+        return (
+            f"Total Keys:{stats.get('total_keys', 0)}\n"
+            f"String Chars:{stats.get('string_chars', 0)}\n"
+            f"List Items:{stats.get('list_items', 0)}\n"
+            f"Set Members:{stats.get('set_members', 0)}\n"
+            f"Hash Fields:{stats.get('hash_fields', 0)}\n"
+            f"ZSet Nodes:{stats.get('zset_nodes', 0)}\n"
+            "---\n"
+            f"LRU Hits:{lru.get('hits', 0)}\n"
+            f"LRU Misses:{lru.get('misses', 0)}\n"
+            f"Hit Rate:{lru.get('hit_rate_pct', 0.0)}%\n"
+            f"LRU Tracked:{lru.get('tracked_keys', 0)} / {lru.get('max_size', 128)}"
+        )
