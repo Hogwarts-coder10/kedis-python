@@ -2,6 +2,19 @@ import difflib
 import os
 import sys
 
+# --- BUG FIX: Issue #1 (Linux Kitty Terminal Compatibility) ---
+# Intercept and neutralize Kitty's advanced keyboard protocol before
+# GNU readline or Rich initializes and breaks the terminal cursor state.
+
+if (
+    os.environ.get("TERM") == "xterm-kitty"
+    or "kitty" in os.environ.get("TERM", "").lower()
+):
+    os.environ["KITTY_DISABLE_KEYBOARD_PROTOCOL"] = "1"
+
+    os.environ["TERM"] = "xterm-256color"
+
+
 from commands import CommandHandler
 from network import NetworkManager
 from parser import CommandParser
@@ -9,21 +22,29 @@ from store import KedisStore
 from ui import UI, console
 
 # --- The Command History Hook ---
+
 try:
     import atexit
     import readline
 
     histfile = os.path.join(os.path.expanduser("~"), ".kedis_history")
+
     try:
         readline.read_history_file(histfile)
+
         readline.set_history_length(1000)
+
     except FileNotFoundError:
         pass
+
     atexit.register(readline.write_history_file, histfile)
+
 except ImportError:
     pass
 
+
 # --- The Dictionary of Valid Commands ---
+
 VALID_COMMANDS = [
     "SET",
     "GET",
@@ -57,27 +78,41 @@ VALID_COMMANDS = [
     "CLS",
     "EXIT",
     "QUIT",
+    "MULTI",
+    "EXEC",
+    "DISCARD",
 ]
 
 
 class KedisClient:
     def __init__(self):
+
         self.network = NetworkManager()
+
         self.local_mode = False
+
         self.suppress_reconnect = False
+
         self.debug_mode = False
+
         self.store = None
+
         self.handler = None
 
     def boot(self):
         """The Ignition Sequence"""
+
         UI.print_banner()
+
         try:
             self.network.connect()
+
             console.print("[green]✓ Network Link Established[/green]")
+
             console.print(
                 f"[bold blue]Ready (TCP Network Mode) - Connected to {self.network.host}:{self.network.port}[/bold blue]\n"
             )
+
         except ConnectionRefusedError:
             UI.print_panel(
                 "[bold yellow]⚠️ Network database unavailable.[/bold yellow]\n\n"
@@ -87,70 +122,107 @@ class KedisClient:
                 "Connection Failed",
                 "yellow",
             )
+
             choice = (
                 console.input("[bold yellow]Continue? [Y/n]: [/bold yellow]")
                 .strip()
                 .lower()
             )
+
             if choice == "n":
                 console.print(
                     "\n[bold red]Aborting. Shutting down Kedis CLI...[/bold red]"
                 )
+
                 sys.exit(0)
+
             self._init_local_engine()
 
         console.print("[dim]Type 'exit', 'quit', or press Ctrl+C to shut down.[/dim]\n")
+
         self.run_loop()
 
     def _init_local_engine(self):
+
         self.local_mode = True
+
         self.store = KedisStore()
+
         self.handler = CommandHandler(self.store)
+
         console.print("\n[green]✓ Local Storage Engine Online[/green]")
+
         console.print("[green]✓ Command Router Online[/green]")
+
         console.print("[green]✓ Persistence Layer Online[/green]")
+
         console.print(
             f"[cyan]Loaded {len(self.store._data)} keys from local persistence.[/cyan]"
         )
+
         console.print("[bold purple]Ready (Standalone Local Mode).[/bold purple]\n")
 
     def run_loop(self):
         """The Core Terminal Loop"""
+
         while True:
             try:
                 self._check_radar()
 
                 # Determine prompt debug status
+
                 current_debug = (
                     getattr(self.store, "debug_mode", False)
                     if self.local_mode
                     else self.debug_mode
                 )
-                prompt = (
-                    "[bold red]echo-debug[/bold red] ❯ "
-                    if current_debug
-                    else "[bold cyan]echo[/bold cyan] ❯ "
-                )
 
-                raw_input = console.input(prompt).strip()
+                # --- BUG FIX: Linux Kitty Terminal & POSIX Readline Invisible Input ---
+
+                if os.name == "posix" and "readline" in sys.modules:
+                    if current_debug:
+                        prompt = "\001\x1b[1;31m\002echo-debug\001\x1b[0m\002 ❯ "
+
+                    else:
+                        prompt = "\001\x1b[1;36m\002echo\001\x1b[0m\002 ❯ "
+
+                    raw_input = input(prompt).strip()
+
+                else:
+                    # Windows or fallback (rich handles this fine)
+
+                    prompt = (
+                        "[bold red]echo-debug[/bold red] ❯ "
+                        if current_debug
+                        else "[bold cyan]echo[/bold cyan] ❯ "
+                    )
+
+                    raw_input = console.input(prompt).strip()
+
                 if not raw_input:
                     continue
 
                 cmd = raw_input.split()[0].upper()
 
                 # If it's a UI/Client command, handle it and skip the database trip
+
                 if self._handle_client_commands(cmd, raw_input, current_debug):
                     continue
 
                 # Otherwise, execute against the DB and render the result
+
                 self._execute_and_render(cmd, raw_input)
 
             except KeyboardInterrupt:
                 console.print("\n[bold red]Shutting down Kedis...[/bold red]")
+
                 break
+
             except TypeError as e:
                 # Catch-all for engine type errors leaking out
+
                 UI.render_wrongtype(str(e), "key")
+
             except Exception as e:
                 console.print(
                     f"[bold red](error) ERR internal client error: {str(e)}[/bold red]"
@@ -160,7 +232,9 @@ class KedisClient:
 
     def _check_radar(self):
         """
+
         Scans for TCP server recovery in the background.
+
         """
 
         if self.local_mode and not self.suppress_reconnect:
@@ -173,43 +247,57 @@ class KedisClient:
                     "Network Available",
                     "yellow",
                 )
+
                 choice = (
                     console.input("[bold yellow]Switch? [Y/n]: [/bold yellow]")
                     .strip()
                     .lower()
                 )
+
                 if choice == "n":
                     self.suppress_reconnect = True
+
                     console.print(
                         "[dim]Staying in Standalone Mode. Reconnect radar disabled.[/dim]\n"
                     )
+
                 else:
                     self.network.connect()
+
                     self.local_mode = False
+
                     console.print("\n[green]✓ Network Link Re-Established[/green]")
+
                     console.print(
                         f"[bold blue]Ready (TCP Network Mode) - Connected to {self.network.host}:{self.network.port}[/bold blue]\n"
                     )
 
     def _handle_client_commands(self, cmd, raw_input, current_debug) -> bool:
         """
+
         Processes commands that don't need to hit the database engine.
+
         """
 
         if cmd in ["CLS", "CLEAR"]:
             os.system("cls" if os.name == "nt" else "clear")
+
             return True
 
         if cmd in ["EXIT", "QUIT"]:
             console.print("[bold red]Shutting down Kedis...[/bold red]")
+
             sys.exit(0)
 
         if cmd == "DEBUG":
             if self.local_mode:
                 self.store.debug_mode = not getattr(self.store, "debug_mode", False)
+
                 self.debug_mode = self.store.debug_mode
+
             else:
                 self.debug_mode = not self.debug_mode
+
                 self.network.send_command(raw_input)
 
             status = (
@@ -217,7 +305,9 @@ class KedisClient:
                 if self.debug_mode
                 else "[bold green]OFF ⚪[/bold green]"
             )
+
             console.print(f"\n[dim]🔧 Diagnostic telemetry is now {status}[/dim]\n")
+
             return True
 
         if cmd == "RECONNECT":
@@ -227,39 +317,49 @@ class KedisClient:
                     "⚠ NETWORK STATUS",
                     "yellow",
                 )
+
             else:
                 console.print(
                     "[dim]Attempting manual TCP network re-engagement...[/dim]"
                 )
+
                 try:
                     self.network.connect()
+
                     self.local_mode = False
+
                     self.suppress_reconnect = False
+
                     UI.print_panel(
                         "[bold green]✓ Reconnected successfully[/bold green]\n"
                         f"[blue]Mode: TCP Network ({self.network.host}:{self.network.port})[/blue]",
                         "🔌 CONNECTION RESTORED",
                         "green",
                     )
+
                 except OSError:
                     UI.print_panel(
                         "[bold red]✖ Recovery failed. Server is still offline.[/bold red]",
                         "✖ CONNECTION FAILED",
                         "red",
                     )
+
             return True
 
         if cmd == "MODE":
             debug_status = (
                 "[bold green]ON[/bold green]" if current_debug else "[dim]OFF[/dim]"
             )
+
             if self.local_mode:
                 radar_status = (
                     "[dim]Disabled[/dim]"
                     if self.suppress_reconnect
                     else "[green]Scanning[/green]"
                 )
+
                 key_count = len(self.store._data) if self.store else 0
+
                 mode_text = (
                     f"Mode:            [purple]Standalone[/purple]\n"
                     f"Persistence:     [yellow]Local Disk[/yellow]\n"
@@ -267,7 +367,9 @@ class KedisClient:
                     f"Debug:           {debug_status}\n"
                     f"Keys Loaded:     [cyan]{key_count}[/cyan]"
                 )
+
                 UI.print_panel(mode_text, "Kedis Status", "purple")
+
             else:
                 mode_text = (
                     f"Mode:       [blue]TCP[/blue]\n"
@@ -276,18 +378,25 @@ class KedisClient:
                     f"Connection: [green]Active[/green]\n"
                     f"Debug:      {debug_status}"
                 )
+
                 UI.print_panel(mode_text, "Kedis Status", "blue")
+
             return True
 
         if cmd == "INFO":
             version = "0.2.0"
+
             codename = "Echo"
+
             if self.local_mode:
                 key_count = len(getattr(self.store, "_data", {})) if self.store else 0
+
                 exp_count = (
                     len(getattr(self.store, "_expires", {})) if self.store else 0
                 )
+
                 aof_file = getattr(self.store, "aof_filename", "kedis.aof")
+
                 aof_size = (
                     f"{os.path.getsize(aof_file) / 1024:.1f} KB"
                     if os.path.exists(aof_file)
@@ -295,31 +404,45 @@ class KedisClient:
                 )
 
                 str_c = list_c = set_c = hash_c = zset_c = 0
+
                 if self.store:
                     for val in self.store._data.values():
                         val_type = type(val).__name__
+
                         if val_type == "list":
                             list_c += 1
+
                         elif val_type == "set":
                             set_c += 1
+
                         elif val_type == "dict":
                             hash_c += 1
+
                         elif val_type == "SkipList":
                             zset_c += 1
+
                         else:
                             str_c += 1
+
                 type_breakdown = f"[dim]Str: {str_c} | Lst: {list_c} | Set: {set_c} | Hsh: {hash_c} | ZSet: {zset_c}[/dim]"
+
                 persistence = "AOF"
+
                 current_mode = "Standalone"
+
             else:
                 key_count = exp_count = aof_size = "N/A (Server)"
+
                 type_breakdown = "[dim]N/A (Server)[/dim]"
+
                 persistence = "TCP Stream"
+
                 current_mode = "TCP"
 
             debug_status = (
                 "[bold green]ON[/bold green]" if current_debug else "[dim]OFF[/dim]"
             )
+
             info_text = (
                 f"Version        : [green]{version}[/green]\n"
                 f"Codename       : [yellow]{codename}[/yellow]\n\n"
@@ -331,7 +454,9 @@ class KedisClient:
                 f"Mode           : [purple]{current_mode}[/purple]\n"
                 f"Debug          : {debug_status}"
             )
+
             UI.print_panel(info_text, "Kedis Information", "blue")
+
             return True
 
         if cmd == "HELP":
@@ -370,35 +495,48 @@ class KedisClient:
                 "  [yellow]CLEAR / CLS[/yellow]          : Clear the terminal screen\n"
                 "  [yellow]EXIT / QUIT[/yellow]          : Shut down the client\n"
             )
+
             UI.print_panel(help_text, "Kedis Command Reference", "yellow")
+
             return True
 
         return False
 
     def _execute_and_render(self, cmd, raw_input):
         """
+
         Routes execution (TCP vs Local) and renders the unified response.
+
         """
 
         try:
             if self.local_mode:
                 if cmd == "STATS":
                     response = self.handler.execute(["STATS"])
+
                 else:
                     tokens = CommandParser.parse(raw_input)
+
                     if tokens and tokens[0] == "ERROR":
                         console.print(f"[red]{tokens[1]}[/red]")
+
                         return
+
                     if not tokens:
                         return
+
                     response = self.handler.execute(tokens)
+
             else:
                 response = self.network.send_command(raw_input)
+
         except OSError:
             self._handle_tcp_crash()
+
             return
 
         # --- THE GRAND UX INTERCEPTOR (UNIFIED) ---
+
         if cmd == "COMPACT":
             if "+OK" in response:
                 UI.print_panel(
@@ -406,6 +544,7 @@ class KedisClient:
                     "🧹 AOF Cleaner",
                     "green",
                 )
+
             else:
                 UI.print_panel(
                     f"[bold red]Compaction Failed[/bold red]\n{response}",
@@ -421,8 +560,10 @@ class KedisClient:
             or "err command not found" in response.lower()
         ):
             matches = difflib.get_close_matches(cmd, VALID_COMMANDS, n=1, cutoff=0.5)
+
             if matches:
                 UI.render_typo(cmd, matches)
+
             else:
                 console.print(f"[bold red]{response}[/bold red]")
 
@@ -432,6 +573,7 @@ class KedisClient:
         elif cmd == "TYPE":
             if "error" in response.lower():
                 console.print(response)
+
             else:
                 UI.render_type_sensor(response, raw_input)
 
@@ -442,14 +584,18 @@ class KedisClient:
                 or "(empty" in response
             ):
                 console.print(response)
+
             else:
                 UI.render_table(cmd, response, raw_input)
+
         else:
             console.print(response)
 
     def _handle_tcp_crash(self):
         """
+
         Gracefully recovers if the TCP server explodes mid-query.
+
         """
 
         crash_text = (
@@ -457,7 +603,9 @@ class KedisClient:
             "[white]Do you want to engage emergency hot-swap to the Local Engine?[/white]\n"
             "[dim](Data saved here will not sync to the server)[/dim]"
         )
+
         UI.print_panel(crash_text, "🚨 Connection Lost", "red")
+
         choice = (
             console.input(
                 "\n[bold yellow]Continue in Standalone Mode? [Y/n]: [/bold yellow]"
@@ -465,11 +613,14 @@ class KedisClient:
             .strip()
             .lower()
         )
+
         if choice == "n":
             console.print("\n[bold red]Aborting. Shutting down Kedis CLI...[/bold red]")
+
             sys.exit(0)
 
         self._init_local_engine()
+
         UI.print_panel(
             "[green]✓ Local Engine Hot-Swapped Successfully[/green]\n"
             f"[cyan]Loaded {len(self.store._data)} keys from local persistence.[/cyan]",
@@ -480,4 +631,5 @@ class KedisClient:
 
 if __name__ == "__main__":
     client = KedisClient()
+
     client.boot()
