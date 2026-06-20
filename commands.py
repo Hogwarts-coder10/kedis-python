@@ -33,6 +33,7 @@ class CommandHandler:
             "ZRANGE": self._handle_zrange,
             "TYPE": self._handle_type,
             "STATS": self._handle_stats,
+            "CONFIG": self._handle_config,  # <-- Added the config parser
         }
 
     def execute(self, tokens: list[str]) -> str:
@@ -45,7 +46,6 @@ class CommandHandler:
         cmd = tokens[0]
 
         # The Magic O(1) Router
-        # Instead of 9 if/elif checks, we instantly grab the exact function we need.
         if cmd in self._commands:
             handler_function = self._commands[cmd]
             return handler_function(tokens)
@@ -55,6 +55,32 @@ class CommandHandler:
     # ---------------------------------------------------------
     # COMMAND HANDLERS (The isolated engine components)
     # ---------------------------------------------------------
+
+    def _handle_config(self, tokens: list[str]) -> str:
+        """Handles dynamic server configuration (CONFIG SET / CONFIG GET)"""
+        if len(tokens) < 3:
+            return "(error) ERR wrong number of arguments for 'CONFIG' command"
+
+        sub_cmd = tokens[1].upper()
+        param = tokens[2].lower()
+
+        if param != "appendfsync":
+            return f"(error) ERR unsupported CONFIG parameter '{param}'"
+
+        if sub_cmd == "SET":
+            if len(tokens) != 4:
+                return "(error) ERR wrong number of arguments for 'CONFIG SET'"
+            new_mode = tokens[3].lower()
+            return self.store.set_appendfsync(new_mode)
+
+        elif sub_cmd == "GET":
+            if len(tokens) != 3:
+                return "(error) ERR wrong number of arguments for 'CONFIG GET'"
+            # Returns the standard 2-part array format
+            return f'1) "{param}"\n2) "{self.store.appendfsync}"'
+
+        else:
+            return f"(error) ERR unknown CONFIG subcommand '{sub_cmd}'"
 
     def _handle_set(self, tokens: list[str]) -> str:
         if len(tokens) != 3:
@@ -255,7 +281,6 @@ class CommandHandler:
         key = tokens[1]
         added = 0
         try:
-            # Loop through in pairs so we can add multiple cars at once!
             for i in range(2, len(tokens), 2):
                 score = float(tokens[i])
                 member = tokens[i + 1]
