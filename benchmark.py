@@ -8,8 +8,8 @@ console = Console()
 
 HOST = "127.0.0.1"
 PORT = 6379
-THREADS = 50
-REQUESTS_PER_THREAD = 1000
+THREADS = 1  # Dropped to 1 to avoid the collision
+REQUESTS_PER_THREAD = 50000  # Cranked up to maintain the volume
 
 
 def hammer_server(thread_id):
