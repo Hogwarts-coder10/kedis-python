@@ -338,7 +338,7 @@ class KedisClient:
             return True
 
         if cmd == "INFO":
-            version = "0.3.0"
+            version = "0.2.0"
             codename = "Echo"
 
             if self.local_mode:
@@ -370,9 +370,13 @@ class KedisClient:
                             str_c += 1
 
                 type_breakdown = f"[dim]Str: {str_c} | Lst: {list_c} | Set: {set_c} | Hsh: {hash_c} | ZSet: {zset_c}[/dim]"
-                
+
                 # Dynamically pull the active I/O drivetrain (Safely scoped to Local Mode)
-                sync_policy = self.store.appendfsync.upper() if getattr(self, "store", None) else "UNKNOWN"
+                sync_policy = (
+                    self.store.appendfsync.upper()
+                    if getattr(self, "store", None)
+                    else "UNKNOWN"
+                )
                 persistence = f"AOF ({sync_policy})"
                 current_mode = "Standalone"
 
@@ -401,7 +405,7 @@ class KedisClient:
             UI.print_panel(info_text, "Kedis Information", "blue")
 
             return True
-        
+
         if cmd == "HELP":
             help_text = (
                 "[bold cyan]Core String Commands[/bold cyan]\n"
