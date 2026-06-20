@@ -189,23 +189,37 @@ The architecture is intentionally modular to make experimentation and future rew
 
 
 # ⚡ Benchmark
-
-Current benchmark results:
-
-```text
-~5300 requests/sec
+Single-thread localhost benchmark
+100,000 total operations (50,000 SET + 50,000 GET)
 ```
+| AOF Mode | Throughput |
+|-----------|------------|
+| appendfsync always | ~1,081 req/sec |
+| appendfsync everysec | ~13,898 req/sec |
+```
+### Observation
 
-Environment:
+Persistence strategy has a significant impact on throughput.
 
-* Python 3.x
-* TCP networking enabled
-* Concurrent client workload
-* Mixed GET / SET operations
-* AOF persistence enabled
+`appendfsync always` prioritizes durability by forcing a disk sync after every write.
 
-Benchmarking is ongoing as persistence and networking layers continue to evolve.
+`appendfsync everysec` batches synchronization operations, significantly improving throughput while accepting up to one second of potential data loss during unexpected crashes.
 
+---
+
+
+### Benchmark Configuration
+
+- Host: localhost
+- Threads: 1
+- Operations: 100,000
+- Workload:
+  - SET
+  - GET
+- Persistence:
+  - appendfsync always
+  - appendfsync everysec
+ 
 ---
 
 # 🧪 Testing
