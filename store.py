@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import time
 from collections import OrderedDict
 from typing import Any, Optional
@@ -8,7 +9,12 @@ from skiplist import SkipList
 
 
 class KedisStore:
-    def __init__(self, aof_filename="kedis.aof", lru_maxsize: int = 128):
+    def __init__(
+        self,
+        aof_filename="kedis.aof",
+        lru_maxsize: int = 128,
+        appendfsync: str = "everysec",
+    ):
         self.debug_mode = False
         # The primary hash map for storing key-value pairs of ANY type
         self._data: dict[str, Any] = {}
@@ -28,24 +34,90 @@ class KedisStore:
         self._is_recovering = True
 
         self.aof_filename = aof_filename
+
+        # --- THE I/O DRIVETRAIN ---
+        self.appendfsync = appendfsync
+        self._shutdown_flag = False
+
         self.recover_from_aof()
 
         self._is_recovering = False
         self.aof_file = open(self.aof_filename, "a")
 
+        # Start the background sync engine if using high-performance mode
+        if self.appendfsync == "everysec":
+            self._sync_thread = threading.Thread(
+                target=self._background_fsync, daemon=True
+            )
+            self._sync_thread.start()
+
+    def set_appendfsync(self, mode: str) -> str:
+        """
+        Dynamically shifts the I/O drivetrain while the engine is running.
+        """
+
+        if mode not in ("always", "everysec"):
+            return "-ERR unsupported sync mode. Use 'always' or 'everysec'"
+
+        self.appendfsync = mode
+
+        if mode == "always":
+            # Shifting to MAX SAFETY: Immediately flush any pending RAM buffers to disk
+            if getattr(self, "aof_file", None) and not self.aof_file.closed:
+                try:
+                    self.aof_file.flush()
+                    os.fsync(self.aof_file.fileno())
+                except OSError:
+                    pass
+            return "+OK appendfsync set to always"
+
+        if mode == "everysec":
+            # Shifting to MAX SPEED: Make sure the background thread is actually alive
+            if not hasattr(self, "_sync_thread") or not self._sync_thread.is_alive():
+                self._shutdown_flag = False
+                self._sync_thread = threading.Thread(
+                    target=self._background_fsync, daemon=True
+                )
+                self._sync_thread.start()
+            return "+OK appendfsync set to everysec"
+
+    def _background_fsync(self):
+        """
+        The background I/O thread that flushes the OS buffer to disk once per second.
+        """
+
+        while not self._shutdown_flag:
+            time.sleep(1.0)
+            # Only hit the metal if the drivetrain is currently set to 'everysec'
+            if (
+                self.appendfsync == "everysec"
+                and getattr(self, "aof_file", None)
+                and not self.aof_file.closed
+            ):
+                try:
+                    self.aof_file.flush()
+                    os.fsync(self.aof_file.fileno())
+                except OSError:
+                    pass
+
     def _log_operation(self, *tokens):
-        """Appends the raw command to AOF and forces it to the physical disk"""
+        """
+        Appends the raw command to AOF based on the active appendfsync policy.
+        """
 
         if getattr(self, "_is_recovering", False):
             return
 
         command_string = " ".join(str(t) for t in tokens)
         self.aof_file.write(command_string + "\n")
-        self.aof_file.flush()
-        try:
-            os.fsync(self.aof_file.fileno())
-        except OSError:
-            pass
+
+        # Only block the main Python thread if the user demands absolute safety
+        if self.appendfsync == "always":
+            self.aof_file.flush()
+            try:
+                os.fsync(self.aof_file.fileno())
+            except OSError:
+                pass
 
     def _evict_if_expired(self, key: str) -> bool:
         """Helper to passively check and evict an expired key. Returns True if evicted."""
