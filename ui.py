@@ -40,6 +40,41 @@ class UI:
         )
 
     @staticmethod
+    def render_config(response, sub_cmd):
+        """Renders dynamic engine tuning results in a beautiful panel."""
+        if "error" in response.lower() or "ERR" in response:
+            UI.print_panel(
+                f"[bold red]❌ {response.lstrip('-')}[/bold red]",
+                "Configuration Error",
+                "red",
+            )
+        elif sub_cmd == "SET":
+            # For success messages like: "+OK appendfsync set to always"
+            msg = response.lstrip("+OK ").strip()
+            UI.print_panel(
+                f"[bold green]✓ Success:[/bold green] [white]{msg}[/white]",
+                "⚙️ ENGINE TUNING",
+                "green",
+            )
+        elif sub_cmd == "GET":
+            # Parses the format: 1) "appendfsync"\n2) "everysec"
+            lines = response.split("\n")
+            if len(lines) >= 2:
+                try:
+                    param = lines[0].split('"')[1]
+                    val = lines[1].split('"')[1]
+                    UI.print_panel(
+                        f"Parameter : [bold cyan]{param}[/bold cyan]\n"
+                        f"State     : [bold yellow]{val}[/bold yellow]",
+                        "🔍 CONFIG SENSOR",
+                        "blue",
+                    )
+                except IndexError:
+                    console.print(response)
+            else:
+                console.print(response)
+
+    @staticmethod
     def render_stats(response):
         """Beautifully renders the Engine Stats with the new LRU subsystem divider."""
         lines = response.split("\n")
