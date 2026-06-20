@@ -370,15 +370,12 @@ class KedisClient:
                             str_c += 1
 
                 type_breakdown = f"[dim]Str: {str_c} | Lst: {list_c} | Set: {set_c} | Hsh: {hash_c} | ZSet: {zset_c}[/dim]"
-
-                sync_policy = (
-                    self.store.appendfsync.upper()
-                    if getattr(self, "store", None)
-                    else "UNKNOWN"
-                )
-
-                persistence = "AOF"
+                
+                # Dynamically pull the active I/O drivetrain (Safely scoped to Local Mode)
+                sync_policy = self.store.appendfsync.upper() if getattr(self, "store", None) else "UNKNOWN"
+                persistence = f"AOF ({sync_policy})"
                 current_mode = "Standalone"
+
             else:
                 key_count = exp_count = aof_size = "N/A (Server)"
                 type_breakdown = "[dim]N/A (Server)[/dim]"
@@ -396,14 +393,15 @@ class KedisClient:
                 f"Breakdown      : {type_breakdown}\n"
                 f"Expiring Keys  : [cyan]{exp_count}[/cyan]\n\n"
                 f"Persistence    : [yellow]{persistence}[/yellow]\n"
-                f"Sync Mode      : [yellow]{sync_policy}[/yellow]\n"
                 f"AOF Size       : [magenta]{aof_size}[/magenta]\n\n"
                 f"Mode           : [purple]{current_mode}[/purple]\n"
                 f"Debug          : {debug_status}"
             )
-            UI.print_panel(info_text, "Kedis Information", "blue")
-            return True
 
+            UI.print_panel(info_text, "Kedis Information", "blue")
+
+            return True
+        
         if cmd == "HELP":
             help_text = (
                 "[bold cyan]Core String Commands[/bold cyan]\n"
