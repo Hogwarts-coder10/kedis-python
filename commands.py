@@ -1,10 +1,13 @@
+import threading
 from store import KedisStore
-
 
 class CommandHandler:
     def __init__(self, store: KedisStore):
         self.store = store
-
+        
+        # Global Engine Lock
+        self._engine_lock = threading.Lock()
+        
         # The O(1) Dispatch Table
         # Maps the string command directly to the handler function's memory address
         self._commands = {
@@ -46,11 +49,12 @@ class CommandHandler:
         cmd = tokens[0]
 
         # The Magic O(1) Router
-        if cmd in self._commands:
-            handler_function = self._commands[cmd]
-            return handler_function(tokens)
-        else:
-            return f"(error) ERR unknown command '{cmd}'"
+        with self._engine_lock:
+            if cmd in self._commands:
+                handler_function = self._commands[cmd]
+                return handler_function(tokens)
+            else:
+                return f"(error) ERR unknown command '{cmd}'"
 
     # ---------------------------------------------------------
     # COMMAND HANDLERS (The isolated engine components)
