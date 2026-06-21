@@ -265,7 +265,7 @@ This mirrors the design approach used by Redis for sorted sets.
 ---
 
 
-## 🏎️ Performance Telemetry & Concurrency Curve
+# 🏎️ Performance Telemetry & Concurrency Curve
 
 Kedis is rigorously stress-tested to understand its exact physical hardware limits and concurrency behavior. The following telemetry was generated using the custom Kedis Wind Tunnel benchmark script, executing **100,000 Operations** (50% `SET`, 50% `GET`) across varying thread counts with `appendfsync everysec` enabled.
 
