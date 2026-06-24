@@ -1,13 +1,19 @@
 import threading
+
 from store import KedisStore
+
 
 class CommandHandler:
     def __init__(self, store: KedisStore):
         self.store = store
-        
-        # Global Engine Lock
+
+        # GlobaL Engine lock
+
         self._engine_lock = threading.Lock()
-        
+
+        # Pub / Sub SwitchBoard
+        self._channels = {}
+
         # The O(1) Dispatch Table
         # Maps the string command directly to the handler function's memory address
         self._commands = {
@@ -37,9 +43,11 @@ class CommandHandler:
             "TYPE": self._handle_type,
             "STATS": self._handle_stats,
             "CONFIG": self._handle_config,  # <-- Added the config parser
+            "SUBSCRIBE": self._handle_subscribe,
+            "PUBLISH": self._handle_publish,
         }
 
-    def execute(self, tokens: list[str]) -> str:
+    def execute(self, tokens: list[str], client_socket=None) -> str:
         """
         Routes parsed tokens to the correct storage operations in O(1) time.
         """
@@ -51,8 +59,13 @@ class CommandHandler:
         # The Magic O(1) Router
         with self._engine_lock:
             if cmd in self._commands:
-                handler_function = self._commands[cmd]
-                return handler_function(tokens)
+                # 📡 Route the physical socket to Pub/Sub commands
+                if cmd in ["SUBSCRIBE", "PUBLISH"]:
+                    handler_function = self._commands[cmd]
+                    return handler_function(tokens, client_socket)
+                else:
+                    handler_function = self._commands[cmd]
+                    return handler_function(tokens)
             else:
                 return f"(error) ERR unknown command '{cmd}'"
 
@@ -349,3 +362,51 @@ class CommandHandler:
             f"Hit Rate:{lru.get('hit_rate_pct', 0.0)}%\n"
             f"LRU Tracked:{lru.get('tracked_keys', 0)} / {lru.get('max_size', 128)}"
         )
+
+    def _handle_subscribe(self, tokens: list[str], client_socket) -> str:
+        """Registers a client's socket to a specific channel."""
+        if client_socket is None:
+            return "(error) ERR network socket not found"
+
+        if len(tokens) < 2:
+            return "(error) ERR wrong number of arguments for 'subscribe' command"
+
+        channel = tokens[1]
+
+        if channel not in self._channels:
+            self._channels[channel] = []
+
+        if client_socket not in self._channels[channel]:
+            self._channels[channel].append(client_socket)
+
+        return f"1) subscribe\n2) {channel}\n3) 1"
+
+    def _handle_publish(self, tokens: list[str], client_socket) -> str:
+        """Broadcasts a message to all sockets listening on a channel."""
+        if len(tokens) < 3:
+            return "(error) ERR wrong number of arguments for 'publish' command"
+
+        channel = tokens[1]
+        message = " ".join(tokens[2:])  # Support multi-word messages
+
+        if channel not in self._channels:
+            return "(integer) 0"
+
+        subscribers = self._channels[channel]
+        receivers = 0
+
+        payload = f"1) message\n2) {channel}\n3) {message}\n"
+
+        dead_sockets = []
+        for sock in subscribers:
+            try:
+                # sock is technically a socketserver request object, so we use sendall
+                sock.sendall(payload.encode("utf-8"))
+                receivers += 1
+            except Exception:
+                dead_sockets.append(sock)
+
+        for dead in dead_sockets:
+            subscribers.remove(dead)
+
+        return f"(integer) {receivers}"
