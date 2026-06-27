@@ -151,8 +151,19 @@ def start_server():
         try:
             server.serve_forever()
         except KeyboardInterrupt:
-            console.print("\n[bold red]Shutting down Kedis Server...[/bold red]")
+            console.print(
+                "\n[bold red]🛑 Initiating Clean Engine Shutdown...[/bold red]"
+            )
+
+            # 1. Command the storage engine to flush RAM and park threads
+            global_store.shutdown()
+
+            # 2. Shut down the network layer and reject new connections
             server.shutdown()
+
+            console.print(
+                "[bold green]✅ Engine powered down safely. No data lost.[/bold green]"
+            )
 
 
 if __name__ == "__main__":
