@@ -81,6 +81,36 @@ class KedisStore:
                 self._sync_thread.start()
             return "+OK appendfsync set to everysec"
 
+    def shutdown(self):
+        """
+        Executes a clean shutdown. Stops the background I/O thread,
+        and forces a final synchronous write to the physical disk
+
+        (Basically Gracefully shutting down)....
+        """
+
+        self._shutdown_flag = (
+            True  # signals the background thread to safely exit it's loop
+        )
+
+        if hasattr(self, "_sync_thread") and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=2.0)
+
+        # Force one final, blocking flush of the RAM buffer to the SSD
+        if hasattr(self, "aof_file") and not self.aof_file.closed:
+            try:
+                self.aof_file.flush()
+                os.fsync(self.aof_file.fileno())
+                self.aof_file.close()
+                if self.debug_mode:
+                    print(
+                        "💾 [SHUTDOWN] Final AOF buffer flushed to disk successfully."
+                    )
+
+            except OSError as e:
+                if self.debug_mode:
+                    print(f"⚠️ [SHUTDOWN] Failed to flush final buffer: {e}")
+
     def _background_fsync(self):
         """
         The background I/O thread that flushes the OS buffer to disk once per second.
