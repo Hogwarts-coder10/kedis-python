@@ -265,9 +265,9 @@ This mirrors the design approach used by Redis for sorted sets.
 ---
 
 
-# 🏎️ Performance Telemetry & Concurrency Curve
+#  🏎️ Concurrency Ceiling: GIL Contention Analysis
 
-Kedis is rigorously stress-tested to understand its exact physical hardware limits and concurrency behavior. The following telemetry was generated using the custom Kedis Wind Tunnel benchmark script, executing **100,000 Operations** (50% `SET`, 50% `GET`) across varying thread counts with `appendfsync everysec` enabled.
+This benchmark exists to characterize Kedis's threading limitations under the GIL, and to justify the move to async networking on the roadmap.
 
 <img width="600" height="390" alt="image" src="https://github.com/user-attachments/assets/a9caa7f5-2390-4fc0-a9d4-96c1f36f6800" />
 
@@ -284,12 +284,12 @@ Kedis is rigorously stress-tested to understand its exact physical hardware limi
 | **50 Threads** | 10,977 RPS |
 
 ### Systems Analysis: The Python GIL & Global Mutex Lock
-To guarantee 100% thread safety and prevent memory corruption (`WinError 10054`), the Kedis core routing engine is protected by a Global Mutex Lock. 
+The Kedis core routing engine uses a Global Mutex Lock to serialize access to shared state. No data corruption was observed across stress tests up to 50 threads.
 
 * **Parallel I/O Scaling (1-10 Threads):** Throughput actually *increases* under multi-threading. While Thread A holds the lock to execute a memory write, the other threads efficiently read packets off the TCP socket in parallel, perfectly masking the network overhead. 
 * **Lock Contention (15+ Threads):** As concurrent connections scale beyond the optimal window, the overhead of the Python Global Interpreter Lock (GIL) thrashing—constantly pausing and waking dozens of threads fighting for the single Mutex lock—creates significant context-switching overhead, stabilizing the throughput floor around ~10,000 RPS. 
 
-**Verdict:** The Kedis engine is fully thread-safe, surviving 50-thread max-pressure stress tests without dropping a packet, and hits its absolute optimal operational window at **10 concurrent network connections** (21.4k RPS).
+**Takeaway:** Throughput peaks at ~10 concurrent connections (21.4k RPS) and degrades past that point as GIL contention dominates — dropping to ~11k RPS at 50 threads. This is a hard ceiling imposed by CPython's threading model, not a tunable parameter. It's the direct motivation for moving to async I/O (see Roadmap).
 
 ---
 
@@ -314,7 +314,7 @@ Planned improvements:
 
 * Buffered AOF persistence
 * RESP protocol support
-* Async networking
+*  Async networking — replaces thread-per-connection model; see Concurrency Ceiling analysis for why
 * Improved observability
 * Memory-based eviction
 * Enhanced benchmark tooling
