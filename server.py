@@ -5,7 +5,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from commands import CommandHandler
-from parser import CommandParser
+from parser import CommandParser, KESPEncoder
 from store import KedisStore
 
 console = Console()
@@ -92,8 +92,7 @@ class KedisTCPHandler(socketserver.BaseRequestHandler):
                 if not data:
                     break
 
-                raw_input = data.decode("utf-8").strip()
-                tokens = CommandParser.parse(raw_input)
+                tokens = CommandParser.parse(data)
 
                 if tokens and tokens[0] == "ERROR":
                     self.request.sendall(tokens[1].encode("utf-8"))
@@ -118,7 +117,8 @@ class KedisTCPHandler(socketserver.BaseRequestHandler):
                     # Forward immediately to the storage engine dispatch table
                     # Pass the physical socket (self.request) into the engine
                     response = global_handler.execute(tokens, self.request)
-                    self.request.sendall(response.encode("utf-8"))
+                    kesp_bytes = KESPEncoder.encode(response)
+                    self.request.sendall(kesp_bytes)
 
             except ConnectionResetError:
                 break
