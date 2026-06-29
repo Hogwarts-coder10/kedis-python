@@ -1,4 +1,6 @@
+import signal
 import socketserver
+import sys
 import threading
 
 from rich.console import Console
@@ -148,22 +150,33 @@ def start_server():
     )
 
     with ThreadedKedisServer((HOST, PORT), KedisTCPHandler) as server:
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
+        # --- THE OS SIGNAL TRAP (ISSUE #12 FIX) ---
+        def shutdown_sequence(signum, frame):
+            sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
             console.print(
-                "\n[bold red]🛑 Initiating Clean Engine Shutdown...[/bold red]"
+                f"\n[bold red]🛑 {sig_name} intercepted. Initiating Clean Engine Shutdown...[/bold red]"
             )
 
             # 1. Command the storage engine to flush RAM and park threads
             global_store.shutdown()
 
-            # 2. Shut down the network layer and reject new connections
-            server.shutdown()
+            # 2. Shut down the network layer asynchronously to avoid deadlocking the signal handler
+            threading.Thread(target=server.shutdown, daemon=True).start()
 
             console.print(
                 "[bold green]✅ Engine powered down safely. No data lost.[/bold green]"
             )
+            sys.exit(0)
+
+        # Arm the traps for both manual (Ctrl+C) and system-level (Docker/systemd) terminations
+        signal.signal(signal.SIGINT, shutdown_sequence)
+        signal.signal(signal.SIGTERM, shutdown_sequence)
+
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            # Fallback (handled primarily by the signal trap above)
+            pass
 
 
 if __name__ == "__main__":
