@@ -21,6 +21,10 @@ class KedisStore:
         # A secondary hash map to track expiration timestamps (Unix time)
         self._expires: dict[str, float] = {}
 
+        # 🚀 Issue 9 FIX: Cold Boot SnapShot recovery
+        # Pulls the heavy data into RAM before the network even turns on
+        self._load_snapshot()
+
         # ---------------------------------------------------------
         # TRUE LRU SURVIVAL TRACKER
         # Uses OrderedDict purely to track the timeline of access.
@@ -308,14 +312,33 @@ class KedisStore:
         self._expires.clear()
         self._lru_clear()
 
-    def save(self, filename: str = "dump.json") -> bool:
+    def save(self):
+        """
+        Safely flushes memory to a snapshot file using an atomic swap.
+        """
+
+        main_file = "kedis.snapshot"
+        temp_file = "kedis.snapshot.tmp"
+
         try:
-            state = {"data": self._data, "expires": self._expires}
-            with open(filename, "w") as f:
-                json.dump(state, f)
+            # 1. Write to a temporary file first
+            with open(temp_file, "w") as f:
+                json.dump(self._data, f)
+
+                # 2. Force the OS to physically write the bytes to the SSD right now
+                f.flush()
+                os.fsync(f.fileno())
+
+            # 🚀 Issue 10 FIX: Added atomic swap
+            # 3. Atomically swap the temp file over the main file
+            os.replace(temp_file, main_file)
             return True
+
         except Exception as e:
-            print(f"DEBUG: SAVE FAILED -{e}")
+            # Cleanup the debris if the write exploded mid-flight
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+            print(f"SAVE ERROR: {e}")
             return False
 
     def load(self, filename: str = "dump.json") -> None:
@@ -462,6 +485,25 @@ class KedisStore:
                 os.remove(temp_file)
             print(f"Compaction failed: {e}")
             return False
+
+    def _load_snapshot(self):
+        """
+        Restores database state from atomic snapshot file on boot
+        """
+
+        main_file = "kedis.snapshot"
+
+        if os.path.exists(main_file):
+            try:
+                with open(main_file, "r") as f:
+                    self.data = json.load(f)
+                print(
+                    f"✓ Snapshot recovery successful: {len(self._data)} keys restored to RAM."
+                )
+
+            except Exception as e:
+                print(f"❌ CRITICAL: Failed to load snapshot: {e}")
+                self._data = {}  # Failsafe to an empty engine if the file is completely destroyed
 
     # LIST OPERATIONS
     def lpush(self, key: str, *values: str) -> int:
