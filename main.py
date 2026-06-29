@@ -150,7 +150,7 @@ class KedisClient:
         ).strip()
         sync_mode = "always" if choice == "1" else "everysec"
 
-        self.store = KedisStore(appendfsync=sync_mode, lru_maxsize=100000)
+        self.store = KedisStore(appendfsync=sync_mode, lru_maxsize=128)
         self.handler = CommandHandler(self.store)
 
         console.print("\n[green]✓ Local Storage Engine Online[/green]")
@@ -338,7 +338,7 @@ class KedisClient:
             return True
 
         if cmd == "INFO":
-            version = "0.2.0"
+            version = "0.3.0"
             codename = "Echo"
 
             if self.local_mode:
@@ -450,83 +450,186 @@ class KedisClient:
         return False
 
     def _execute_and_render(self, cmd, raw_input):
-        """Routes execution (TCP vs Local) and renders the unified response."""
+        """The KESP Transmission: Routes execution, decodes KESP, and renders UI."""
         try:
+            # 1. TRANSLATE HUMAN TYPING TO KESP BYTES
+            kesp_payload = self._encode_kesp_for_engine(raw_input)
+            if not kesp_payload:
+                console.print(
+                    "[bold red](error) Invalid syntax. Check your quotes.[/bold red]"
+                )
+                return
+
             if self.local_mode:
                 if cmd == "STATS":
-                    response = self.handler.execute(["STATS"])
+                    raw_response = self.handler.execute(["STATS"])
                 else:
-                    tokens = CommandParser.parse(raw_input)
+                    # Feed the KESP bytes to the intake parser
+                    tokens = CommandParser.parse(kesp_payload)
                     if tokens and tokens[0] == "ERROR":
                         console.print(f"[red]{tokens[1]}[/red]")
                         return
                     if not tokens:
                         return
-                    response = self.handler.execute(tokens)
+                    raw_response = self.handler.execute(tokens)
+
+                # Route the local Python response through the KESP Exhaust Encoder
+                from parser import KESPEncoder
+
+                kesp_bytes = KESPEncoder.encode(raw_response)
 
             else:
-                response = self.network.send_command(raw_input)
+                # TCP MODE: Send raw KESP bytes across the wire
+                try:
+                    self.network.socket.sendall(kesp_payload)
+                    kesp_bytes = self.network.socket.recv(4096)
+                except AttributeError:
+                    # Fallback if NetworkManager doesn't expose the raw socket
+                    kesp_bytes = self.network.send_command(kesp_payload)
+
+            # 2. TRANSLATE KESP BYTES BACK TO UI TEXT
+            response_text = self._decode_kesp_for_ui(kesp_bytes)
 
         except OSError:
             self._handle_tcp_crash()
             return
+        except Exception as e:
+            console.print(
+                f"[bold red](error) ERR internal client error: {str(e)}[/bold red]"
+            )
+            return
 
         # --- THE GRAND UX INTERCEPTOR (UNIFIED) ---
         if cmd == "COMPACT":
-            if "+OK" in response:
+            if "OK" in response_text:
                 UI.print_panel(
-                    f"[bold green]Compaction Successful[/bold green]\n{response}",
+                    f"[bold green]Compaction Successful[/bold green]\n{response_text}",
                     "🧹 AOF Cleaner",
                     "green",
                 )
             else:
                 UI.print_panel(
-                    f"[bold red]Compaction Failed[/bold red]\n{response}",
+                    f"[bold red]Compaction Failed[/bold red]\n{response_text}",
                     "❌ Error",
                     "red",
                 )
 
         elif cmd == "STATS":
-            UI.render_stats(response)
+            UI.render_stats(response_text)
 
         elif cmd == "CONFIG":
             tokens = raw_input.split()
-            # Extract whether they typed SET or GET
             sub_cmd = tokens[1].upper() if len(tokens) > 1 else ""
-            UI.render_config(response, sub_cmd)
+            UI.render_config(response_text, sub_cmd)
 
         elif (
-            "unknown command" in response.lower()
-            or "err command not found" in response.lower()
+            "unknown command" in response_text.lower()
+            or "err command not found" in response_text.lower()
         ):
             matches = difflib.get_close_matches(cmd, VALID_COMMANDS, n=1, cutoff=0.5)
-
             if matches:
                 UI.render_typo(cmd, matches)
             else:
-                console.print(f"[bold red]{response}[/bold red]")
+                console.print(f"[bold red]{response_text}[/bold red]")
 
-        elif "WRONGTYPE" in response:
-            UI.render_wrongtype(response, raw_input)
+        elif "WRONGTYPE" in response_text:
+            UI.render_wrongtype(response_text, raw_input)
 
         elif cmd == "TYPE":
-            if "error" in response.lower():
-                console.print(response)
+            if "error" in response_text.lower():
+                console.print(response_text)
             else:
-                UI.render_type_sensor(response, raw_input)
+                UI.render_type_sensor(response_text, raw_input)
 
         elif cmd in ["HGETALL", "LRANGE", "SMEMBERS", "KEYS", "ZRANGE"]:
             if (
-                "error" in response.lower()
-                or "wrongtype" in response.lower()
-                or "(empty" in response
+                "error" in response_text.lower()
+                or "wrongtype" in response_text.lower()
+                or "(empty" in response_text
             ):
-                console.print(response)
+                console.print(response_text)
             else:
-                UI.render_table(cmd, response, raw_input)
+                UI.render_table(cmd, response_text, raw_input)
 
         else:
-            console.print(response)
+            console.print(response_text)
+
+    def _encode_kesp_for_engine(self, user_input: str) -> bytes:
+        """Packs standard UI typing into strict KESP Array bytes."""
+        import shlex
+
+        try:
+            tokens = shlex.split(user_input)
+        except ValueError:
+            return b""
+
+        if not tokens:
+            return b""
+        header = f"A{len(tokens)}\n".encode("utf-8")
+        body = b"".join(
+            f"S{len(t.encode('utf-8'))}\n{t}\n".encode("utf-8") for t in tokens
+        )
+        return header + body
+
+    def _decode_kesp_for_ui(self, raw_bytes: bytes) -> str:
+        """
+        Translates raw KESP bytes into the human-readable text strings
+        that the UI rendering functions (like render_table) expect.
+        """
+        if not raw_bytes:
+            return "(connection closed)"
+
+        try:
+            text = raw_bytes.decode("utf-8")
+            if not text:
+                return ""
+
+            sigil = text[0]
+
+            if sigil == "+":
+                return text[1:].strip()
+            elif sigil == "E":
+                return f"(error) {text[1:].strip()}"
+            elif sigil == "I":
+                return f"(integer) {text[1:].strip()}"
+            elif sigil == "N":
+                return "(nil)"
+            elif sigil == "S":
+                parts = text.split("\n", 1)
+                if len(parts) > 1:
+                    data = parts[1].rsplit("\n", 1)[0]
+                    return f'"{data}"'
+            elif sigil == "A":
+                # 🚀 Format KESP Arrays specifically so UI.render_table() can parse them
+                lines = text.strip().split("\n")
+                if len(lines) <= 1:
+                    return "(empty array)"
+
+                output = []
+                idx = 1
+                item_num = 1
+
+                while idx < len(lines):
+                    if lines[idx].startswith("S"):
+                        output.append(f"{item_num}) {lines[idx + 1]}")
+                        idx += 2
+                    elif lines[idx].startswith("I"):
+                        output.append(f"{item_num}) {lines[idx][1:]}")
+                        idx += 1
+                    elif lines[idx].startswith("N"):
+                        output.append(f"{item_num}) (nil)")
+                        idx += 1
+                    else:
+                        idx += 1
+                        continue
+                    item_num += 1
+
+                return "\n".join(output) if output else "(empty array)"
+
+            return text.strip()
+
+        except Exception as e:
+            return f"(decoder error) {e}"
 
     def _handle_tcp_crash(self):
         """Gracefully recovers if the TCP server explodes mid-query."""
