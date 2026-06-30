@@ -1,7 +1,6 @@
+import asyncio
 import signal
-import socketserver
 import sys
-import threading
 
 from rich.console import Console
 from rich.panel import Panel
@@ -15,6 +14,7 @@ console = Console()
 # ---------------------------------------------------------
 # The Shared Global Database Core
 # ---------------------------------------------------------
+
 global_store = KedisStore()
 global_handler = CommandHandler(global_store)
 
@@ -22,162 +22,189 @@ HOST = "127.0.0.1"
 PORT = 6379
 
 
-class KedisTCPHandler(socketserver.BaseRequestHandler):
-    def setup(self):
-        """
-        Runs automatically once per client connection before handle() starts.
-        Initializes isolated session memory and the O(1) Network Dispatch Table.
-        """
+class AsyncKedisSession:
+    """
+    Manages the state and routing for a single async client connection.
+    """
+
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self.reader = reader
+        self.writer = writer
+        self.addr = writer.get_extra_info("peername")
         self.in_transaction = False
         self.tx_queue = []
 
-        # --- THE NETWORK STATE DISPATCH TABLE ---
+        # Network Dispatch Table
         self.tx_router = {
             "MULTI": self.handle_multi,
             "EXEC": self.handle_exec,
             "DISCARD": self.handle_discard,
         }
 
-    # ---------------------------------------------------------
-    # NETWORK STATE ROUTING OPERATIONS (The Register Buffer)
-    # ---------------------------------------------------------
-    def handle_multi(self):
+    async def send(self, data: bytes):
+        """
+        Asynchronously flushes the bytes to the network sockets
+        """
+
+        self.writer.write(data)
+        await self.writer.drain()
+
+    # -------------------------------------
+    # ASYNC TRANSACTION ROUTUING (Which will be used in dispatch table)
+    # -------------------------------------
+
+    async def handle_multi(self):
         if self.in_transaction:
-            self.request.sendall(b"-ERR MULTI calls can not be nested")
+            await self.send(b"EMULTI calls are not nested\n")
         else:
             self.in_transaction = True
             self.tx_queue = []
-            self.request.sendall(b"+OK")
+            await self.send(b"+OK")
 
-    def handle_discard(self):
+    async def handle_exec(self):
         if not self.in_transaction:
-            self.request.sendall(b"-ERR DISCARD without MULTI")
+            await self.send(b"EEXEC without MULTI\n")
         else:
-            self.in_transaction = False
-            self.tx_queue = []  # Wipe the whiteboard buffer clear
-            self.request.sendall(b"+OK")
-
-    def handle_exec(self):
-        if not self.in_transaction:
-            self.request.sendall(b"-ERR EXEC without MULTI")
-        else:
-            if not self.tx_queue:
-                self.request.sendall(b"*(0)")  # Empty array format
-            else:
-                # Dispatch the entire queued sequence sequentially
-                responses = []
-                for queued_tokens in self.tx_queue:
-                    # Pass the physical socket (self.request) into the engine here also
-                    res = global_handler.execute(queued_tokens, self.request)
-                    responses.append(res)
-
-                # Join individual results into a single multi-line response payload
-                combined_response = "\n".join(responses)
-                self.request.sendall(combined_response.encode("utf-8"))
-
-            # Reset pipeline metrics post-ignition
-            self.in_transaction = False
+            self.in_transaction = True
             self.tx_queue = []
+            await self.send(b"+OK")
 
-    # ---------------------------------------------------------
-    # MAIN NETWORK THREAD ENGINE LOOP
-    # ---------------------------------------------------------
-    def handle(self):
-        client_id = f"{self.client_address[0]}:{self.client_address[1]}"
-        console.print(
-            f"[green]🔌 Client Connected:[/green] {client_id} (Active Threads: {threading.active_count() - 1})"
-        )
+    async def handle_discard(self):
+        if not self.in_transaction:
+            await self.send(b"EDISCARD without MULTI\n")
+        else:
+            self.in_transaction = True
+            self.tx_queue = []
+            await self.send(b"+OK")
+
+    # -------------------------------------
+    # ASYNC EVENT LOOP (MAIN)
+    # -------------------------------------
+
+    async def run(self):
+        """
+        The main non-blocking event loop with a dynamic I/O Surge Tank.
+        """
+
+        client_id = f"{self.addr[0]} : {self.addr[1]}"
+        console.print(f"[green] 🔌 Client Connected:[/green] {client_id}")
+
+        # The Surge Tank : Buffers the fragmmented TCP packets
+        intake_buffer = bytearray()
 
         while True:
             try:
-                data = self.request.recv(1024)
-                if not data:
+                # Widenning the intake pipe to 64KB per read
+                chunk = await self.reader.read(65536)
+                if not chunk:
                     break
 
-                tokens = CommandParser.parse(data)
+                # pool the new bytes into the intake buffer
+                intake_buffer.extend(chunk)
+
+                # attempt to parse the buffer
+
+                try:
+                    tokens = CommandParser.parse(bytes(intake_buffer))
+                except Exception:
+                    # If the parser crashes, the KESP payload is likely sliced in half.
+                    # We simply yield control and wait for the next TCP packet to arrive.
+                    continue
 
                 if tokens and tokens[0] == "ERROR":
-                    self.request.sendall(tokens[1].encode("utf-8"))
-                    continue
-                if not tokens:
-                    self.request.sendall(b"")
+                    clean_err = tokens[1].replace("-ERR", " ")
+                    await self.send(f"E{clean_err}\n".encode("utf-8"))
+                    intake_buffer.clear()
                     continue
 
+                if not tokens:
+                    # Parser has returned nothing; still waiting for a complete KESP frame
+                    continue
+
+                # Exceute the fully assembled command
                 cmd = tokens[0].upper()
 
-                # 1. INTERCEPT PROTOCOL CONTROL STRATEGIES (O(1) Route check)
                 if cmd in self.tx_router:
-                    self.tx_router[cmd]()
-                    continue
+                    await self.tx_router[cmd]()
 
-                # 2. EVALUATE TRANSIT ROUTING PATHS
-                if self.in_transaction:
-                    # Append commands directly into the isolated session buffer
+                elif self.in_transaction:
                     self.tx_queue.append(tokens)
-                    self.request.sendall(b"+QUEUED")
+                    await self.send(b"+OK")
+
                 else:
-                    # Forward immediately to the storage engine dispatch table
-                    # Pass the physical socket (self.request) into the engine
-                    response = global_handler.execute(tokens, self.request)
+                    response = global_handler.execute(tokens, self.writer)
                     kesp_bytes = KESPEncoder.encode(response)
-                    self.request.sendall(kesp_bytes)
+                    await self.send(kesp_bytes)
+
+                # Flush the intake buffer after a sucessful ignition
+                intake_buffer.clear()
 
             except ConnectionResetError:
                 break
             except Exception as e:
-                error_msg = f"-ERR internal server error: {str(e)}"
-                self.request.sendall(error_msg.encode("utf-8"))
+                await self.send(f"Einternal server error: {str(e)}\n".encode("utf-8"))
+                intake_buffer.clear()
 
         console.print(f"[yellow]⚠️ Client Disconnected:[/yellow] {client_id}")
+        self.writer.close()
+        await self.writer.wait_closed()
 
 
-class ThreadedKedisServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    daemon_threads = True
-    allow_reuse_address = True
+async def handle_connection(reader, writer):
+    """
+    Spawns a new isolated session object for every incoming TCP connection.
+    """
+
+    session = AsyncKedisSession(reader, writer)
+    await session.run()
 
 
-def start_server():
+async def main():
     console.print(
         Panel(
             f"[bold blue]Kedis Engine Core Online[/bold blue]\n"
             f"Listening on TCP {HOST}:{PORT}\n\n"
-            f"Network Routing: [green]O(1) Dispatch Table[/green]\n"
-            f"Transaction Buffer: [green]Isolated Session Sandbox[/green]",
-            title="🚀 SERVER IGNITION",
+            f"Network Architecture: [green]asyncio Event Loop[/green]\n"
+            f"Concurrency: [green]Non-blocking I/O[/green]",
+            title="🚀 ASYNC IGNITION",
             border_style="blue",
             expand=False,
         )
     )
 
-    with ThreadedKedisServer((HOST, PORT), KedisTCPHandler) as server:
-        # --- THE OS SIGNAL TRAP (ISSUE #12 FIX) ---
-        def shutdown_sequence(signum, frame):
-            sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
-            console.print(
-                f"\n[bold red]🛑 {sig_name} intercepted. Initiating Clean Engine Shutdown...[/bold red]"
-            )
+    # Booting the async server socket
+    server = await asyncio.start_server(handle_connection, HOST, PORT)
 
-            # 1. Command the storage engine to flush RAM and park threads
-            global_store.shutdown()
+    # --- THE OS SIGNAL TRAP (Issue #12 Fix - Async Compatible) ---
+    def shutdown_sequence(sig_name):
+        console.print(
+            f"\n[bold red]🛑 {sig_name} intercepted. Initiating Clean Engine Shutdown...[/bold red]"
+        )
+        global_store.shutdown()
+        server.close()
+        console.print(
+            "[bold green]✅ Engine powered down safely. No data lost.[/bold green]"
+        )
+        sys.exit(0)
 
-            # 2. Shut down the network layer asynchronously to avoid deadlocking the signal handler
-            threading.Thread(target=server.shutdown, daemon=True).start()
+    # Wiring up the cross-platform signal handlers
+    loop = asyncio.get_event_loop()
+    if sys.platform != "win32":
+        loop.add_signal_handler(signal.SIGINT, lambda: shutdown_sequence("SIGINT"))
+        loop.add_signal_handler(signal.SIGTERM, lambda: shutdown_sequence("SIGTERM"))
 
-            console.print(
-                "[bold green]✅ Engine powered down safely. No data lost.[/bold green]"
-            )
-            sys.exit(0)
-
-        # Arm the traps for both manual (Ctrl+C) and system-level (Docker/systemd) terminations
-        signal.signal(signal.SIGINT, shutdown_sequence)
-        signal.signal(signal.SIGTERM, shutdown_sequence)
-
+    async with server:
         try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            # Fallback (handled primarily by the signal trap above)
+            await server.serve_forever()
+        except asyncio.CancelledError:
             pass
+        except KeyboardInterrupt:
+            # Fallback for Windows if signal handlers fail
+            shutdown_sequence("SIGINT")
 
 
 if __name__ == "__main__":
-    start_server()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
