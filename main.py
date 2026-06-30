@@ -580,7 +580,12 @@ class KedisClient:
             return "(connection closed)"
 
         try:
-            text = raw_bytes.decode("utf-8")
+            text = (
+                raw_bytes.decode("utf-8")
+                if isinstance(raw_bytes, bytes)
+                else str(raw_bytes)
+            )
+            
             if not text:
                 return ""
 
