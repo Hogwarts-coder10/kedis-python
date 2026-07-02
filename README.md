@@ -314,7 +314,7 @@ Planned improvements:
 
 * Buffered AOF persistence
 * RESP protocol support
-*  Async networking — replaces thread-per-connection model; see Concurrency Ceiling analysis for why
+*  Async networking — replaces thread-per-connection model; see Concurrency Ceiling analysis for why [done]
 * Improved observability
 * Memory-based eviction
 * Enhanced benchmark tooling
