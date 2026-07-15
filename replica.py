@@ -1,4 +1,5 @@
 import asyncio
+import json
 import signal
 import sys
 
@@ -25,10 +26,15 @@ PORT = 6381
 server_role = "master"
 server_host = None
 master_port = None
+connected_replicas = []  # 📡 Holds the writer sockets for all active Followers
 
 
-async def establish_replica_slipstream(host: str, port: int):
-    """Opens a permanent TCP socket to the Leader engine."""
+async def init_replication_stream(host: str, port: int):
+    """
+    Opens a permanent TCP socket to the Leader engine,
+    downloads the baseline,
+    and processes live replication streams.
+    """
     global server_role, server_host, master_port
 
     try:
@@ -36,10 +42,10 @@ async def establish_replica_slipstream(host: str, port: int):
             f"[cyan]🔗 [REPLICATION] Initiating handshake with Leader at {host}:{port}...[/cyan]"
         )
 
-        # Open the direct TCP line to the Leader
+        # 1. Open the direct TCP line to the Leader
         reader, writer = await asyncio.open_connection(host, port)
 
-        # Lock in the new state
+        # Lock in the telemetry state
         server_role = "replica"
         server_host = host
         master_port = port
@@ -48,14 +54,86 @@ async def establish_replica_slipstream(host: str, port: int):
             f"[bold green]✅ [REPLICATION] Slipstream locked! Successfully connected to {host}:{port}[/bold green]"
         )
 
-        # ⚠️ TOMORROW: This is where we will write the loop that
-        # waits for the snapshot and live commands from the Leader.
+        # 2. Demand the baseline state from the Leader
+        console.print(
+            "[cyan]📥 [REPLICATION] Requesting baseline snapshot via SYNC...[/cyan]"
+        )
+        writer.write(b"SYNC\n")
+        await writer.drain()
+
+        # 3. Read the incoming KESP payload containing the JSON data
+        # Using a dense surge buffer to read the KESP array frame safely
+        intake_buffer = bytearray()
+        snapshot_loaded = False
+
+        while not snapshot_loaded:
+            chunk = await reader.read(65536)
+            if not chunk:
+                raise ConnectionError(
+                    "Leader severed connection before snapshot arrived."
+                )
+
+            intake_buffer.extend(chunk)
+
+            try:
+                # Attempt to parse using your KESP engine rules
+                tokens = CommandParser.parse(bytes(intake_buffer))
+                if tokens:
+                    # The first token parsed will be the raw JSON snapshot string
+                    raw_json = tokens[0]
+
+                    # Cold Boot: Overwrite local database memory entirely
+                    parsed_data = json.loads(raw_json)
+                    global_store._data = parsed_data
+
+                    console.print(
+                        f"[bold green]💾 [REPLICATION] Cold Boot Successful! Restored {len(parsed_data)} keys from Leader.[/bold green]"
+                    )
+                    snapshot_loaded = True
+                    intake_buffer.clear()
+            except Exception as e:
+                # Payload is still fragmented across packets, loop back to read more
+                console.print(
+                    f"[bold yellow]⚠️ [REPLICATION] Parser skipping chunk: {e}[/bold yellow]"
+                )
+                continue
+
+        # 4. 🚀 PHASE 3 LIVE STREAM: Stay locked in the slipstream forever catching live writes
+        console.print(
+            "[bold blue]⚡ [REPLICATION] Entering Live Stream Mode. Awaiting commands...[/bold blue]"
+        )
+
+        while True:
+            chunk = await reader.read(65536)
+            if not chunk:
+                console.print(
+                    "[bold red]⚠️ [REPLICATION] Leader connection lost![/bold red]"
+                )
+                break
+
+            intake_buffer.extend(chunk)
+
+            while True:
+                try:
+                    tokens = CommandParser.parse(bytes(intake_buffer))
+                    if not tokens:
+                        break
+
+                    # Execute the mirrored write locally using your handler
+                    # We pass None for the writer because the replica doesn't need to respond to the Leader
+                    global_handler.execute(tokens, None)
+                    console.print(
+                        f"[magenta]🔄 [REPLICATION Live] Executed: {' '.join(tokens)}[/magenta]"
+                    )
+
+                    intake_buffer.clear()
+                except Exception:
+                    # Partial packet handling
+                    break
 
     except Exception as e:
-        console.print(
-            f"[bold red]❌ [REPLICATION] Handshake failed. Engine could not reach {host}:{port} - {e}[/bold red]"
-        )
-        server_role = "master"  # Fall back to master if the connection fails
+        console.print(f"[bold red]❌ [REPLICATION] Sync Engine crashed: {e}[/bold red]")
+        server_role = "master"  # Fall back to master role if cluster drivetrain breaks
 
 
 class AsyncKedisSession:
@@ -172,12 +250,50 @@ class AsyncKedisSession:
                     else:
                         # Ignite the handshake sequence in the background without blocking the loop
                         asyncio.create_task(
-                            establish_replica_slipstream(r_host, int(r_port))
+                            init_replication_stream(r_host, int(r_port))
                         )
                         await self.send(b"+OK Replica handshake initiated\r\n")
 
                     intake_buffer.clear()
                     continue  # Skip sending this command to the store
+
+                if cmd == "SYNC":
+                    if server_role == "master":
+                        console.print(
+                            "[cyan]📦 [REPLICATION] Follower requested baseline. Dumping RAM...[/cyan]"
+                        )
+
+                        # Serializing the entire database state
+                        snapshot_json = json.dumps(global_store._data)
+                        json_bytes = snapshot_json.encode("utf-8")
+
+                        # Package it exactly like a KESP Client Command Array
+                        # *1 = Array of 1 item
+                        # $<length> = Length of the JSON payload
+                        header = b"A1\n"
+                        body = (
+                            f"S{len(json_bytes)}\n".encode("utf-8") + json_bytes + b"\n"
+                        )
+                        kesp_payload = header + body
+
+                        await self.send(kesp_payload)
+                        console.print(
+                            "[bold green]✅ [REPLICATION] Baseline snapshot transmitted![/bold green]"
+                        )
+
+                        # Add this Follower to the Live Broadcast Registry
+                        connected_replicas.append(self.writer)
+                        console.print(
+                            f"[bold magenta]📡 [REPLICATION] Follower locked into Live Stream. Total replicas: {len(connected_replicas)}[/bold magenta]"
+                        )
+
+                    else:
+                        await self.send(
+                            b"[bold red]ERR I'm a follower, I cannot sync you!!\n[/bold red]"
+                        )
+
+                    intake_buffer.clear()
+                    continue
 
                 if cmd in self.tx_router:
                     await self.tx_router[cmd]()
@@ -187,9 +303,56 @@ class AsyncKedisSession:
                     await self.send(b"+OK")
 
                 else:
+                    # 🛡️ PHASE 4: THE READ-ONLY FIREWALL
+                    write_commands = {"SET", "DEL", "HSET", "LPUSH", "RPUSH"}
+
+                    if server_role == "replica" and cmd in write_commands:
+                        console.print(
+                            f"[bold yellow]⚠️ [SECURITY] Blocked client attempt to run {cmd} on Follower.[/bold yellow]"
+                        )
+                        # Fire a KESP Error back to the client
+                        await self.send(
+                            b"EREADONLY You can't write against a read-only replica.\n"
+                        )
+                        intake_buffer.clear()
+                        continue
+
+                    # Execute the command locally
                     response = global_handler.execute(tokens, self.writer)
                     kesp_bytes = KESPEncoder.encode(response)
                     await self.send(kesp_bytes)
+
+                    # 📡 PHASE 3: LIVE COMMAND FORWARDING
+                    if server_role == "master" and cmd in write_commands:
+                        # 🔥 THE DIAGNOSTIC FLARE
+                        console.print(
+                            f"[cyan]📡 [BROADCAST] Firing {cmd} down the slipstream to {len(connected_replicas)} followers...[/cyan]"
+                        )
+
+                        # 1. Rebuild the exact KESP Array the client originally sent
+                        header = f"A{len(tokens)}\n".encode("utf-8")
+                        body = b"".join(
+                            f"S{len(t.encode('utf-8'))}\n{t}\n".encode("utf-8")
+                            for t in tokens
+                        )
+                        broadcast_payload = header + body
+
+                        # 2. Fire it down  to all Followers
+                        dead_replicas = []
+                        for rep_writer in connected_replicas:
+                            try:
+                                rep_writer.write(broadcast_payload)
+                                await rep_writer.drain()
+                            except Exception:
+                                # If the Follower crashed or disconnected, mark it for removal
+                                dead_replicas.append(rep_writer)
+
+                        # 3. Clean up the registry to prevent memory leaks and deadlocks
+                        for dead in dead_replicas:
+                            connected_replicas.remove(dead)
+                            console.print(
+                                "[yellow]⚠️ [REPLICATION] Follower disconnected. Removed from Live Stream.[/yellow]"
+                            )
 
                 # Flush the intake buffer after a sucessful ignition
                 intake_buffer.clear()
@@ -197,8 +360,12 @@ class AsyncKedisSession:
             except ConnectionResetError:
                 break
             except Exception as e:
-                await self.send(f"Einternal server error: {str(e)}\n".encode("utf-8"))
+                # 🔥 THE UNMASKING FLARE
+                console.print(
+                    f"[bold red]❌ [REPLICATION Live] Stream Crash: {repr(e)}[/bold red]"
+                )
                 intake_buffer.clear()
+                break
 
         console.print(f"[yellow]⚠️ Client Disconnected:[/yellow] {client_id}")
         self.writer.close()

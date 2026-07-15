@@ -136,5 +136,5 @@ class KESPClient:
 
 
 if __name__ == "__main__":
-    cli = KESPClient()
+    cli = KESPClient(port=6381)
     cli.repl()
