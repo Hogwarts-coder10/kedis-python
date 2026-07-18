@@ -1,8 +1,9 @@
+import itertools
 import json
 import os
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Any, Optional
 
 from skiplist import SkipList
@@ -289,7 +290,7 @@ class KedisStore:
             if k in self._expires and self._expires[k] < time.time():
                 continue
 
-            if isinstance(val, list):
+            if isinstance(val, deque):
                 k_type, k_len = "list", str(len(val))
             elif isinstance(val, set):
                 k_type, k_len = "set", str(len(val))
@@ -327,6 +328,10 @@ class KedisStore:
         temp_file = "kedis.snapshot.tmp"
 
         try:
+            serializable_data = {
+                k: (list(v) if isinstance(v, deque) else v)
+                for k, v in self._data.items()
+            }
             # 1. Write to a temporary file first
             with open(temp_file, "w") as f:
                 json.dump(self._data, f)
@@ -387,24 +392,24 @@ class KedisStore:
                 elif cmd == "LPUSH" and len(tokens) >= 3:
                     key = tokens[1]
                     if key not in self._data:
-                        self._data[key] = []
+                        self._data[key] = deque()
                     for val in tokens[2:]:
-                        self._data[key].insert(0, val)
+                        self._data[key].appendleft(val)
                     self._touch_write(key)
                 elif cmd == "RPUSH" and len(tokens) >= 3:
                     key = tokens[1]
                     if key not in self._data:
-                        self._data[key] = []
+                        self._data[key] = deque()
                     self._data[key].extend(tokens[2:])
                     self._touch_write(key)
                 elif cmd == "LPOP" and len(tokens) >= 2:
                     key = tokens[1]
                     if (
                         key in self._data
-                        and isinstance(self._data[key], list)
+                        and isinstance(self._data[key], deque)
                         and self._data[key]
                     ):
-                        self._data[key].pop(0)
+                        self._data[key].popleft()
                         self._touch_write(key)
                         if not self._data[key]:
                             del self._data[key]
@@ -413,10 +418,10 @@ class KedisStore:
                     key = tokens[1]
                     if (
                         key in self._data
-                        and isinstance(self._data[key], list)
+                        and isinstance(self._data[key], deque)
                         and self._data[key]
                     ):
-                        self._data[key].pop(-1)
+                        self._data[key].pop()
                         self._touch_write(key)
                         if not self._data[key]:
                             del self._data[key]
@@ -454,7 +459,7 @@ class KedisStore:
         try:
             with open(temp_file, "w") as f:
                 for key, value in self._data.items():
-                    if isinstance(value, list):
+                    if isinstance(value, deque):
                         f.write(f"RPUSH {key} {' '.join(value)}\n")
                     elif isinstance(value, set):
                         f.write(f"SADD {key} {' '.join(value)}\n")
@@ -514,15 +519,15 @@ class KedisStore:
     # LIST OPERATIONS
     def lpush(self, key: str, *values: str) -> int:
         self._evict_if_expired(key)
-        if key in self._data and not isinstance(self._data[key], list):
+        if key in self._data and not isinstance(self._data[key], deque):
             raise TypeError(
                 "WRONGTYPE Operation against a key holding the wrong kind of value"
             )
         if key not in self._data:
-            self._data[key] = []
+            self._data[key] = deque()
 
         for val in values:
-            self._data[key].insert(0, val)
+            self._data[key].appendleft(val)
 
         self._log_operation("LPUSH", key, *values)
         self._touch_write(key)
@@ -533,24 +538,27 @@ class KedisStore:
         self._touch_read(key)
         if key not in self._data:
             return []
-        if not isinstance(self._data[key], list):
+        if not isinstance(self._data[key], deque):
             raise TypeError(
                 "WRONGTYPE Operation against a key holding the wrong kind of value"
             )
-        if stop == -1:
-            return self._data[key][start:]
-        return self._data[key][start : stop + 1]
+
+        target_list = self._data[key]
+        actual_stop = None if stop == -1 else stop + 1
+        return list(itertools.islice(target_list, start, actual_stop))
 
     def rpush(self, key: str, *values: str) -> int:
         self._evict_if_expired(key)
-        if key in self._data and not isinstance(self._data[key], list):
+        if key in self._data and not isinstance(self._data[key], deque):
             raise TypeError(
                 "WRONGTYPE Operation against a key holding the wrong kind of value"
             )
         if key not in self._data:
-            self._data[key] = []
+            self._data[key] = deque()
 
-        self._data[key].extend(values)
+        for val in values:
+            self._data[key].append(val)
+
         self._log_operation("RPUSH", key, *values)
         self._touch_write(key)
         return len(self._data[key])
@@ -559,14 +567,14 @@ class KedisStore:
         self._evict_if_expired(key)
         if key not in self._data:
             return None
-        if not isinstance(self._data[key], list):
+        if not isinstance(self._data[key], deque):
             raise TypeError(
                 "WRONGTYPE Operation against a key holding the wrong kind of value"
             )
         if not self._data[key]:
             return None
 
-        popped_value = self._data[key].pop(0)
+        popped_value = self._data[key].popleft()
         self._log_operation("LPOP", key)
         self._touch_write(key)
 
@@ -580,14 +588,14 @@ class KedisStore:
         self._evict_if_expired(key)
         if key not in self._data:
             return None
-        if not isinstance(self._data[key], list):
+        if not isinstance(self._data[key], deque):
             raise TypeError(
                 "WRONGTYPE Operation against a key holding the wrong kind of value"
             )
         if not self._data[key]:
             return None
 
-        popped_value = self._data[key].pop(-1)
+        popped_value = self._data[key].pop()
         self._log_operation("RPOP", key)
         self._touch_write(key)
 
@@ -717,7 +725,7 @@ class KedisStore:
         if key not in self._data:
             return "None"
         val = self._data[key]
-        if isinstance(val, list):
+        if isinstance(val, deque):
             return "List"
         elif isinstance(val, set):
             return "Set"
@@ -740,7 +748,7 @@ class KedisStore:
             "zset_nodes": 0,
         }
         for val in self._data.values():
-            if isinstance(val, list):
+            if isinstance(val, deque):
                 stats["list_items"] += len(val)
             elif isinstance(val, set):
                 stats["set_members"] += len(val)
