@@ -44,49 +44,6 @@ except ImportError:
     pass
 
 
-# --- The Dictionary of Valid Commands ---
-
-VALID_COMMANDS = [
-    "SET",
-    "GET",
-    "DEL",
-    "EXPIRE",
-    "TTL",
-    "FLUSHALL",
-    "LPUSH",
-    "RPUSH",
-    "LPOP",
-    "RPOP",
-    "LRANGE",
-    "SADD",
-    "SMEMBERS",
-    "SREM",
-    "HSET",
-    "HGET",
-    "HGETALL",
-    "ZADD",
-    "ZRANGE",
-    "KEYS",
-    "TYPE",
-    "STATS",
-    "COMPACT",
-    "CONFIG",  # <-- Whitelisted for the client loop
-    "MODE",
-    "INFO",
-    "HELP",
-    "DEBUG",
-    "RECONNECT",
-    "CLEAR",
-    "CLS",
-    "EXIT",
-    "QUIT",
-    "MULTI",
-    "EXEC",
-    "DISCARD",
-    "REPLICAOF",
-]
-
-
 class KedisClient:
     def __init__(self):
         self.network = NetworkManager()
@@ -95,10 +52,61 @@ class KedisClient:
         self.debug_mode = False
         self.store = None
         self.handler = None
+        self.VALID_COMMANDS = []
 
     def boot(self):
         """The Ignition Sequence"""
         UI.print_banner()
+
+        # 🚀 DYNAMIC AUTOCOMPLETE GENERATOR (TCP MODE)
+        try:
+            temp_handler = CommandHandler(None)
+            engine_commands = list(temp_handler._commands.keys())
+        except Exception:
+            # Fallback if CommandHandler strict-requires a store to initialize
+            engine_commands = [
+                "SET",
+                "GET",
+                "DEL",
+                "EXPIRE",
+                "TTL",
+                "FLUSHALL",
+                "LPUSH",
+                "RPUSH",
+                "LPOP",
+                "RPOP",
+                "LRANGE",
+                "SADD",
+                "SMEMBERS",
+                "SREM",
+                "HSET",
+                "HGET",
+                "HGETALL",
+                "ZADD",
+                "ZRANGE",
+                "KEYS",
+                "TYPE",
+                "STATS",
+                "COMPACT",
+            ]
+
+        cli_commands = [
+            "MODE",
+            "INFO",
+            "HELP",
+            "DEBUG",
+            "RECONNECT",
+            "CLEAR",
+            "CLS",
+            "EXIT",
+            "QUIT",
+            "MULTI",
+            "EXEC",
+            "DISCARD",
+            "REPLICAOF",
+            "CONFIG",
+        ]
+        self.VALID_COMMANDS = engine_commands + cli_commands
 
         try:
             self.network.connect()
@@ -153,6 +161,26 @@ class KedisClient:
 
         self.store = KedisStore(appendfsync=sync_mode, lru_maxsize=128)
         self.handler = CommandHandler(self.store)
+
+        # 🚀 DYNAMIC AUTOCOMPLETE GENERATOR (LOCAL MODE)
+        engine_commands = list(self.handler._commands.keys())
+        cli_commands = [
+            "MODE",
+            "INFO",
+            "HELP",
+            "DEBUG",
+            "RECONNECT",
+            "CLEAR",
+            "CLS",
+            "EXIT",
+            "QUIT",
+            "MULTI",
+            "EXEC",
+            "DISCARD",
+            "REPLICAOF",
+            "CONFIG",
+        ]
+        self.VALID_COMMANDS = engine_commands + cli_commands
 
         console.print("\n[green]✓ Local Storage Engine Online[/green]")
         console.print(f"[green]✓ I/O Drivetrain Locked: {sync_mode.upper()}[/green]")
@@ -359,7 +387,7 @@ class KedisClient:
                     for val in self.store._data.values():
                         val_type = type(val).__name__
 
-                        if val_type == "list":
+                        if val_type == "list" or val_type == "deque":
                             list_c += 1
                         elif val_type == "set":
                             set_c += 1
@@ -527,7 +555,10 @@ class KedisClient:
             "unknown command" in response_text.lower()
             or "err command not found" in response_text.lower()
         ):
-            matches = difflib.get_close_matches(cmd, VALID_COMMANDS, n=1, cutoff=0.5)
+            # 🚀 Use the dynamic dictionary here instead of the hardcoded global
+            matches = difflib.get_close_matches(
+                cmd, self.VALID_COMMANDS, n=1, cutoff=0.5
+            )
             if matches:
                 UI.render_typo(cmd, matches)
             else:

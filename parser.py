@@ -18,51 +18,62 @@ class CommandParser:
         except UnicodeDecodeError:
             return ["ERROR", "-ERR Malformed payload"]
 
+        tokens = []
+
         # 🚦 INLINE FALLBACK: For manual testing via ncat (e.g., typing 'SET engine active')
         if first_byte != "A":
             try:
-                return raw_data.decode("utf-8").strip().split()
+                tokens = raw_data.decode("utf-8").strip().split()
             except UnicodeDecodeError:
                 return ["ERROR", "-ERR invalid text encoding"]
+        else:
+            # 🚀 KESP DECODER: Strict, Binary-Safe Byte Counting
+            try:
+                pointer = 0
 
-        # 🚀 KESP DECODER: Strict, Binary-Safe Byte Counting
-        tokens = []
-        try:
-            pointer = 0
-
-            # 1. Read the Array Header (e.g., "A3\n")
-            nl_idx = raw_data.find(b"\n", pointer)
-            if nl_idx == -1:
-                return ["ERROR", "-ERR Incomplete KESP Array"]
-
-            expected_args = int(raw_data[pointer + 1 : nl_idx].decode("utf-8"))
-            pointer = nl_idx + 1  # Move pointer past the \n
-
-            # 2. Loop exactly 'expected_args' times
-            for _ in range(expected_args):
-                # Read String Header (e.g., "S6\n")
+                # 1. Read the Array Header (e.g., "A3\n")
                 nl_idx = raw_data.find(b"\n", pointer)
                 if nl_idx == -1:
-                    return ["ERROR", "-ERR Incomplete KESP String"]
+                    return ["ERROR", "-ERR Incomplete KESP Array"]
 
-                if raw_data[pointer : pointer + 1] != b"S":
-                    return ["ERROR", "-ERR Protocol desync: Expected 'S'"]
+                expected_args = int(raw_data[pointer + 1 : nl_idx].decode("utf-8"))
+                pointer = nl_idx + 1  # Move pointer past the \n
 
-                str_len = int(raw_data[pointer + 1 : nl_idx].decode("utf-8"))
-                pointer = nl_idx + 1
+                # 2. Loop exactly 'expected_args' times
+                for _ in range(expected_args):
+                    # Read String Header (e.g., "S6\n")
+                    nl_idx = raw_data.find(b"\n", pointer)
+                    if nl_idx == -1:
+                        return ["ERROR", "-ERR Incomplete KESP String"]
 
-                # 3. Extract exact bytes (The Binary-Safe Magic)
-                # We do NOT search for a newline here. We slice exactly 'str_len' bytes.
-                data_bytes = raw_data[pointer : pointer + str_len]
-                tokens.append(data_bytes.decode("utf-8"))
+                    if raw_data[pointer : pointer + 1] != b"S":
+                        return ["ERROR", "-ERR Protocol desync: Expected 'S'"]
 
-                # Move pointer past the data and its trailing protocol \n
-                pointer = pointer + str_len + 1
+                    str_len = int(raw_data[pointer + 1 : nl_idx].decode("utf-8"))
+                    pointer = nl_idx + 1
 
-            return tokens
+                    # 3. Extract exact bytes (The Binary-Safe Magic)
+                    # We do NOT search for a newline here. We slice exactly 'str_len' bytes.
+                    data_bytes = raw_data[pointer : pointer + str_len]
+                    tokens.append(data_bytes.decode("utf-8"))
 
-        except (ValueError, IndexError):
-            return ["ERROR", "-ERR Malformed KESP payload"]
+                    # Move pointer past the data and its trailing protocol \n
+                    pointer = pointer + str_len + 1
+
+            except (ValueError, IndexError):
+                return ["ERROR", "-ERR Malformed KESP payload"]
+
+        # 🚀 SMART PARSER: NORMALIZE FLAGS FOR ALL INPUTS
+        if tokens and len(tokens) > 0 and tokens[0] != "ERROR":
+            tokens[0] = tokens[0].upper()
+
+            OPTION_FLAGS = {"WITHSCORES", "ALPHA", "LIMIT", "BY", "ASC", "DESC"}
+            tokens = [
+                t.upper() if isinstance(t, str) and t.upper() in OPTION_FLAGS else t
+                for t in tokens
+            ]
+
+        return tokens
 
 
 class KESPEncoder:
