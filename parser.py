@@ -1,79 +1,82 @@
-import shlex
-from typing import List
-
-
 class CommandParser:
     @staticmethod
-    def parse(raw_data: bytes) -> list[str]:
+    def parse(raw_data: bytes) -> tuple[list[str], int]:
         """
-        Parses incoming network data. Supports both the strict Kedis Serialization Protocol (KESP)
-        and legacy inline commands for raw ncat testing.
+        Parses incoming network data. Returns a tuple of (tokens, bytes_consumed).
+        If the payload is incomplete, returns ([], 0) to wait for more data.
         """
-        if not raw_data:
-            return []
 
-        # Peek at the very first byte. If it's not 'A' (Array), fallback to raw text parsing.
+        if not raw_data:
+            return [], 0
+
         try:
             first_byte = raw_data[:1].decode("utf-8")
+
         except UnicodeDecodeError:
-            return ["ERROR", "-ERR Malformed payload"]
+            return ["ERROR", "-ERR Malformed payload"], len(raw_data)
 
         tokens = []
+        bytes_consumed = 0
 
-        # 🚦 INLINE FALLBACK: For manual testing via ncat (e.g., typing 'SET engine active')
+        # Inline fallback
         if first_byte != "A":
             try:
                 tokens = raw_data.decode("utf-8").strip().split()
+                bytes_consumed = len(raw_data)
+
             except UnicodeDecodeError:
-                return ["ERROR", "-ERR invalid text encoding"]
+                return ["ERROR", "-ERR Invalid text encoding"], len(raw_data)
+
         else:
-            # 🚀 KESP DECODER: Strict, Binary-Safe Byte Counting
+            # KESP Decoder: Strict, Binary-safe byte counting
             try:
                 pointer = 0
+                nl_index = raw_data.find(b"\n", pointer)
 
-                # 1. Read the Array Header (e.g., "A3\n")
-                nl_idx = raw_data.find(b"\n", pointer)
-                if nl_idx == -1:
-                    return ["ERROR", "-ERR Incomplete KESP Array"]
+                if nl_index == -1:
+                    return [], 0  # Incomplete array header, wait for more bytes
 
-                expected_args = int(raw_data[pointer + 1 : nl_idx].decode("utf-8"))
-                pointer = nl_idx + 1  # Move pointer past the \n
+                expected_args = int(raw_data[pointer + 1 : nl_index].decode("utf-8"))
+                pointer = nl_index + 1
 
-                # 2. Loop exactly 'expected_args' times
                 for _ in range(expected_args):
-                    # Read String Header (e.g., "S6\n")
                     nl_idx = raw_data.find(b"\n", pointer)
                     if nl_idx == -1:
-                        return ["ERROR", "-ERR Incomplete KESP String"]
+                        return [], 0  # incomplete string header
 
+                    # 🚀 FIX: Flipped the operator to catch invalid headers
                     if raw_data[pointer : pointer + 1] != b"S":
-                        return ["ERROR", "-ERR Protocol desync: Expected 'S'"]
+                        return ["ERROR", "-ERR Protocol Desync: Expected 'S'"], len(
+                            raw_data
+                        )
 
                     str_len = int(raw_data[pointer + 1 : nl_idx].decode("utf-8"))
                     pointer = nl_idx + 1
 
-                    # 3. Extract exact bytes (The Binary-Safe Magic)
-                    # We do NOT search for a newline here. We slice exactly 'str_len' bytes.
+                    # Check if the full string + trailing newline has arrived yet
+                    if pointer + str_len + 1 > len(raw_data):
+                        return [], 0  # incomplete payload, wait for next payload
+
                     data_bytes = raw_data[pointer : pointer + str_len]
                     tokens.append(data_bytes.decode("utf-8"))
 
-                    # Move pointer past the data and its trailing protocol \n
-                    pointer = pointer + str_len + 1
+                    pointer += str_len + 1
+
+                bytes_consumed = pointer
 
             except (ValueError, IndexError):
-                return ["ERROR", "-ERR Malformed KESP payload"]
+                return ["ERROR", "-ERR Malformed KESP payload"], len(raw_data)
 
-        # 🚀 SMART PARSER: NORMALIZE FLAGS FOR ALL INPUTS
         if tokens and len(tokens) > 0 and tokens[0] != "ERROR":
             tokens[0] = tokens[0].upper()
-
             OPTION_FLAGS = {"WITHSCORES", "ALPHA", "LIMIT", "BY", "ASC", "DESC"}
+
             tokens = [
                 t.upper() if isinstance(t, str) and t.upper() in OPTION_FLAGS else t
                 for t in tokens
             ]
 
-        return tokens
+        return tokens, bytes_consumed
 
 
 class KESPEncoder:
@@ -112,6 +115,16 @@ class KESPEncoder:
             header = f"A{len(data)}\n".encode("utf-8")
             # Recursively encode every element inside the array
             elements = b"".join(KESPEncoder.encode(item) for item in data)
+            return header + elements
+
+        # 🚀 5. Dictionaries (Flattens into an alternating Key-Value Array)
+        elif isinstance(data, dict):
+            # A dictionary of 3 items becomes a KESP array of 6 items [k1, v1, k2, v2...]
+            header = f"A{len(data) * 2}\n".encode("utf-8")
+            elements = b"".join(
+                KESPEncoder.encode(str(k)) + KESPEncoder.encode(v)
+                for k, v in data.items()
+            )
             return header + elements
 
         # Fallback

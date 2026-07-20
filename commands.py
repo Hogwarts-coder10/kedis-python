@@ -45,6 +45,27 @@ class CommandHandler:
             "PUBLISH": self._handle_publish,
         }
 
+    @property
+    def WRITE_COMMANDS(self) -> set[str]:
+        """
+        The definitive list of all engine commands that mutate database state.
+        Used by the replication slipstream to broadcast changes and enforce read-only firewalls.
+        """
+        return {
+            "SET",
+            "DEL",
+            "EXPIREAT",
+            "FLUSHALL",
+            "LPUSH",
+            "RPUSH",
+            "LPOP",
+            "RPOP",
+            "SADD",
+            "SREM",
+            "HSET",
+            "ZADD",
+        }
+
     def execute(self, tokens: list[str], client_socket=None):
         """
         Routes parsed tokens to the correct storage operations in O(1) time.

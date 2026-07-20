@@ -494,7 +494,7 @@ class KedisClient:
                     raw_response = self.handler.execute(["STATS"])
                 else:
                     # Feed the KESP bytes to the intake parser
-                    tokens = CommandParser.parse(kesp_payload)
+                    tokens, consumed = CommandParser.parse(kesp_payload)
                     if tokens and tokens[0] == "ERROR":
                         console.print(f"[red]{tokens[1]}[/red]")
                         return

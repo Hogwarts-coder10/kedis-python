@@ -22,10 +22,6 @@ class KedisStore:
         # A secondary hash map to track expiration timestamps (Unix time)
         self._expires: dict[str, float] = {}
 
-        # 🚀 Issue 9 FIX: Cold Boot SnapShot recovery
-        # Pulls the heavy data into RAM before the network even turns on
-        self._load_snapshot()
-
         # ---------------------------------------------------------
         # TRUE LRU SURVIVAL TRACKER
         # Uses OrderedDict purely to track the timeline of access.
@@ -35,6 +31,10 @@ class KedisStore:
         self._lru_maxsize = lru_maxsize
         self._lru_hits = 0
         self._lru_misses = 0
+
+        # 🚀 Issue 9 FIX: Cold Boot SnapShot recovery
+        # Pulls the heavy data into RAM before the network even turns on
+        self._load_snapshot()
 
         self._is_recovering = True
 
@@ -55,6 +55,54 @@ class KedisStore:
                 target=self._background_fsync, daemon=True
             )
             self._sync_thread.start()
+
+    # ------------------------------------------------------------------
+    # SNAPSHOT SERIALIZATION ENVELOPES (Used by SAVE and REPLICATION)
+    # ------------------------------------------------------------------
+    def get_snapshot_state(self) -> dict:
+        """
+        Packages the complex memory map into a JSON-safe dictionary envelope.
+        """
+        serializable_data = {}
+        for k, v in self._data.items():
+            v_type = type(v).__name__
+            if v_type == "SkipList":
+                serializable_data[k] = {"__type__": "skiplist", "data": v.member_map}
+            elif v_type == "set":
+                serializable_data[k] = {"__type__": "set", "data": list(v)}
+            elif v_type == "deque":
+                serializable_data[k] = {"__type__": "deque", "data": list(v)}
+            else:
+                serializable_data[k] = v
+
+        return {"data": serializable_data, "expires": getattr(self, "_expires", {})}
+
+    def restore_snapshot_state(self, state: dict) -> None:
+        """
+        Restores memory and rebuilds complex objects from a JSON-safe envelope.
+        """
+        raw_data = state.get("data", {})
+        self._expires = state.get("expires", {})
+        self._data = {}
+
+        for k, v in raw_data.items():
+            if isinstance(v, dict) and "__type__" in v:
+                if v["__type__"] == "skiplist":
+                    sl = SkipList()
+                    for member, score in v["data"].items():
+                        sl.insert(score, member)
+                    self._data[k] = sl
+                elif v["__type__"] == "set":
+                    self._data[k] = set(v["data"])
+                elif v["__type__"] == "deque":
+                    self._data[k] = deque(v["data"])
+            else:
+                self._data[k] = v
+
+        if hasattr(self, "_lru_clear"):
+            self._lru_clear()
+            for k in self._data.keys():
+                self._touch_write(k)
 
     def set_appendfsync(self, mode: str) -> str:
         """
@@ -323,35 +371,16 @@ class KedisStore:
         """
         Safely flushes memory to a snapshot file using an atomic swap.
         """
-
         main_file = "kedis.snapshot"
         temp_file = "kedis.snapshot.tmp"
 
         try:
-            serializable_data = {}
-
-            for k, v in self._data.items():
-                v_type = type(v).__name__
-
-                if v_type == "SkipList":
-                    # Just save the raw member map, we will rebuild the tree on load
-                    serializable_data[k] = {
-                        "__type__": "skiplist",
-                        "data": v.member_map,
-                    }
-
-                elif v_type == "set":
-                    serializable_data[k] = {"__type__": "set", "data": list(v)}
-
-                elif v_type == "deque":
-                    serializable_data[k] = {"__type__": "deque", "data": list(v)}
-
-                else:
-                    serializable_data[k] = v
+            # 🚀 FIX: Use the extracted snapshot state method
+            safe_state = self.get_snapshot_state()
 
             # 1. Write to a temporary file first
             with open(temp_file, "w") as f:
-                json.dump({"data": serializable_data, "expires": self._expires}, f)
+                json.dump(safe_state, f)
 
                 f.flush()
                 os.fsync(f.fileno())
@@ -376,34 +405,8 @@ class KedisStore:
             try:
                 with open(filename, "r") as f:
                     state = json.load(f)
-
-                    raw_data = state.get("data", {})
-                    self._expires = state.get("expires", {})
-                    self._data = {}
-
-                    # 🚀 THE FIX: Unpack the envelopes and rebuild the exact objects
-                    for k, v in raw_data.items():
-                        if isinstance(v, dict) and "__type__" in v:
-                            if v["__type__"] == "skiplist":
-                                sl = SkipList()
-                                # Re-insert the scores to rebuild the rank-aware pointers
-                                for member, score in v["data"].items():
-                                    sl.insert(score, member)
-                                self._data[k] = sl
-
-                            elif v["__type__"] == "set":
-                                self._data[k] = set(v["data"])
-
-                            elif v["__type__"] == "deque":
-                                self._data[k] = deque(v["data"])
-                        else:
-                            self._data[k] = v
-
-                    # Rebuild the LRU tracker based on what was loaded
-                    self._lru_clear()
-                    for k in self._data.keys():
-                        self._touch_write(k)
-
+                    # 🚀 FIX: Use the extracted restoration method
+                    self.restore_snapshot_state(state)
             except Exception as e:
                 print(f"DEBUG: Load failed - {e}")
 
@@ -508,8 +511,10 @@ class KedisStore:
                         for h_field, h_val in value.items():
                             f.write(f"HSET {key} {h_field} {h_val}\n")
                     elif isinstance(value, SkipList):
-                        members_with_scores = value.get_range(0, -1, withscores=True)
-                        for mem, scr in members_with_scores:
+                        flat_list = value.get_range(0, -1, withscores=True)
+                        for i in range(0, len(flat_list), 2):
+                            mem = flat_list[i]
+                            scr = flat_list[i + 1]
                             f.write(f"ZADD {key} {scr} {mem}\n")
                     else:
                         f.write(f"SET {key} {value}\n")
@@ -542,13 +547,12 @@ class KedisStore:
         """
         Restores database state from atomic snapshot file on boot
         """
-
         main_file = "kedis.snapshot"
 
         if os.path.exists(main_file):
             try:
-                with open(main_file, "r") as f:
-                    self.data = json.load(f)
+                # 🚀 FIX: Delegate to the new load method to safely unpack envelopes on startup
+                self.load(main_file)
                 print(
                     f"✓ Snapshot recovery successful: {len(self._data)} keys restored to RAM."
                 )
@@ -778,7 +782,6 @@ class KedisStore:
             return "string"
 
     def get_engine_stats(self) -> dict[str, Any]:
-
         self._evict_all_expired()
         stats = {
             "total_keys": len(self._data),
