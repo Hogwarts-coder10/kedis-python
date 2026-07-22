@@ -174,11 +174,16 @@ class AsyncKedisSession:
         self.in_transaction = False
         self.tx_queue = []
 
+        # Connection-specific watch state {key: expected_version}
+        self.watched_keys = {}
+
         # Network Dispatch Table
         self.tx_router = {
             "MULTI": self.handle_multi,
             "EXEC": self.handle_exec,
             "DISCARD": self.handle_discard,
+            "WATCH": self.handle_watch,
+            "UNWATCH": self.handle_unwatch,
         }
 
     async def send(self, data: bytes):
@@ -192,44 +197,73 @@ class AsyncKedisSession:
     # ASYNC TRANSACTION ROUTUING (Which will be used in dispatch table)
     # -------------------------------------
 
-    async def handle_multi(self):
+    async def handle_watch(self, tokens: list):
         if self.in_transaction:
-            await self.send(b"EMULTI calls are not nested\n")
+            await self.send(b"-ERR WATCH inside MULTI is not allowed\r\n")
+            return
+        if len(tokens) < 2:
+            await self.send(b"-ERR wrong number of arguments for 'watch'\r\n")
+            return
+
+        # Lock in the current version of the requested keys
+        for key in tokens[1:]:
+            current_ver = getattr(global_store, "_versions", {}).get(key, 0)
+            self.watched_keys[key] = current_ver
+        await self.send(b"+OK\r\n")
+
+    async def handle_unwatch(self, tokens: list):
+        self.watched_keys.clear()
+        await self.send(b"+OK\r\n")
+
+    async def handle_multi(self, tokens: list):
+        if self.in_transaction:
+            await self.send(b"-ERR MULTI calls are not nested\r\n")
         else:
             self.in_transaction = True
             self.tx_queue = []
-            await self.send(b"+OK")
+            await self.send(b"+OK\r\n")
 
-    async def handle_discard(self):
-        """
-        Aborts the transaction, clears the queue, and resets the flag.
-        """
+    async def handle_discard(self, tokens: list):
         if not getattr(self, "in_transaction", False):
             await self.send(b"-ERR DISCARD without MULTI\r\n")
             return
 
         self.in_transaction = False
         self.tx_queue = []
+        self.watched_keys.clear()  # Discarding also clears watched keys
         await self.send(b"+OK\r\n")
 
-    async def handle_exec(self):
-        """
-        Executes all queued commands sequentially,
-        and returns an array of results.
-        """
+    async def handle_exec(self, tokens: list):
         if not getattr(self, "in_transaction", False):
             await self.send(b"-ERR EXEC without MULTI\r\n")
             return
 
-        # drop out of transaction mode
+        #  OPTIMISTIC LOCK CHECK
+        # Verify no watched keys have been modified by another client
+        transaction_aborted = False
+        for key, expected_version in self.watched_keys.items():
+            current_version = getattr(global_store, "_versions", {}).get(key, 0)
+            if current_version != expected_version:
+                transaction_aborted = True
+                break
+
+        # Drop out of transaction mode and clear locks
         self.in_transaction = False
+        self.watched_keys.clear()
+
+        # If race condition detected, abort safely
+        if transaction_aborted:
+            self.tx_queue.clear()
+            # kedis protocol returns a Null Array for aborted transactions
+            await self.send(b"N\n")
+            return
 
         # Handle empty queues
         if not self.tx_queue:
-            await self.send(b"*0\r\n")
+            await self.send(b"A0\n")
             return
 
-        # execute the payload
+        # Execute the payload
         results = []
         for cmd_args in self.tx_queue:
             result = await asyncio.to_thread(
@@ -240,7 +274,7 @@ class AsyncKedisSession:
         self.tx_queue.clear()
 
         # Format and send the array of results back to the client
-        response = f"*{len(results)}\r\n".encode("utf-8")
+        response = f"A{len(results)}\n".encode("utf-8")
         for res in results:
             response += KESPEncoder.encode(res)
 
@@ -352,7 +386,7 @@ class AsyncKedisSession:
                         continue
 
                     if cmd in self.tx_router:
-                        await self.tx_router[cmd]()
+                        await self.tx_router[cmd](tokens)
 
                     elif self.in_transaction:
                         self.tx_queue.append(tokens)

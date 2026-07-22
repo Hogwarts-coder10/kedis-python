@@ -89,6 +89,7 @@ class KedisClient:
                 "STATS",
                 "COMPACT",
                 "SLOWLOG",
+                "LATENCY",
             ]
 
         cli_commands = [
@@ -104,9 +105,10 @@ class KedisClient:
             "MULTI",
             "EXEC",
             "DISCARD",
+            "WATCH",
+            "UNWATCH",
             "REPLICAOF",
             "CONFIG",
-            "LATENCY",
         ]
         self.VALID_COMMANDS = engine_commands + cli_commands
 
@@ -181,6 +183,8 @@ class KedisClient:
             "DISCARD",
             "REPLICAOF",
             "CONFIG",
+            "WATCH",
+            "UNWATCH",
         ]
         self.VALID_COMMANDS = engine_commands + cli_commands
 
@@ -682,6 +686,15 @@ class KedisClient:
                     elif lines[idx].startswith("I"):
                         output.append(f"{item_num}) {lines[idx][1:]}")
                         idx += 1
+
+                    elif lines[idx].startswith("+"):  # ADDED Simple Strings
+                        output.append(f"{item_num}) {lines[idx][1:]}")
+                        idx += 1
+
+                    elif lines[idx].startswith("E"):  # 🚀 ADDED: Errors
+                        output.append(f"{item_num}) (error) {lines[idx][1:]}")
+                        idx += 1
+
                     elif lines[idx].startswith("N"):
                         output.append(f"{item_num}) (nil)")
                         idx += 1

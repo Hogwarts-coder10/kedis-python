@@ -21,6 +21,8 @@ class KedisStore:
         self._data: dict[str, Any] = {}
         # A secondary hash map to track expiration timestamps (Unix time)
         self._expires: dict[str, float] = {}
+        # Track the exact mutation of every key to prevent race conditions
+        self._versions: dict[str, int] = {}
 
         # ---------------------------------------------------------
         # TRUE LRU SURVIVAL TRACKER
@@ -142,6 +144,13 @@ class KedisStore:
                 self._sync_thread.start()
             return "+OK appendfsync set to everysec"
 
+    def _bump_version(self, key: str) -> None:
+        """
+        Increments the mutation tracker for a key (used for WATCH/EXEC locking)
+        """
+
+        self._versions[key] = self._versions.get(key, 0) + 1
+
     def shutdown(self):
         """
         Executes a clean shutdown. Stops the background I/O thread,
@@ -257,6 +266,8 @@ class KedisStore:
 
     def _touch_write(self, key: str) -> None:
         """Tracks a write. If the engine hits the redline, executes the oldest key."""
+        self._bump_version(key)
+
         if key in self._lru_tracker:
             self._lru_tracker.move_to_end(key)
         else:
@@ -364,6 +375,7 @@ class KedisStore:
     def delete(self, key: str) -> int:
         self._evict_if_expired(key)
         if key in self._data:
+            self._bump_version(key)
             self._log_operation("DEL", key)
             del self._data[key]
             self._expires.pop(key, None)
@@ -419,6 +431,7 @@ class KedisStore:
         self._data.clear()
         self._expires.clear()
         self._lru_clear()
+        self._versions.clear()
 
     def save(self):
         """
