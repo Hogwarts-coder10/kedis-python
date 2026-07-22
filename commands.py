@@ -1,4 +1,6 @@
 import threading
+import time
+from typing import Any
 
 from store import KedisStore
 
@@ -43,6 +45,8 @@ class CommandHandler:
             "CONFIG": self._handle_config,
             "SUBSCRIBE": self._handle_subscribe,
             "PUBLISH": self._handle_publish,
+            "SLOWLOG": self.cmd_slowlog,
+            "LATENCY": self.cmd_latency,
         }
 
     @property
@@ -75,17 +79,49 @@ class CommandHandler:
             return "-ERR empty command or syntax error"
 
         cmd = tokens[0].upper()
+        args = tokens[
+            1:
+        ]  # (Though your current code passes tokens, let's keep your routing exact)
 
-        with self._engine_lock:
-            if cmd in self._commands:
-                if cmd in ["SUBSCRIBE", "PUBLISH"]:
-                    handler_function = self._commands[cmd]
-                    return handler_function(tokens, client_socket)
+        # 🚀 TRACK A: Start the high-precision telemetry stopwatch (in nanoseconds)
+        start_time = time.perf_counter_ns()
+        result = None
+
+        try:
+            with self._engine_lock:
+                if cmd in self._commands:
+                    if cmd in ["SUBSCRIBE", "PUBLISH"]:
+                        handler_function = self._commands[cmd]
+                        result = handler_function(tokens, client_socket)
+                    else:
+                        handler_function = self._commands[cmd]
+                        # Note: Depending on how your handlers are registered,
+                        # they might expect 'tokens' or 'args'. Keeping your existing call:
+                        result = handler_function(tokens)
+                    return result
                 else:
-                    handler_function = self._commands[cmd]
-                    return handler_function(tokens)
-            else:
-                return f"-ERR unknown command '{cmd}'"
+                    result = f"-ERR unknown command '{cmd}'"
+                    return result
+
+        except TypeError as e:
+            result = f"-ERR wrong number of arguments for '{cmd}' command"
+            return result
+        except Exception as e:
+            result = f"-ERR {str(e)}"
+            return result
+
+        finally:
+            # 🚀 TRACK A: Stop the stopwatch, convert nanoseconds to microseconds
+            end_time = time.perf_counter_ns()
+            duration_us = (end_time - start_time) // 1000
+
+            # Feed the metrics to the store's slowlog ring buffer if available
+            if (
+                hasattr(self, "store")
+                and self.store
+                and hasattr(self.store, "_log_slow_command")
+            ):
+                self.store._log_slow_command(tokens, duration_us)
 
     # ---------------------------------------------------------
     # COMMAND HANDLERS (The isolated engine components)
@@ -393,4 +429,84 @@ class CommandHandler:
         for dead in dead_sockets:
             subscribers.remove(dead)
 
-        return receivers
+        return
+
+    def cmd_slowlog(self, tokens: list[str]) -> Any:
+        if len(tokens) < 2:
+            return "-ERR wrong number of arguments for 'slowlog' command"
+
+        subcmd = tokens[1].upper()
+
+        if subcmd == "GET":
+            count = None
+            if len(tokens) > 2:
+                try:
+                    count = int(tokens[2])
+                except ValueError:
+                    return "-ERR value is not an integer or out of range"
+
+            # Fetch raw logs
+            raw_logs = self.store.slowlog_get(count)
+            if not raw_logs:
+                return []
+
+            # Formatting raw logs for client UI
+            formatted_logs = []
+
+            for entry in raw_logs:
+                log_id = entry[0]
+                timestamp = entry[1]
+                duration_us = entry[2]
+                cmd_string = " ".join(entry[3])
+
+                formatted_logs.append(
+                    f"ID: {log_id} | Time: {timestamp} | {duration_us}µs | Cmd: {cmd_string}"
+                )
+
+            return formatted_logs
+
+        elif subcmd == "LEN":
+            return self.store.slowlog_len()
+
+        elif subcmd == "RESET":
+            self.store.slowlog_reset()
+            return "+OK"
+
+        else:
+            return f"-ERR Unknown subcommand '{subcmd}'. Try SLOWLOG <GET|LEN|RESET>"
+
+    def cmd_latency(self, tokens: list[str]) -> Any:
+        if len(tokens) < 2:
+            return "-ERR wrong number of arguments for 'latency' command"
+
+        subcmd = tokens[1].upper()
+        # Safely fetch the lag, defaulting to 0.0 if in Local Mode without a heartbeat
+        lag_ms = getattr(self.store, "current_lag_ms", 0.0)
+
+        if subcmd == "LAG":
+            return f"{lag_ms}ms"
+
+        elif subcmd == "DOCTOR":
+            # The Engine Health Diagnostic Report
+            drivetrain = self.store.appendfsync.upper()
+            keys = len(getattr(self.store, "_data", {}))
+
+            # Determine health status based on lag severity
+            if lag_ms < 5.0:
+                health = "[green]EXCELLENT[/green]"
+            elif lag_ms < 20.0:
+                health = "[yellow]WARNING (Mild Loop Delay)[/yellow]"
+            else:
+                health = "[red]CRITICAL (Heavy Blocking)[/red]"
+
+            report = (
+                f"--- KEDIS ENGINE HEALTH ---\n"
+                f"Event Loop Lag : {lag_ms}ms\n"
+                f"Status         : {health}\n"
+                f"I/O Drivetrain : {drivetrain}\n"
+                f"Active Keys    : {keys}\n"
+            )
+            return report
+
+        else:
+            return f"-ERR Unknown subcommand '{subcmd}'. Try LATENCY <LAG|DOCTOR>"

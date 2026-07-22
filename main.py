@@ -88,6 +88,7 @@ class KedisClient:
                 "TYPE",
                 "STATS",
                 "COMPACT",
+                "SLOWLOG",
             ]
 
         cli_commands = [
@@ -105,6 +106,7 @@ class KedisClient:
             "DISCARD",
             "REPLICAOF",
             "CONFIG",
+            "LATENCY",
         ]
         self.VALID_COMMANDS = engine_commands + cli_commands
 
@@ -462,6 +464,8 @@ class KedisClient:
                 "[bold purple]Client Commands (Dashboard)[/bold purple]\n"
                 "  [yellow]KEYS[/yellow]                 : Radar of all active keys\n"
                 "  [yellow]COMPACT[/yellow]              : Compress the AOF log file\n"
+                "  [yellow]SLOWLOG[/yellow]              : View slow query telemetry (GET, LEN, RESET)\n"
+                "  [yellow]LATENCY[/yellow]              : View async event loop lag (LAG, DOCTOR)\n"
                 "  [yellow]MODE[/yellow]                 : View current drivetrain (TCP/Local)\n"
                 "  [yellow]INFO[/yellow]                 : View engine telemetry and version\n"
                 "  [yellow]HELP[/yellow]                 : Show this command reference\n"
@@ -582,6 +586,31 @@ class KedisClient:
                 console.print(response_text)
             else:
                 UI.render_table(cmd, response_text, raw_input)
+
+        elif cmd == "LATENCY":
+            # Strip the literal quotes that the KESP decoder wraps around bulk strings
+            clean_text = response_text.strip('"')
+
+            if "DOCTOR" in raw_input.upper() and not clean_text.startswith("(error)"):
+                from rich.table import Table
+
+                table = Table(
+                    title="🩺 Engine Health Diagnostic",
+                    style="cyan",
+                    border_style="cyan",
+                )
+                table.add_column("Metric", justify="left", style="bold white")
+                table.add_column("Value", justify="left")
+
+                # Dynamically parse the report from commands.py into table rows
+                for line in clean_text.split("\n"):
+                    if ":" in line:
+                        metric, value = line.split(":", 1)
+                        table.add_row(metric.strip(), value.strip())
+
+                console.print(table)
+            else:
+                console.print(clean_text)
 
         else:
             console.print(response_text)

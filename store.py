@@ -49,6 +49,14 @@ class KedisStore:
         self._is_recovering = False
         self.aof_file = open(self.aof_filename, "a")
 
+        # SLOWLOG TELEMETRY ENGINE
+        self.slowlog_slower_than = (
+            10000  # Default threshold: 10,000 microseconds (10ms)
+        )
+        self.slowlog_max_len = 128  # Maximum number of logged items to retain in RAM
+        self.slowblog_id_counter = 0  # Maximum number of logged items to retain in RAM
+        self._slowlog_queue: deque = deque(maxlen=self.slowlog_max_len)
+
         # Start the background sync engine if using high-performance mode
         if self.appendfsync == "everysec":
             self._sync_thread = threading.Thread(
@@ -285,6 +293,51 @@ class KedisStore:
             "tracked_keys": len(self._lru_tracker),
             "max_size": self._lru_maxsize,
         }
+
+    def _log_slow_command(self, tokens: list, duration_us: int):
+        """
+        Checks if a command exceeded the execution threshold and logs it.
+        """
+
+        if self.slowlog_slower_than < 0:
+            return  # Slowlog is disabled if threshold is negative
+
+        if duration_us >= self.slowlog_slower_than:
+            self.slowblog_id_counter += 1
+            entry = [
+                self.slowblog_id_counter,
+                int(time.time()),
+                duration_us,
+                [str(t) for t in tokens],
+            ]
+            self._slowlog_queue.append(entry)
+
+    def slowlog_get(self, count: Optional[int] = None) -> list:
+        """
+        Retuns the most recent slow log queries
+        """
+
+        logs = list(self._slowlog_queue)
+        logs.reverse()
+
+        if count is not None and count >= 0:
+            return logs[:count]
+
+        return logs
+
+    def slowlog_len(self) -> int:
+        """
+        Returns the total number of items currently in slowlog
+        """
+
+        return len(self._slowlog_queue)
+
+    def slowlog_reset(self) -> None:
+        """
+        Clears all slowlog entries
+        """
+
+        self._slowlog_queue.clear()
 
     # ------------------------------------------------------------------
     # COMMANDS (Wired into the LRU Tracker globally)

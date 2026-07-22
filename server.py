@@ -2,6 +2,7 @@ import asyncio
 import json
 import signal
 import sys
+import time
 
 from rich.console import Console
 from rich.panel import Panel
@@ -27,6 +28,30 @@ server_role = "master"
 server_host = None
 master_port = None
 connected_replicas = []  # 📡 Holds the writer sockets for all active Followers
+
+
+async def loop_latency_monitor(store):
+    """
+    Diagnostic sensor: Pulses every 100ms. If it takes longer to wake up,
+    the event loop is being blocked by a synchronous operation.
+    """
+
+    store.current_lag_ms = 0.0
+
+    while True:
+        start_time = time.perf_counter()
+
+        # We expect the loop to hand control back in exactly 100ms
+        await asyncio.sleep(0.1)
+
+        end_time = time.perf_counter()
+
+        # Calculating actual sleep time
+        actual_sleep_time = (end_time - start_time) * 1000
+        lag = actual_sleep_time - 100.0
+
+        # Floor to 0 (sometimes sleep wakes up a fraction early), round to 2 decimals
+        store.current_lag_ms = max(0.0, round(lag, 2))
 
 
 async def init_replication_stream(host: str, port: int):
@@ -420,6 +445,7 @@ async def main():
     )
 
     server = await asyncio.start_server(handle_connection, HOST, PORT)
+    asyncio.create_task(loop_latency_monitor(global_store))
 
     # --- THE OS SIGNAL TRAP ---
     def shutdown_sequence(sig_name):
