@@ -25,6 +25,22 @@ Rather than focusing on Redis compatibility, Kedis focuses on understanding the 
 
 ---
 
+
+## 📚 Engine Documentation
+
+Dive into the internal grimoire to understand how Kedis achieves microsecond latency:
+* [Architecture & Pipeline](docs/architecture.md)
+* [KESP Wire Protocol](docs/protocol.md)
+* [Networking & Surge Tank](docs/networking.md)
+* [Persistence & I/O Drivetrain](docs/persistence.md)
+* [Command Spellbook](docs/commands.md)
+* [TTL & Lifespan Mechanics](docs/ttl.md)
+* [Pub/Sub Broadcasts](docs/pubsub.md)
+* [Benchmarks & Telemetry](docs/benchmarks.md)
+* [Future Roadmap](docs/roadmap.md)
+
+---
+
 # ✨ Features
 
 ## 🔑 Core Key-Value Operations
