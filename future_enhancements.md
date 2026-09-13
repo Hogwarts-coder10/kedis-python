@@ -329,6 +329,24 @@ Potential algorithms:
 
 ---
 
+## Future Enhancement
+### CDSA Native Storage Backend
+
+Integrate the CDSA C data-structures library as an optional native
+storage backend for Kedis-Python.
+
+Potential benefits:
+- Faster key-value lookups
+- Reduced Python object and dictionary overhead
+- Better memory efficiency
+- Native implementations of hash maps and advanced data structures
+- Improved throughput for large workloads
+- Reuse of CDSA's custom allocators and data structures
+
+The initial implementation will preserve Kedis-Python's existing Python
+API and command semantics while moving performance-critical operations
+into CDSA through a Python C extension.
+
 # Engineering Philosophy
 
 Because using Redis teaches me how to use Redis.
