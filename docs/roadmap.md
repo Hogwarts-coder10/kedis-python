@@ -97,8 +97,3 @@ These ideas are exploratory and may or may not become part of Kedis.
 
 ---
 
-# ⚡ About Kedis-C
-
-Performance-focused work—including the native implementation of the **KESP parser**, networking stack, and low-level memory optimizations—will be developed in **Kedis-C**.
-
-Kedis-Python will continue serving as the reference implementation, while Kedis-C will prioritize maximum throughput and systems-level performance. Both engines will remain compatible through the shared KESP protocol.
