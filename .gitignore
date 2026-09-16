@@ -41,3 +41,8 @@ Thumbs.db
 dump.json
 kedis.aof
 kedis.snapshot
+
+# library files
+*.so
+
+compile_commands.json
