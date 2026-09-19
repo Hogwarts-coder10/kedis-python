@@ -7,6 +7,8 @@ class ZNode:
     A single node in skip list chassis
     """
 
+    __slots__ = ("score", "member", "forward", "span")
+
     def __init__(self, score: float, member: str, level: int):
         self.score = score
         self.member = member
@@ -31,9 +33,17 @@ class SkipList:
         self.member_map = {}  # for O(1) lookups
 
     def _random_level(self):
-        """Rolls the dice to determine if a node gets an express lane."""
+        """Rolls the dice to determine if a node gets an express lane.
+
+        Tied to self.P == 0.5: getrandbits(1) is a straight coin flip,
+        cheaper than random.random() < 0.5 since it skips float
+        generation entirely. If self.P is ever changed to something
+        other than 0.5, this needs to go back to random.random().
+        """
         lvl = 1
-        while random.random() < self.P and lvl < self.MAX_LEVEL:
+        max_level = self.MAX_LEVEL
+        getrandbits = random.getrandbits
+        while getrandbits(1) == 0 and lvl < max_level:
             lvl += 1
         return lvl
 
@@ -44,24 +54,28 @@ class SkipList:
         to support O(log N + M) rank-based range queries.
         """
         is_new = 1
+        member_map = self.member_map
 
         # 1. Handle existing members: remove and re-insert to maintain sorting
-        if member in self.member_map:
+        existing_score = member_map.get(member)
+        if existing_score is not None:
             is_new = 0
-            if self.member_map[member] == score:
+            if existing_score == score:
                 return 0
             self.remove(member)
 
-        self.member_map[member] = score
+        member_map[member] = score
 
-        update = [self.head] * self.MAX_LEVEL
+        head = self.head
+        level = self.level
+        update = [head] * self.MAX_LEVEL
         rank = [0] * self.MAX_LEVEL
-        current = self.head
+        current = head
 
         # 2. Traverse the skip list to find the insertion point.
         # Track the cumulative rank (distance) traversed at each level.
-        for i in range(self.level - 1, -1, -1):
-            rank[i] = rank[i + 1] if i < self.level - 1 else 0
+        for i in range(level - 1, -1, -1):
+            rank[i] = rank[i + 1] if i < level - 1 else 0
 
             nxt = current.forward[i]
             while nxt and (
@@ -77,13 +91,15 @@ class SkipList:
         lvl = self._random_level()
 
         # 4. Initialize new levels if the random level exceeds current max level
-        if lvl > self.level:
-            for i in range(self.level, lvl):
+        if lvl > level:
+            member_count = len(member_map)
+            for i in range(level, lvl):
                 rank[i] = 0
-                update[i] = self.head
+                update[i] = head
                 # The initial span of a new level covers the entire existing list
-                update[i].span[i] = len(self.member_map) - 1
+                update[i].span[i] = member_count - 1
             self.level = lvl
+            level = lvl
 
         # 5. Splice the new node into the forward pointer chains
         new_node = ZNode(score, member, lvl)
@@ -101,7 +117,7 @@ class SkipList:
 
         # 7. Increment the span of all levels above the new node
         # that bypass it completely.
-        for i in range(lvl, self.level):
+        for i in range(lvl, level):
             update[i].span[i] += 1
 
         return is_new
@@ -111,15 +127,18 @@ class SkipList:
         Removes a member from the skip list while maintaining O(log N) complexity.
         Updates the span of all intersected and bypassing levels to preserve rank integrity.
         """
-        if member not in self.member_map:
+        member_map = self.member_map
+        if member not in member_map:
             return 0
 
-        score = self.member_map.pop(member)
-        update = [self.head] * self.MAX_LEVEL
-        current = self.head
+        score = member_map.pop(member)
+        head = self.head
+        level = self.level
+        update = [head] * self.MAX_LEVEL
+        current = head
 
         # 1. Traverse to find the target node and track all predecessor nodes
-        for i in range(self.level - 1, -1, -1):
+        for i in range(level - 1, -1, -1):
             nxt = current.forward[i]
             while nxt and (
                 nxt.score < score or (nxt.score == score and nxt.member < member)
@@ -132,7 +151,7 @@ class SkipList:
 
         # 2. Re-route pointers and recalculate spans
         if target and target.member == member and target.score == score:
-            for i in range(self.level):
+            for i in range(level):
                 if update[i].forward[i] == target:
                     # The target is in this level's path.
                     # Bypass the target and absorb its remaining span.
@@ -144,7 +163,7 @@ class SkipList:
                     update[i].span[i] -= 1
 
             # 3. Clean up empty upper levels if the highest nodes are removed
-            while self.level > 1 and self.head.forward[self.level - 1] is None:
+            while self.level > 1 and head.forward[self.level - 1] is None:
                 self.level -= 1
             return 1
 
@@ -173,12 +192,13 @@ class SkipList:
         stop = min(stop, length - 1)
 
         current = self.head
+        level = self.level
         traversed = 0
         target_rank = start + 1  # Ranks are 1-indexed relative to the head
 
         # 3. The O(log N) Fast-Forward Search
         # Jump using the span values until we are at the node right before the target
-        for i in range(self.level - 1, -1, -1):
+        for i in range(level - 1, -1, -1):
             while current.forward[i] and (traversed + current.span[i] < target_rank):
                 traversed += current.span[i]
                 current = current.forward[i]
@@ -189,12 +209,13 @@ class SkipList:
         # 4. The O(M) Collection Walk
         # Walk exactly (stop - start + 1) steps at the base level
         elements = []
+        append = elements.append
         steps_remaining = (stop - start) + 1
 
         while current and steps_remaining > 0:
-            elements.append(current.member)
+            append(current.member)
             if withscores:
-                elements.append(f"{current.score:g}")
+                append(f"{current.score:g}")
 
             current = current.forward[0]
             steps_remaining -= 1
