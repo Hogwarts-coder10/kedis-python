@@ -17,7 +17,7 @@ authors = [
 # If your project actually depends on third-party packages at runtime,
 # list them here instead of leaving this empty — check requirements.txt
 # and copy the real ones over.
-dependencies = [rich,pyfiglet]
+dependencies = ["rich","pyfiglet"]
 
 [project.urls]
 Homepage = "https://github.com/Hogwarts-coder10/kedis-python"
