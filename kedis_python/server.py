@@ -7,9 +7,9 @@ import time
 from rich.console import Console
 from rich.panel import Panel
 
-from commands import CommandHandler
-from parser import CommandParser, KESPEncoder
-from store import KedisStore
+from .commands import CommandHandler
+from .parser import CommandParser, KESPEncoder
+from .store import KedisStore
 
 console = Console()
 

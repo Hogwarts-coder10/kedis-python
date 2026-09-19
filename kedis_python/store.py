@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict, deque
 from typing import Any, Optional
 
-from skiplist import SkipList
+from .skiplist import SkipList
 
 
 class KedisStore:

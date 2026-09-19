@@ -2,7 +2,7 @@ import threading
 import time
 from typing import Any
 
-from store import KedisStore
+from .store import KedisStore
 
 
 class CommandHandler:

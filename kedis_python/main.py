@@ -16,11 +16,11 @@ if (
     os.environ["TERM"] = "xterm-256color"
 
 
-from commands import CommandHandler
-from network import NetworkManager
-from parser import CommandParser
-from store import KedisStore
-from ui import UI, console
+from .commands import CommandHandler
+from .network import NetworkManager
+from .parser import CommandParser
+from .store import KedisStore
+from .ui import UI, console
 
 # --- The Command History Hook ---
 
@@ -511,15 +511,15 @@ class KedisClient:
                     raw_response = self.handler.execute(tokens)
 
                 # Route the local Python response through the KESP Exhaust Encoder
-                from parser import KESPEncoder
+                from .parser import KESPEncoder
 
                 kesp_bytes = KESPEncoder.encode(raw_response)
 
             else:
                 # TCP MODE: Send raw KESP bytes across the wire
                 try:
-                    self.network.socket.sendall(kesp_payload)
-                    kesp_bytes = self.network.socket.recv(4096)
+                    self.network.sock.sendall(kesp_payload)
+                    kesp_bytes = self.network.sock.recv(4096)
                 except AttributeError:
                     # Fallback if NetworkManager doesn't expose the raw socket
                     kesp_bytes = self.network.send_command(kesp_payload.decode("utf-8"))
@@ -742,6 +742,10 @@ class KedisClient:
         )
 
 
-if __name__ == "__main__":
+def main():
     client = KedisClient()
     client.boot()
+
+
+if __name__ == "__main__":
+    main()
