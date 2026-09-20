@@ -1,4 +1,14 @@
 class CommandParser:
+    # --- Protocol hardening limits, mirroring the guards real Redis puts
+    # on its own wire protocol. Without these, a client can make the
+    # server buffer network input without limit — either by never
+    # sending a terminator, or by declaring an absurd array/string
+    # length and then slow-drip feeding bytes forever.
+    MAX_INLINE_LENGTH = 64 * 1024  # cap on an unterminated inline command
+    MAX_HEADER_LINE = 32  # more than enough for "A123456\n" / "S123456\n"
+    MAX_ARRAY_LENGTH = 1024 * 1024  # cap on a declared element count
+    MAX_BULK_LENGTH = 512 * 1024 * 1024  # cap on a single declared string length
+
     @staticmethod
     def parse(raw_data: bytes) -> tuple[list[str], int]:
         """
@@ -18,14 +28,29 @@ class CommandParser:
         tokens = []
         bytes_consumed = 0
 
-        # Inline fallback
+        # Inline fallback — newline-terminated, exactly like Redis's own
+        # inline command mode. This is what protects it against
+        # fragmentation: a command split across two TCP packets is NOT
+        # treated as complete until its terminator actually arrives.
         if first_byte != "A":
-            try:
-                tokens = raw_data.decode("utf-8").strip().split()
-                bytes_consumed = len(raw_data)
+            nl_index = raw_data.find(b"\n")
 
+            if nl_index == -1:
+                # No terminator yet — bound how long we'll wait, so a
+                # client that never sends '\n' can't grow the intake
+                # buffer without limit.
+                if len(raw_data) > CommandParser.MAX_INLINE_LENGTH:
+                    return ["ERROR", "-ERR Protocol error: too big inline request"], len(
+                        raw_data
+                    )
+                return [], 0  # incomplete, wait for the newline
+
+            bytes_consumed = nl_index + 1
+
+            try:
+                tokens = raw_data[:nl_index].decode("utf-8").strip().split()
             except UnicodeDecodeError:
-                return ["ERROR", "-ERR Invalid text encoding"], len(raw_data)
+                return ["ERROR", "-ERR Invalid text encoding"], bytes_consumed
 
         else:
             # KESP Decoder: Strict, Binary-safe byte counting
@@ -34,14 +59,34 @@ class CommandParser:
                 nl_index = raw_data.find(b"\n", pointer)
 
                 if nl_index == -1:
+                    if len(raw_data) > CommandParser.MAX_HEADER_LINE:
+                        return [
+                            "ERROR",
+                            "-ERR Protocol error: invalid array header",
+                        ], len(raw_data)
                     return [], 0  # Incomplete array header, wait for more bytes
 
                 expected_args = int(raw_data[pointer + 1 : nl_index].decode("utf-8"))
+
+                if expected_args < 0 or expected_args > CommandParser.MAX_ARRAY_LENGTH:
+                    return [
+                        "ERROR",
+                        "-ERR Protocol error: invalid multibulk length",
+                    ], len(raw_data)
+
                 pointer = nl_index + 1
 
                 for _ in range(expected_args):
                     nl_idx = raw_data.find(b"\n", pointer)
                     if nl_idx == -1:
+                        # Same reasoning as the inline cap: a client that
+                        # never terminates a bulk-string header shouldn't
+                        # be able to buffer forever either.
+                        if len(raw_data) - pointer > CommandParser.MAX_HEADER_LINE:
+                            return [
+                                "ERROR",
+                                "-ERR Protocol error: invalid bulk length",
+                            ], len(raw_data)
                         return [], 0  # incomplete string header
 
                     # 🚀 FIX: Flipped the operator to catch invalid headers
@@ -51,6 +96,13 @@ class CommandParser:
                         )
 
                     str_len = int(raw_data[pointer + 1 : nl_idx].decode("utf-8"))
+
+                    if str_len < 0 or str_len > CommandParser.MAX_BULK_LENGTH:
+                        return [
+                            "ERROR",
+                            "-ERR Protocol error: invalid bulk length",
+                        ], len(raw_data)
+
                     pointer = nl_idx + 1
 
                     # Check if the full string + trailing newline has arrived yet

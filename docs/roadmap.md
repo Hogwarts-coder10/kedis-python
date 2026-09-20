@@ -74,14 +74,6 @@ Continue expanding and stabilizing the Kedis Engine Serialization Protocol (KESP
 - [ ] Formal protocol specification
 
 ---
-# 📍 CDSA Integration
-- [ ] Profile Kedis-Python bottlenecks
-- [ ] Design Python ↔ CDSA integration layer
-- [ ] Add optional CDSA-backed keyspace
-- [ ] Benchmark against the pure-Python backend
-- [ ] Add native acceleration for selected data structures
-- [ ] Make the native backend optional/configurable
-
 # 🚀 Future Research Ideas
 
 These ideas are exploratory and may or may not become part of Kedis.
