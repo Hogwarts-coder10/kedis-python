@@ -24,6 +24,7 @@ Homepage = "https://github.com/Hogwarts-coder10/kedis-python"
 
 [project.scripts]
 kedis-cli = "kedis_python.main:main"
+kedis-server = "kedis_python.server:run"
 
 [tool.setuptools.packages.find]
 include = ["kedis_python*"]

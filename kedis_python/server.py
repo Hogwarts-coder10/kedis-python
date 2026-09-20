@@ -507,8 +507,12 @@ async def main():
             shutdown_sequence("SIGINT")
 
 
-if __name__ == "__main__":
+def run():
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
+
+if __name__ == "__main__":
+    run()

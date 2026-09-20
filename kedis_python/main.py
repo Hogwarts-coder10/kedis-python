@@ -97,6 +97,7 @@ class KedisClient:
             "INFO",
             "HELP",
             "DEBUG",
+            "DISCONNECT",
             "RECONNECT",
             "CLEAR",
             "CLS",
@@ -173,6 +174,7 @@ class KedisClient:
             "INFO",
             "HELP",
             "DEBUG",
+            "DISCONNECT",
             "RECONNECT",
             "CLEAR",
             "CLS",
@@ -308,6 +310,36 @@ class KedisClient:
                 else "[bold green]OFF ⚪[/bold green]"
             )
             console.print(f"\n[dim]🔧 Diagnostic telemetry is now {status}[/dim]\n")
+            return True
+
+        if cmd == "DISCONNECT":
+            if self.local_mode:
+                UI.print_panel(
+                    "[white]You are already in Standalone Mode.[/white]",
+                    "⚠ NETWORK STATUS",
+                    "yellow",
+                )
+            else:
+                console.print("[dim]Closing TCP network connection...[/dim]")
+                self.network.disconnect()
+
+                # Manual disconnect means the user wants to STAY local —
+                # suppress the radar so it doesn't immediately nag them
+                # back to TCP mode the moment it sees the server again.
+                self.suppress_reconnect = True
+
+                if self.store is None:
+                    self._init_local_engine()
+                else:
+                    self.local_mode = True
+
+                UI.print_panel(
+                    "[bold yellow]✓ Disconnected from Kedis TCP Engine[/bold yellow]\n"
+                    "[white]Mode: Standalone (Local Disk)[/white]\n"
+                    "[dim]Reconnect radar disabled — use RECONNECT to resume TCP mode.[/dim]",
+                    "🔌 CONNECTION CLOSED",
+                    "yellow",
+                )
             return True
 
         if cmd == "RECONNECT":
@@ -474,6 +506,7 @@ class KedisClient:
                 "  [yellow]INFO[/yellow]                 : View engine telemetry and version\n"
                 "  [yellow]HELP[/yellow]                 : Show this command reference\n"
                 "  [yellow]DEBUG[/yellow]                : Toggle diagnostic logs\n"
+                "  [yellow]DISCONNECT[/yellow]           : Manually drop TCP link, go Standalone\n"
                 "  [yellow]RECONNECT[/yellow]            : Manually reconnect to TCP server\n"
                 "  [yellow]STATS[/yellow]                : Deep Memory Map\n"
                 "  [yellow]CONFIG[/yellow]               : Hot-swap engine dials mid-flight\n"
@@ -645,7 +678,7 @@ class KedisClient:
             return "(connection closed)"
 
         try:
-            # 🛡️ THE FIX: Safely handle both raw bytes and pre-decoded text strings
+            #  FIX: Safely handle both raw bytes and pre-decoded text strings
             text = (
                 raw_bytes.decode("utf-8")
                 if isinstance(raw_bytes, bytes)
