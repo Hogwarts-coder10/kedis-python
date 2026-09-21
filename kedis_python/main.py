@@ -90,6 +90,10 @@ class KedisClient:
                 "COMPACT",
                 "SLOWLOG",
                 "LATENCY",
+                "SETBIT",
+                "GETBIT",
+                "BITCOUNT",
+                "BITOP",
             ]
 
         cli_commands = [
@@ -678,7 +682,7 @@ class KedisClient:
             return "(connection closed)"
 
         try:
-            #  FIX: Safely handle both raw bytes and pre-decoded text strings
+            # 🛡️ THE FIX: Safely handle both raw bytes and pre-decoded text strings
             text = (
                 raw_bytes.decode("utf-8")
                 if isinstance(raw_bytes, bytes)

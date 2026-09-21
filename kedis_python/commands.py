@@ -47,6 +47,10 @@ class CommandHandler:
             "PUBLISH": self._handle_publish,
             "SLOWLOG": self.cmd_slowlog,
             "LATENCY": self.cmd_latency,
+            "SETBIT": self._handle_setbit,
+            "GETBIT": self._handle_getbit,
+            "BITCOUNT": self._handle_bitcount,
+            "BITOP": self._handle_bitop,
         }
 
     @property
@@ -68,6 +72,8 @@ class CommandHandler:
             "SREM",
             "HSET",
             "ZADD",
+            "SETBIT",
+            "BITOP",
         }
 
     def execute(self, tokens: list[str], client_socket=None):
@@ -355,6 +361,56 @@ class CommandHandler:
             return result if result else []
         except ValueError:
             return "-ERR value is not an integer or out of range"
+        except TypeError as e:
+            return f"-ERR {str(e)}"
+
+    def _handle_setbit(self, tokens: list[str]):
+        if len(tokens) != 4:
+            return "-ERR wrong number of arguments for 'setbit' command"
+        try:
+            offset = int(tokens[2])
+            bit = int(tokens[3])
+            return self.store.setbit(tokens[1], offset, bit)
+        except ValueError as e:
+            return f"-ERR {str(e)}"
+        except TypeError as e:
+            return f"-ERR {str(e)}"
+
+    def _handle_getbit(self, tokens: list[str]):
+        if len(tokens) != 3:
+            return "-ERR wrong number of arguments for 'getbit' command"
+        try:
+            offset = int(tokens[2])
+            return self.store.getbit(tokens[1], offset)
+        except ValueError as e:
+            return f"-ERR {str(e)}"
+        except TypeError as e:
+            return f"-ERR {str(e)}"
+
+    def _handle_bitcount(self, tokens: list[str]):
+        if len(tokens) not in (2, 4):
+            return "-ERR wrong number of arguments for 'bitcount' command"
+        try:
+            if len(tokens) == 4:
+                start = int(tokens[2])
+                end = int(tokens[3])
+                return self.store.bitcount(tokens[1], start, end)
+            return self.store.bitcount(tokens[1])
+        except ValueError:
+            return "-ERR value is not an integer or out of range"
+        except TypeError as e:
+            return f"-ERR {str(e)}"
+
+    def _handle_bitop(self, tokens: list[str]):
+        if len(tokens) < 4:
+            return "-ERR wrong number of arguments for 'bitop' command"
+        try:
+            operation = tokens[1]
+            destkey = tokens[2]
+            srckeys = tokens[3:]
+            return self.store.bitop(operation, destkey, *srckeys)
+        except ValueError as e:
+            return f"-ERR {str(e)}"
         except TypeError as e:
             return f"-ERR {str(e)}"
 

@@ -830,6 +830,140 @@ class KedisStore:
             )
         return self._data[key].get_range(start, stop, withscores)
 
+    # ------------------------------------------------------------------
+    # BITMAP OPERATIONS
+    # Real Redis has no separate "bitmap" type — SETBIT/GETBIT/BITCOUNT
+    # all operate directly on the String type's raw bytes. We do the
+    # same: a bitmap-backed key is stored as an ordinary str, where each
+    # character's ordinal (0-255) represents one byte. This keeps
+    # bitmap keys fully compatible with TYPE (already reports "string"
+    # for anything that isn't a list/set/hash/zset) and with the
+    # existing KESP string encoder — no wire-protocol changes needed.
+    #
+    # Caveat: this only round-trips correctly for byte values 0-255 per
+    # character. A key set via plain SET with multi-byte UTF-8 text
+    # (e.g. emoji, non-Latin scripts) does not map 1:1 to "one Python
+    # character = one byte", so bit operations on such a key act on its
+    # Unicode code points, not its UTF-8 byte encoding. That's a gap in
+    # the engine's existing str-based value model generally, not
+    # something specific to bitmaps.
+    # ------------------------------------------------------------------
+
+    def _get_bitmap_bytes(self, key: str) -> list[int]:
+        """Returns the per-byte ordinals backing a key, or [] if absent."""
+        if key not in self._data:
+            return []
+        val = self._data[key]
+        if not isinstance(val, str):
+            raise TypeError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+        return [ord(c) for c in val]
+
+    def setbit(self, key: str, offset: int, bit: int) -> int:
+        self._evict_if_expired(key)
+        if offset < 0:
+            raise ValueError("bit offset is not an integer or out of range")
+        if bit not in (0, 1):
+            raise ValueError("bit is not an integer or out of range")
+
+        byte_index, bit_index = divmod(offset, 8)
+
+        raw_bytes = self._get_bitmap_bytes(key)
+        # Grow with zero bytes until the target byte actually exists,
+        # matching Redis's auto-extension behavior on SETBIT.
+        if byte_index >= len(raw_bytes):
+            raw_bytes.extend([0] * (byte_index + 1 - len(raw_bytes)))
+
+        old_byte = raw_bytes[byte_index]
+        mask = 1 << (7 - bit_index)  # MSB-first, matching Redis's bit numbering
+        old_bit = 1 if (old_byte & mask) else 0
+
+        raw_bytes[byte_index] = (old_byte | mask) if bit == 1 else (old_byte & ~mask & 0xFF)
+
+        self._data[key] = "".join(chr(b) for b in raw_bytes)
+        self._log_operation("SETBIT", key, offset, bit)
+        self._touch_write(key)
+        return old_bit
+
+    def getbit(self, key: str, offset: int) -> int:
+        self._evict_if_expired(key)
+        self._touch_read(key)
+        if offset < 0:
+            raise ValueError("bit offset is not an integer or out of range")
+
+        raw_bytes = self._get_bitmap_bytes(key)
+        byte_index, bit_index = divmod(offset, 8)
+        if byte_index >= len(raw_bytes):
+            return 0
+
+        mask = 1 << (7 - bit_index)
+        return 1 if (raw_bytes[byte_index] & mask) else 0
+
+    def bitcount(
+        self, key: str, start: Optional[int] = None, end: Optional[int] = None
+    ) -> int:
+        self._evict_if_expired(key)
+        self._touch_read(key)
+        raw_bytes = self._get_bitmap_bytes(key)
+        length = len(raw_bytes)
+
+        if start is None and end is None:
+            window = raw_bytes
+        else:
+            start = 0 if start is None else start
+            end = length - 1 if end is None else end
+            if start < 0:
+                start = max(0, length + start)
+            if end < 0:
+                end = max(0, length + end)
+            end = min(end, length - 1)
+            window = raw_bytes[start : end + 1] if start <= end and length else []
+
+        return sum(bin(b).count("1") for b in window)
+
+    def bitop(self, operation: str, destkey: str, *srckeys: str) -> int:
+        operation = operation.upper()
+        if operation not in ("AND", "OR", "XOR", "NOT"):
+            raise ValueError(f"syntax error in BITOP operation '{operation}'")
+        if operation == "NOT" and len(srckeys) != 1:
+            raise ValueError("BITOP NOT must be called with a single source key")
+        if operation != "NOT" and len(srckeys) < 1:
+            raise ValueError("wrong number of arguments for 'bitop' command")
+
+        self._evict_if_expired(destkey)
+        for k in srckeys:
+            self._evict_if_expired(k)
+
+        # Redis pads every source shorter than the longest one with
+        # zero bytes rather than erroring on length mismatch.
+        src_byte_lists = [self._get_bitmap_bytes(k) for k in srckeys]
+        max_len = max((len(b) for b in src_byte_lists), default=0)
+        padded = [b + [0] * (max_len - len(b)) for b in src_byte_lists]
+
+        if operation == "NOT":
+            result = [(~b) & 0xFF for b in padded[0]]
+        else:
+            result = list(padded[0]) if padded else []
+            for other in padded[1:]:
+                if operation == "AND":
+                    result = [a & b for a, b in zip(result, other)]
+                elif operation == "OR":
+                    result = [a | b for a, b in zip(result, other)]
+                elif operation == "XOR":
+                    result = [a ^ b for a, b in zip(result, other)]
+
+        if result:
+            self._data[destkey] = "".join(chr(b) for b in result)
+        elif destkey in self._data:
+            del self._data[destkey]
+            self._expires.pop(destkey, None)
+            self._lru_invalidate(destkey)
+
+        self._log_operation("BITOP", operation, destkey, *srckeys)
+        self._touch_write(destkey)
+        return len(result)
+
     def type_of(self, key: str) -> str:
         self._evict_if_expired(key)
         self._touch_read(key)
