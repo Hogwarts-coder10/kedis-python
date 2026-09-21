@@ -1,6 +1,6 @@
 import os
 
-from store import KedisStore
+from kedis_python.store import KedisStore
 
 
 def run_diagnostics():

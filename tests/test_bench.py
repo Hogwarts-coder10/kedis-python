@@ -1,5 +1,5 @@
-from commands import CommandHandler
-from store import KedisStore
+from kedis_python.commands import CommandHandler
+from kedis_python.store import KedisStore
 
 
 def run_diagnostics():
