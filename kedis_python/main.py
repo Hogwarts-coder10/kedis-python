@@ -424,7 +424,7 @@ class KedisClient:
                     else "0.0 KB"
                 )
 
-                str_c = list_c = set_c = hash_c = zset_c = 0
+                str_c = list_c = set_c = hash_c = zset_c = bit_c =  0
                 if self.store:
                     for val in self.store._data.values():
                         val_type = type(val).__name__
@@ -440,7 +440,7 @@ class KedisClient:
                         else:
                             str_c += 1
 
-                type_breakdown = f"[dim]Str: {str_c} | Lst: {list_c} | Set: {set_c} | Hsh: {hash_c} | ZSet: {zset_c}[/dim]"
+                type_breakdown = f"[dim]Str: {str_c} | Lst: {list_c} | Set: {set_c} | Hsh: {hash_c} | ZSet: {zset_c} | Bit: {bit_c}[/dim]"
 
                 # Dynamically pull the active I/O drivetrain (Safely scoped to Local Mode)
                 sync_policy = (
@@ -478,6 +478,7 @@ class KedisClient:
             return True
 
         if cmd == "HELP":
+           if cmd == "HELP":
             help_text = (
                 "[bold cyan]Core String Commands[/bold cyan]\n"
                 "  [green]SET[/green] key val          : Store a string value\n"
@@ -501,6 +502,11 @@ class KedisClient:
                 "[bold cyan]Sorted Set Commands (Leaderboard)[/bold cyan]\n"
                 "  [green]ZADD[/green] key score val     : Add scored members\n"
                 "  [green]ZRANGE[/green] key start stop  : Get the sorted leaderboard\n\n"
+                "[bold cyan]Bitmap Commands (Bit Arrays)[/bold cyan]\n"
+                "  [green]SETBIT[/green] key offset bit : Set or clear a single bit\n"
+                "  [green]GETBIT[/green] key offset     : Read a single bit value\n"
+                "  [green]BITCOUNT[/green] key [s e]    : Count the number of set bits (1s)\n"
+                "  [green]BITOP[/green] op dest src...  : Bitwise AND, OR, XOR, or NOT\n\n"
                 "[bold purple]Client Commands (Dashboard)[/bold purple]\n"
                 "  [yellow]KEYS[/yellow]                 : Radar of all active keys\n"
                 "  [yellow]COMPACT[/yellow]              : Compress the AOF log file\n"
@@ -517,6 +523,9 @@ class KedisClient:
                 "  [yellow]CLEAR / CLS[/yellow]          : Clear the terminal screen\n"
                 "  [yellow]EXIT / QUIT[/yellow]          : Shut down the client\n"
             )
+
+            UI.print_panel(help_text, "Kedis Command Reference", "yellow")
+            return True
 
             UI.print_panel(help_text, "Kedis Command Reference", "yellow")
             return True
