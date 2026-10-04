@@ -605,10 +605,42 @@ class KedisStore:
                         base64.b64decode(tokens[2])
                     )
                     self._touch_write(tokens[1])
+                elif cmd == "SETBIT" and len(tokens) == 4:
+                    # _log_operation is a no-op while recovering, so replaying
+                    # through the public method cannot re-log the command.
+                    try:
+                        self.setbit(tokens[1], int(tokens[2]), int(tokens[3]))
+                    except (ValueError, TypeError):
+                        continue
+                elif cmd == "BITOP" and len(tokens) >= 4:
+                    try:
+                        self.bitop(tokens[1], tokens[2], *tokens[3:])
+                    except (ValueError, TypeError):
+                        continue
+                elif cmd == "SETB64" and len(tokens) == 3:
+                    # Internal AOF-only record: a string value that cannot be
+                    # written as a bare token (whitespace, control or non-ASCII
+                    # characters, empty). Bitmaps routinely contain such bytes.
+                    # "-" is the sentinel for the empty string (base64 of ""
+                    # is empty, which would vanish from a tokenized line).
+                    try:
+                        decoded = (
+                            ""
+                            if tokens[2] == "-"
+                            else base64.b64decode(tokens[2]).decode(
+                                "utf-8", "surrogatepass"
+                            )
+                        )
+                    except ValueError:
+                        continue
+                    self._data[tokens[1]] = decoded
+                    self._expires.pop(tokens[1], None)
+                    self._touch_write(tokens[1])
 
     def compact_aof(self):
         """Compacts the AOF size down to only active and living keys"""
-        temp_file = f"temp_{self.aof_filename}"
+        aof_dir, aof_base = os.path.split(self.aof_filename)
+        temp_file = os.path.join(aof_dir, f"temp_{aof_base}")
         try:
             with open(temp_file, "w") as f:
                 for key, value in self._data.items():
@@ -629,7 +661,25 @@ class KedisStore:
                         encoded = base64.b64encode(value.to_bytes()).decode("ascii")
                         f.write(f"PFLOAD {key} {encoded}\n")
                     else:
-                        f.write(f"SET {key} {value}\n")
+                        text = str(value)
+                        # Bare tokens only: ASCII, printable, no whitespace.
+                        # Anything else (bitmaps especially) is base64-encoded
+                        # so it survives the whitespace-tokenized AOF format.
+                        if (
+                            text
+                            and text.isascii()
+                            and text.isprintable()
+                            and " " not in text
+                        ):
+                            f.write(f"SET {key} {text}\n")
+                        else:
+                            encoded = (
+                                base64.b64encode(
+                                    text.encode("utf-8", "surrogatepass")
+                                ).decode("ascii")
+                                or "-"
+                            )
+                            f.write(f"SETB64 {key} {encoded}\n")
 
                 for key, exp_time in self._expires.items():
                     if exp_time > time.time():
