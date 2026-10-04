@@ -51,6 +51,9 @@ class CommandHandler:
             "GETBIT": self._handle_getbit,
             "BITCOUNT": self._handle_bitcount,
             "BITOP": self._handle_bitop,
+            "PFADD": self._handle_pfadd,
+            "PFCOUNT": self._handle_pfcount,
+            "PFMERGE": self._handle_pfmerge,
         }
 
     @property
@@ -74,6 +77,8 @@ class CommandHandler:
             "ZADD",
             "SETBIT",
             "BITOP",
+            "PFADD",
+            "PFMERGE",
         }
 
     def execute(self, tokens: list[str], client_socket=None):
@@ -166,7 +171,10 @@ class CommandHandler:
     def _handle_get(self, tokens: list[str]):
         if len(tokens) != 2:
             return "-ERR wrong number of arguments for 'GET' command"
-        return self.store.get(tokens[1])
+        try:
+            return self.store.get(tokens[1])
+        except TypeError as e:
+            return f"-ERR {str(e)}"
 
     def _handle_del(self, tokens: list[str]):
         if len(tokens) != 2:
@@ -411,6 +419,31 @@ class CommandHandler:
             return self.store.bitop(operation, destkey, *srckeys)
         except ValueError as e:
             return f"-ERR {str(e)}"
+        except TypeError as e:
+            return f"-ERR {str(e)}"
+
+    def _handle_pfadd(self, tokens: list[str]):
+        if len(tokens) < 2:
+            return "-ERR wrong number of arguments for 'pfadd' command"
+        try:
+            return self.store.pfadd(tokens[1], *tokens[2:])
+        except TypeError as e:
+            return f"-ERR {str(e)}"
+
+    def _handle_pfcount(self, tokens: list[str]):
+        if len(tokens) < 2:
+            return "-ERR wrong number of arguments for 'pfcount' command"
+        try:
+            return self.store.pfcount(*tokens[1:])
+        except TypeError as e:
+            return f"-ERR {str(e)}"
+
+    def _handle_pfmerge(self, tokens: list[str]):
+        if len(tokens) < 2:
+            return "-ERR wrong number of arguments for 'pfmerge' command"
+        try:
+            self.store.pfmerge(tokens[1], *tokens[2:])
+            return "OK"
         except TypeError as e:
             return f"-ERR {str(e)}"
 

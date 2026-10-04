@@ -1,3 +1,4 @@
+import base64
 import itertools
 import json
 import os
@@ -6,6 +7,7 @@ import time
 from collections import OrderedDict, deque
 from typing import Any, Optional
 
+from .hyperloglog import HyperLogLog
 from .skiplist import SkipList
 
 
@@ -82,6 +84,11 @@ class KedisStore:
                 serializable_data[k] = {"__type__": "set", "data": list(v)}
             elif v_type == "deque":
                 serializable_data[k] = {"__type__": "deque", "data": list(v)}
+            elif isinstance(v, HyperLogLog):
+                serializable_data[k] = {
+                    "__type__": "hll",
+                    "data": base64.b64encode(v.to_bytes()).decode("ascii"),
+                }
             else:
                 serializable_data[k] = v
 
@@ -106,6 +113,8 @@ class KedisStore:
                     self._data[k] = set(v["data"])
                 elif v["__type__"] == "deque":
                     self._data[k] = deque(v["data"])
+                elif v["__type__"] == "hll":
+                    self._data[k] = HyperLogLog.from_bytes(base64.b64decode(v["data"]))
             else:
                 self._data[k] = v
 
@@ -370,7 +379,10 @@ class KedisStore:
             return None
 
         self._touch_read(key)
-        return self._data.get(key)
+        val = self._data.get(key)
+        if isinstance(val, HyperLogLog):
+            raise TypeError(self._WRONGTYPE)
+        return val
 
     def delete(self, key: str) -> int:
         self._evict_if_expired(key)
@@ -411,6 +423,8 @@ class KedisStore:
                 k_type, k_len = "hash", str(len(val))
             elif isinstance(val, SkipList):
                 k_type, k_len = "zset", str(len(val))
+            elif isinstance(val, HyperLogLog):
+                k_type, k_len = "string", str(len(val.registers))
             else:
                 k_type, k_len = "string", str(len(str(val)))
 
@@ -562,6 +576,35 @@ class KedisStore:
                         self._data[key] = SkipList()
                     self._data[key].insert(float(tokens[2]), " ".join(tokens[3:]))
                     self._touch_write(key)
+                elif cmd == "PFADD" and len(tokens) >= 2:
+                    key = tokens[1]
+                    hll = self._data.get(key)
+                    if hll is None:
+                        hll = HyperLogLog()
+                        self._data[key] = hll
+                    elif not isinstance(hll, HyperLogLog):
+                        continue
+                    for element in tokens[2:]:
+                        hll.add(element)
+                    self._touch_write(key)
+                elif cmd == "PFMERGE" and len(tokens) >= 2:
+                    dest = tokens[1]
+                    hll = self._data.get(dest)
+                    if hll is None:
+                        hll = HyperLogLog()
+                        self._data[dest] = hll
+                    elif not isinstance(hll, HyperLogLog):
+                        continue
+                    for src in tokens[2:]:
+                        other = self._data.get(src)
+                        if isinstance(other, HyperLogLog):
+                            hll.merge(other)
+                    self._touch_write(dest)
+                elif cmd == "PFLOAD" and len(tokens) == 3:
+                    self._data[tokens[1]] = HyperLogLog.from_bytes(
+                        base64.b64decode(tokens[2])
+                    )
+                    self._touch_write(tokens[1])
 
     def compact_aof(self):
         """Compacts the AOF size down to only active and living keys"""
@@ -582,6 +625,9 @@ class KedisStore:
                             mem = flat_list[i]
                             scr = flat_list[i + 1]
                             f.write(f"ZADD {key} {scr} {mem}\n")
+                    elif isinstance(value, HyperLogLog):
+                        encoded = base64.b64encode(value.to_bytes()).decode("ascii")
+                        f.write(f"PFLOAD {key} {encoded}\n")
                     else:
                         f.write(f"SET {key} {value}\n")
 
@@ -964,6 +1010,79 @@ class KedisStore:
         self._touch_write(destkey)
         return len(result)
 
+    # ------------------------------------------------------------------
+    # HYPERLOGLOG OPERATIONS
+    # Stored as a HyperLogLog object directly in _data. Snapshots use a
+    # base64 envelope; AOF compaction uses an internal PFLOAD record.
+    # ------------------------------------------------------------------
+
+    _WRONGTYPE = "WRONGTYPE Operation against a key holding the wrong kind of value"
+
+    def pfadd(self, key: str, *elements: str) -> int:
+        self._evict_if_expired(key)
+        hll = self._data.get(key)
+        if hll is not None and not isinstance(hll, HyperLogLog):
+            raise TypeError(self._WRONGTYPE)
+
+        created = hll is None
+        if created:
+            hll = HyperLogLog()
+            self._data[key] = hll
+
+        changed = created
+        for element in elements:
+            if hll.add(element):
+                changed = True
+
+        if changed:
+            self._log_operation("PFADD", key, *elements)
+            self._touch_write(key)
+            return 1
+        self._touch_read(key)
+        return 0
+
+    def pfcount(self, *keys: str) -> int:
+        hlls = []
+        for k in keys:
+            self._evict_if_expired(k)
+            self._touch_read(k)
+            val = self._data.get(k)
+            if val is None:
+                continue
+            if not isinstance(val, HyperLogLog):
+                raise TypeError(self._WRONGTYPE)
+            hlls.append(val)
+
+        if not hlls:
+            return 0
+        if len(hlls) == 1:
+            return hlls[0].count()  # uses the cached cardinality
+
+        union = hlls[0].copy()  # never mutate the stored keys
+        for other in hlls[1:]:
+            union.merge(other)
+        return union.count()
+
+    def pfmerge(self, destkey: str, *srckeys: str) -> None:
+        for k in (destkey, *srckeys):
+            self._evict_if_expired(k)
+            val = self._data.get(k)
+            if val is not None and not isinstance(val, HyperLogLog):
+                raise TypeError(self._WRONGTYPE)  # validate BEFORE mutating
+
+        dest = self._data.get(destkey)
+        if dest is None:
+            dest = HyperLogLog()
+            self._data[destkey] = dest
+
+        for k in srckeys:
+            src = self._data.get(k)
+            if src is not None:
+                dest.merge(src)
+
+        self._log_operation("PFMERGE", destkey, *srckeys)
+        self._touch_write(destkey)
+
     def type_of(self, key: str) -> str:
         self._evict_if_expired(key)
         self._touch_read(key)
@@ -990,6 +1109,7 @@ class KedisStore:
             "set_members": 0,
             "hash_fields": 0,
             "zset_nodes": 0,
+            "hll_keys": 0,
         }
         for val in self._data.values():
             if isinstance(val, deque):
@@ -1000,6 +1120,8 @@ class KedisStore:
                 stats["hash_fields"] += len(val)
             elif type(val).__name__ == "SkipList":
                 stats["zset_nodes"] += len(val)
+            elif isinstance(val, HyperLogLog):
+                stats["hll_keys"] += 1
             else:
                 stats["string_chars"] += len(str(val))
 

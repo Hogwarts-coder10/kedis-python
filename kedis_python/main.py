@@ -94,6 +94,9 @@ class KedisClient:
                 "GETBIT",
                 "BITCOUNT",
                 "BITOP",
+                "PFADD",
+                "PFCOUNT",
+                "PFMERGE",
             ]
 
         cli_commands = [
@@ -424,7 +427,7 @@ class KedisClient:
                     else "0.0 KB"
                 )
 
-                str_c = list_c = set_c = hash_c = zset_c = bit_c =  0
+                str_c = list_c = set_c = hash_c = zset_c = bit_c = hll_c = 0
                 if self.store:
                     for val in self.store._data.values():
                         val_type = type(val).__name__
@@ -437,10 +440,12 @@ class KedisClient:
                             hash_c += 1
                         elif val_type == "SkipList":
                             zset_c += 1
+                        elif val_type == "HyperLogLog":
+                            hll_c += 1
                         else:
                             str_c += 1
 
-                type_breakdown = f"[dim]Str: {str_c} | Lst: {list_c} | Set: {set_c} | Hsh: {hash_c} | ZSet: {zset_c} | Bit: {bit_c}[/dim]"
+                type_breakdown = f"[dim]Str: {str_c} | Lst: {list_c} | Set: {set_c} | Hsh: {hash_c} | ZSet: {zset_c} | Bit: {bit_c} | HLL: {hll_c}[/dim]"
 
                 # Dynamically pull the active I/O drivetrain (Safely scoped to Local Mode)
                 sync_policy = (
@@ -507,6 +512,10 @@ class KedisClient:
                 "  [green]GETBIT[/green] key offset     : Read a single bit value\n"
                 "  [green]BITCOUNT[/green] key [s e]    : Count the number of set bits (1s)\n"
                 "  [green]BITOP[/green] op dest src...  : Bitwise AND, OR, XOR, or NOT\n\n"
+                "[bold cyan]HyperLogLog Commands (Cardinality)[/bold cyan]\n"
+                "  [green]PFADD[/green] key elem...     : Add elements (1 if the estimate changed)\n"
+                "  [green]PFCOUNT[/green] key...        : Approx. unique count (union if many keys)\n"
+                "  [green]PFMERGE[/green] dest src...   : Merge HyperLogLogs into dest\n\n"
                 "[bold purple]Client Commands (Dashboard)[/bold purple]\n"
                 "  [yellow]KEYS[/yellow]                 : Radar of all active keys\n"
                 "  [yellow]COMPACT[/yellow]              : Compress the AOF log file\n"
