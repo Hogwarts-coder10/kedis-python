@@ -120,37 +120,41 @@ class KedisClient:
         ]
         self.VALID_COMMANDS = engine_commands + cli_commands
 
-        try:
-            self.network.connect()
-            console.print("[green]✓ Network Link Established[/green]")
-            console.print(
-                f"[bold blue]Ready (TCP Network Mode) - Connected to {self.network.host}:{self.network.port}[/bold blue]\n"
-            )
-        except ConnectionRefusedError:
-            UI.print_panel(
-                "[bold yellow]⚠️ Network database unavailable.[/bold yellow]\n\n"
-                "[white]Switching to standalone mode will create or use\n"
-                "a local database instance.\n\n"
-                "Data may differ from the server.[/white]",
-                "Connection Failed",
-                "yellow",
-            )
-            choice = (
-                console.input("[bold yellow]Continue? [Y/n]: [/bold yellow]")
-                .strip()
-                .lower()
-            )
-
-            if choice == "n":
+        while True:
+            try:
+                self.network.connect()
+                console.print("[green]✓ Network Link Established[/green]")
                 console.print(
-                    "\n[bold red]Aborting. Shutting down Kedis CLI...[/bold red]"
+                    f"[bold blue]Ready (TCP Network Mode) - Connected to {self.network.host}:{self.network.port}[/bold blue]\n"
                 )
-                sys.exit(0)
-
-            self._init_local_engine()
+                break
+            except OSError:  # includes ConnectionRefusedError and timeouts
+                choice = self._connection_failed_menu()
+                if choice == "R":
+                    console.print("[dim]Retrying connection...[/dim]")
+                    continue
+                if choice == "Q":
+                    console.print(
+                        "\n[bold red]Aborting. Shutting down Kedis CLI...[/bold red]"
+                    )
+                    sys.exit(0)
+                self._init_local_engine()  # "L": standalone mode
+                break
 
         console.print("[dim]Type 'exit', 'quit', or press Ctrl+C to shut down.[/dim]\n")
         self.run_loop()
+
+    def _connection_failed_menu(self) -> str:
+        """Shows the Connection Failed screen and returns 'R', 'L' or 'Q'."""
+        UI.print_connection_failed()
+        while True:
+            try:
+                choice = console.input("  [bold]>[/bold] ").strip().upper()
+            except (EOFError, KeyboardInterrupt):
+                return "Q"
+            if choice in ("R", "L", "Q"):
+                return choice
+            console.print("  [dim]Please enter R, L or Q.[/dim]")
 
     def _init_local_engine(self):
         self.local_mode = True

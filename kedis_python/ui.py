@@ -1,23 +1,99 @@
-from pyfiglet import Figlet
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
 console = Console()
 
+BOX_WIDTH = 49
+
+KEDIS_LOGO = [
+    "██╗  ██╗███████╗██████╗ ██╗███████╗",
+    "██║ ██╔╝██╔════╝██╔══██╗██║██╔════╝",
+    "█████╔╝ █████╗  ██║  ██║██║███████╗",
+    "██╔═██╗ ██╔══╝  ██║  ██║██║╚════██║",
+    "██║  ██╗███████╗██████╔╝██║███████║",
+    "╚═╝  ╚═╝╚══════╝╚═════╝ ╚═╝╚══════╝",
+]
+
 
 class UI:
     @staticmethod
-    def print_banner(version="0.3.0", codename="Echo"):
-        fig = Figlet(font="big")
-        logo = fig.renderText("KEDIS")
+    def print_open_box(title, lines, color="cyan", width=BOX_WIDTH):
+        """Prints a box with a titled top edge and a bottom edge but no side
+        borders. `lines` are rich-markup strings printed between the edges."""
+        inner = width - 2
+        label = f" {title} "
+        left = (inner - len(label)) // 2
+        right = inner - len(label) - left
         console.print(
-            Panel.fit(
-                f"[bold cyan]{logo}[/bold cyan]\n[yellow]Codename: {codename}[/yellow]\n[green]Version: {version}[/green]",
-                title="Database Client",
-                border_style="cyan",
-            )
+            f"[{color}]╭{'─' * left}{label}{'─' * right}╮[/{color}]", highlight=False
         )
+        for line in lines:
+            console.print(line, highlight=False)
+        console.print(f"[{color}]╰{'─' * inner}╯[/{color}]", highlight=False)
+
+    @staticmethod
+    def print_banner(version="0.3.0", codename="Echo", subtitle="DATABASE CLIENT"):
+        # Center the subtitle inside the box (17 spaces for a 15-char subtitle).
+        pad = " " * ((BOX_WIDTH - 2 - len(subtitle)) // 2 + 1)
+        lines = [""]
+        lines += [f"  [bold cyan]{row}[/bold cyan]" for row in KEDIS_LOGO]
+        lines += [
+            "",
+            f"{pad}[bold white]{subtitle}[/bold white]",
+            "",
+            f"  [yellow]Codename: {codename}[/yellow]",
+            f"  [green]Version: {version}[/green]",
+            "",
+        ]
+        UI.print_open_box("KEDIS", lines, color="cyan")
+
+    @staticmethod
+    def print_server_ready(host, port, role="master"):
+        """The 'server is up' box shown right after the server banner."""
+        console.print()
+        UI.print_open_box(
+            "SERVER ONLINE",
+            [
+                "",
+                "  [bold green]●  Kedis Engine Core Online[/bold green]",
+                "",
+                f"  [cyan]Listening[/cyan] : [white]{host}:{port}[/white]",
+                f"  [cyan]Role[/cyan]      : [white]{role}[/white]",
+                "  [cyan]Network[/cyan]   : [white]asyncio event loop[/white]",
+                "  [cyan]I/O[/cyan]       : [white]non-blocking[/white]",
+                "",
+                "  [dim]Press Ctrl+C for a clean shutdown.[/dim]",
+                "",
+            ],
+            color="green",
+        )
+
+    @staticmethod
+    def print_connection_failed():
+        """Connection Failed box followed by the Retry / Standalone / Exit menu."""
+        console.print()
+        console.print()
+        UI.print_open_box(
+            "CONNECTION FAILED",
+            [
+                "",
+                "  [bold yellow]⚠  Network database unavailable.[/bold yellow]",
+                "",
+                "  [white]The remote database could not be reached.[/white]",
+                "  [white]Standalone mode can be used instead.[/white]",
+                "",
+            ],
+            color="yellow",
+        )
+        console.print()
+        console.print("  [bold cyan]\\[R][/bold cyan] Retry connection", highlight=False)
+        console.print(
+            "  [bold green]\\[L][/bold green] Continue in standalone mode",
+            highlight=False,
+        )
+        console.print("  [bold red]\\[Q][/bold red] Exit", highlight=False)
+        console.print()
 
     @staticmethod
     def print_panel(text, title, color):
