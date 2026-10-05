@@ -463,6 +463,7 @@ class CommandHandler:
             f"Set Members:{stats.get('set_members', 0)}\n"
             f"Hash Fields:{stats.get('hash_fields', 0)}\n"
             f"ZSet Nodes:{stats.get('zset_nodes', 0)}\n"
+            f"HLL Keys:{stats.get('hll_keys', 0)}\n"
             "---\n"
             f"LRU Hits:{lru.get('hits', 0)}\n"
             f"LRU Misses:{lru.get('misses', 0)}\n"
