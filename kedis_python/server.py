@@ -5,11 +5,11 @@ import sys
 import time
 
 from rich.console import Console
-from rich.panel import Panel
 
 from .commands import CommandHandler
 from .parser import CommandParser, KESPEncoder
 from .store import KedisStore
+from .ui import UI
 
 console = Console()
 
@@ -443,8 +443,8 @@ class AsyncKedisSession:
                     # 🚀 FIX: Slicing for standard commands
                     del intake_buffer[:consumed]
 
-            except ConnectionResetError:
-                break
+            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+                break  # client vanished; fall through to cleanup
             except Exception as e:
                 console.print(
                     f"[bold red]❌ [REPLICATION Live] Stream Crash: {repr(e)}[/bold red]"
@@ -453,8 +453,14 @@ class AsyncKedisSession:
                 break
 
         console.print(f"[yellow]⚠️ Client Disconnected:[/yellow] {client_id}")
-        self.writer.close()
-        await self.writer.wait_closed()
+        try:
+            self.writer.close()
+            await self.writer.wait_closed()
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+            # The peer reset the connection (e.g. killed client, closed with
+            # unread data). wait_closed() re-raises that stored error, but
+            # there is nothing left to clean up, so it is not an error here.
+            pass
 
 
 async def handle_connection(reader, writer):
@@ -466,17 +472,8 @@ async def handle_connection(reader, writer):
 
 
 async def main():
-    console.print(
-        Panel(
-            f"[bold blue]Kedis Engine Core Online[/bold blue]\n"
-            f"Listening on TCP {HOST}:{PORT}\n\n"
-            f"Network Architecture: [green]asyncio Event Loop[/green]\n"
-            f"Concurrency: [green]Non-blocking I/O[/green]",
-            title="🚀 ASYNC IGNITION",
-            border_style="blue",
-            expand=False,
-        )
-    )
+    UI.print_banner(subtitle="DATABASE SERVER")
+    UI.print_server_ready(HOST, PORT, server_role)
 
     server = await asyncio.start_server(handle_connection, HOST, PORT)
     asyncio.create_task(loop_latency_monitor(global_store))
