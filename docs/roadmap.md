@@ -44,8 +44,8 @@ Make Kedis easier to integrate with modern web applications.
 
 Expand the engine beyond simple key-value storage.
 
-- [ ] Bitmaps
-- [ ] HyperLogLog
+- [x] Bitmaps
+- [x] HyperLogLog
 - [ ] Stream data type
 - [ ] Consumer Groups
 - [ ] Background memory defragmentation
