@@ -97,6 +97,13 @@ class KedisClient:
                 "PFADD",
                 "PFCOUNT",
                 "PFMERGE",
+                "XADD",
+                "XLEN",
+                "XRANGE",
+                "XREVRANGE",
+                "XREAD",
+                "XDEL",
+                "XTRIM",
             ]
 
         cli_commands = [
@@ -175,7 +182,7 @@ class KedisClient:
         ).strip()
         sync_mode = "always" if choice == "1" else "everysec"
 
-        self.store = KedisStore(appendfsync=sync_mode, lru_maxsize=128)
+        self.store = KedisStore(appendfsync=sync_mode, lru_maxsize=1024)
         self.handler = CommandHandler(self.store)
 
         # 🚀 DYNAMIC AUTOCOMPLETE GENERATOR (LOCAL MODE)
@@ -416,7 +423,7 @@ class KedisClient:
             return True
 
         if cmd == "INFO":
-            version = "0.3.0"
+            version = "0.1.4"
             codename = "Echo"
 
             if self.local_mode:
@@ -431,7 +438,7 @@ class KedisClient:
                     else "0.0 KB"
                 )
 
-                str_c = list_c = set_c = hash_c = zset_c = bit_c = hll_c = 0
+                str_c = list_c = set_c = hash_c = zset_c = bit_c = hll_c = stream_c = 0
                 if self.store:
                     for val in self.store._data.values():
                         val_type = type(val).__name__
@@ -446,10 +453,12 @@ class KedisClient:
                             zset_c += 1
                         elif val_type == "HyperLogLog":
                             hll_c += 1
+                        elif val_type == "Stream":
+                            stream_c += 1
                         else:
                             str_c += 1
 
-                type_breakdown = f"[dim]Str: {str_c} | Lst: {list_c} | Set: {set_c} | Hsh: {hash_c} | ZSet: {zset_c} | Bit: {bit_c} | HLL: {hll_c}[/dim]"
+                type_breakdown = f"[dim]Str: {str_c} | Lst: {list_c} | Set: {set_c} | Hsh: {hash_c} | ZSet: {zset_c} | Bit: {bit_c} | HLL: {hll_c} | Stream: {stream_c}[/dim]"
 
                 # Dynamically pull the active I/O drivetrain (Safely scoped to Local Mode)
                 sync_policy = (
@@ -520,6 +529,14 @@ class KedisClient:
                 "  [green]PFADD[/green] key elem...     : Add elements (1 if the estimate changed)\n"
                 "  [green]PFCOUNT[/green] key...        : Approx. unique count (union if many keys)\n"
                 "  [green]PFMERGE[/green] dest src...   : Merge HyperLogLogs into dest\n\n"
+                "[bold cyan]Stream Commands (Append-only Logs)[/bold cyan]\n"
+                "  [green]XADD[/green] key [MAXLEN n] id|* f v... : Append an entry\n"
+                "  [green]XLEN[/green] key               : Number of entries\n"
+                "  [green]XRANGE[/green] key start end [COUNT n]  : Entries between IDs (- and + = ends)\n"
+                "  [green]XREVRANGE[/green] key end start [COUNT n] : Same, newest first\n"
+                "  [green]XREAD[/green] [COUNT n] [BLOCK ms] STREAMS key... id...  : Read new entries ($ = only new)\n"
+                "  [green]XDEL[/green] key id...         : Delete entries\n"
+                "  [green]XTRIM[/green] key MAXLEN|MINID n : Trim old entries\n\n"
                 "[bold purple]Client Commands (Dashboard)[/bold purple]\n"
                 "  [yellow]KEYS[/yellow]                 : Radar of all active keys\n"
                 "  [yellow]COMPACT[/yellow]              : Compress the AOF log file\n"

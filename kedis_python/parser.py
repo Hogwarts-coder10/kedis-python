@@ -131,6 +131,19 @@ class CommandParser:
         return tokens, bytes_consumed
 
 
+class BulkString(str):
+    """A string that is ALWAYS encoded as a binary-safe bulk string.
+
+    Plain str values that look like a status ("OK", "+QUEUED") or an error
+    ("ERROR ...", "-ERR ...") are encoded as protocol statuses/errors. That is
+    right for command replies but wrong for user data: a stream entry whose
+    value is "ERROR disk full" must reach the client as data. Wrap data in
+    BulkString to opt out of that detection.
+    """
+
+    __slots__ = ()
+
+
 class KESPEncoder:
     @staticmethod
     def encode(data) -> bytes:
@@ -147,6 +160,10 @@ class KESPEncoder:
 
         # 3. Strings & Status Messages
         elif isinstance(data, str):
+            if isinstance(data, BulkString):
+                encoded_str = data.encode("utf-8")
+                return f"S{len(encoded_str)}\n".encode("utf-8") + encoded_str + b"\n"
+
             # Check for simple protocol statuses
             if data in ["OK", "+OK", "+QUEUED"]:
                 val = data if data.startswith("+") else f"+{data}"

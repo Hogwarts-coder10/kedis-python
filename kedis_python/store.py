@@ -2,6 +2,7 @@ import base64
 import itertools
 import json
 import os
+import sys
 import threading
 import time
 from collections import OrderedDict, deque
@@ -9,13 +10,26 @@ from typing import Any, Optional
 
 from .hyperloglog import HyperLogLog
 from .skiplist import SkipList
+from .stream import Stream, StreamError, format_id, parse_bound, parse_id
+
+
+def _is_bare_token(text: str) -> bool:
+    """True if `text` survives the whitespace-tokenized AOF unchanged:
+    non-empty, ASCII, printable, no spaces."""
+    return bool(text) and text.isascii() and text.isprintable() and " " not in text
+
+
+# Housekeeping thresholds: only rebuild a container that is both big enough to
+# matter and at least a quarter wasted.
+_HK_MIN_BYTES = 4096
+_HK_MIN_GAIN = 2048
 
 
 class KedisStore:
     def __init__(
         self,
         aof_filename="kedis.aof",
-        lru_maxsize: int = 128,
+        lru_maxsize: int = 1024,
         appendfsync: str = "everysec",
     ):
         self.debug_mode = False
@@ -35,6 +49,18 @@ class KedisStore:
         self._lru_maxsize = lru_maxsize
         self._lru_hits = 0
         self._lru_misses = 0
+
+        # Housekeeping telemetry (see housekeeping())
+        self._hk_totals = {
+            "runs": 0,
+            "expired": 0,
+            "expire_orphans": 0,
+            "lru_orphans": 0,
+            "lru_adopted": 0,
+            "reclaimed_bytes": 0,
+        }
+        self._hk_last_run = 0.0
+        self._hk_last_ms = 0.0
 
         # 🚀 Issue 9 FIX: Cold Boot SnapShot recovery
         # Pulls the heavy data into RAM before the network even turns on
@@ -84,6 +110,8 @@ class KedisStore:
                 serializable_data[k] = {"__type__": "set", "data": list(v)}
             elif v_type == "deque":
                 serializable_data[k] = {"__type__": "deque", "data": list(v)}
+            elif isinstance(v, Stream):
+                serializable_data[k] = {"__type__": "stream", "data": v.to_state()}
             elif isinstance(v, HyperLogLog):
                 serializable_data[k] = {
                     "__type__": "hll",
@@ -113,6 +141,8 @@ class KedisStore:
                     self._data[k] = set(v["data"])
                 elif v["__type__"] == "deque":
                     self._data[k] = deque(v["data"])
+                elif v["__type__"] == "stream":
+                    self._data[k] = Stream.from_state(v["data"])
                 elif v["__type__"] == "hll":
                     self._data[k] = HyperLogLog.from_bytes(base64.b64decode(v["data"]))
             else:
@@ -244,8 +274,9 @@ class KedisStore:
                 return True
         return False
 
-    def _evict_all_expired(self) -> None:
-        """The Active Sweeper: Scans the entire engine for expired keys."""
+    def _evict_all_expired(self) -> int:
+        """The Active Sweeper: Scans the entire engine for expired keys.
+        Returns how many keys it removed."""
         current_time = time.time()
         keys_to_delete = []
 
@@ -260,6 +291,7 @@ class KedisStore:
                 del self._expires[key]
             self._lru_invalidate(key)
             self._log_operation("DEL", key)
+        return len(keys_to_delete)
 
     # ------------------------------------------------------------------
     # LRU ENGINE INTERNALS (Upgraded to True Global Eviction)
@@ -312,6 +344,88 @@ class KedisStore:
             "hit_rate_pct": round(hit_rate, 2),
             "tracked_keys": len(self._lru_tracker),
             "max_size": self._lru_maxsize,
+        }
+
+    # ------------------------------------------------------------------
+    # PERIODIC HOUSEKEEPING
+    # CPython cannot move live objects, so there is no Redis-style active
+    # defrag. What a pure-Python store can do is keep its bookkeeping honest:
+    # expire keys nobody touches, keep the LRU tracker and the expiry map in
+    # step with the data, and rebuild containers that never shrink on delete.
+    # The caller must hold the engine lock (CommandHandler.run_housekeeping
+    # and the HOUSEKEEP command both do).
+    # ------------------------------------------------------------------
+
+    def _compact_container(self, name: str) -> int:
+        """Rebuilds a dict-like attribute if deletions left it mostly empty.
+        Returns the bytes reclaimed (0 when it was already compact)."""
+        old = getattr(self, name)
+        old_size = sys.getsizeof(old)
+        if old_size < _HK_MIN_BYTES:
+            return 0
+        fresh = type(old)(old)  # a copy is built compactly, order preserved
+        gain = old_size - sys.getsizeof(fresh)
+        if gain >= _HK_MIN_GAIN and gain >= old_size // 4:
+            setattr(self, name, fresh)
+            return gain
+        return 0
+
+    def housekeeping(self) -> dict:
+        """One maintenance pass. Safe to run at any time under the engine lock."""
+        started = time.perf_counter()
+
+        # 1. Active expiry: free keys that expired but were never touched again.
+        expired = self._evict_all_expired()
+
+        # 2. Expiry entries whose key is gone (a stale one would make
+        #    _evict_if_expired fail on its `del self._data[key]`).
+        stale_exp = [k for k in self._expires if k not in self._data]
+        for k in stale_exp:
+            del self._expires[k]
+
+        # 3. LRU tracker <-> data. A ghost tracker entry holds a slot that a
+        #    live key needs, so the engine evicts live data too early.
+        ghosts = [k for k in self._lru_tracker if k not in self._data]
+        for k in ghosts:
+            del self._lru_tracker[k]
+        # Data the tracker lost sight of would escape the eviction bound.
+        # Adopt it at the cold end, so it is the first to go under pressure.
+        untracked = [k for k in self._data if k not in self._lru_tracker]
+        for k in untracked:
+            self._lru_tracker[k] = None
+            self._lru_tracker.move_to_end(k, last=False)
+
+        # 4. Containers that never shrink after mass deletes.
+        reclaimed = sum(
+            self._compact_container(n) for n in ("_data", "_expires", "_lru_tracker")
+        )
+
+        duration_ms = round((time.perf_counter() - started) * 1000, 3)
+        self._hk_last_run = time.time()
+        self._hk_last_ms = duration_ms
+        t = self._hk_totals
+        t["runs"] += 1
+        t["expired"] += expired
+        t["expire_orphans"] += len(stale_exp)
+        t["lru_orphans"] += len(ghosts)
+        t["lru_adopted"] += len(untracked)
+        t["reclaimed_bytes"] += reclaimed
+
+        return {
+            "expired": expired,
+            "expire_orphans": len(stale_exp),
+            "lru_orphans": len(ghosts),
+            "lru_adopted": len(untracked),
+            "reclaimed_bytes": reclaimed,
+            "duration_ms": duration_ms,
+            "keys": len(self._data),
+        }
+
+    def housekeeping_stats(self) -> dict:
+        return {
+            **self._hk_totals,
+            "last_run": self._hk_last_run,
+            "last_duration_ms": self._hk_last_ms,
         }
 
     def _log_slow_command(self, tokens: list, duration_us: int):
@@ -380,7 +494,7 @@ class KedisStore:
 
         self._touch_read(key)
         val = self._data.get(key)
-        if isinstance(val, HyperLogLog):
+        if isinstance(val, (HyperLogLog, Stream)):
             raise TypeError(self._WRONGTYPE)
         return val
 
@@ -423,6 +537,8 @@ class KedisStore:
                 k_type, k_len = "hash", str(len(val))
             elif isinstance(val, SkipList):
                 k_type, k_len = "zset", str(len(val))
+            elif isinstance(val, Stream):
+                k_type, k_len = "stream", str(len(val))
             elif isinstance(val, HyperLogLog):
                 k_type, k_len = "string", str(len(val.registers))
             else:
@@ -636,6 +752,63 @@ class KedisStore:
                     self._data[tokens[1]] = decoded
                     self._expires.pop(tokens[1], None)
                     self._touch_write(tokens[1])
+                elif cmd in ("XADD", "XADDB64") and len(tokens) >= 4:
+                    # Records always carry the resolved ID, never '*'.
+                    key, id_text = tokens[1], tokens[2]
+                    try:
+                        if cmd == "XADD":
+                            fields = tokens[3:]
+                        else:
+                            fields = json.loads(
+                                base64.b64decode(tokens[3]).decode("ascii")
+                            )
+                        stream = self._data.get(key)
+                        if stream is None:
+                            stream = Stream()
+                        elif not isinstance(stream, Stream):
+                            continue
+                        stream.add(fields, id_text)
+                    except (ValueError, StreamError):
+                        continue
+                    self._data[key] = stream
+                    self._touch_write(key)
+                elif cmd == "XDEL" and len(tokens) >= 3:
+                    stream = self._data.get(tokens[1])
+                    if isinstance(stream, Stream):
+                        try:
+                            stream.delete(*[parse_id(t) for t in tokens[2:]])
+                        except StreamError:
+                            continue
+                        self._touch_write(tokens[1])
+                elif cmd == "XTRIM" and len(tokens) == 4:
+                    stream = self._data.get(tokens[1])
+                    if isinstance(stream, Stream):
+                        try:
+                            if tokens[2].upper() == "MAXLEN":
+                                stream.trim(maxlen=int(tokens[3]))
+                            elif tokens[2].upper() == "MINID":
+                                stream.trim(minid=parse_id(tokens[3]))
+                            else:
+                                continue
+                        except (ValueError, StreamError):
+                            continue
+                        self._touch_write(tokens[1])
+                elif cmd == "XSTATE" and len(tokens) == 4:
+                    # Internal AOF-only record written by compaction: restores
+                    # the top ID and lifetime counter (also for empty streams).
+                    try:
+                        last_id = parse_id(tokens[2])
+                        added = int(tokens[3])
+                    except (ValueError, StreamError):
+                        continue
+                    stream = self._data.get(tokens[1])
+                    if stream is None:
+                        stream = Stream()
+                        self._data[tokens[1]] = stream
+                    if isinstance(stream, Stream):
+                        stream.last_id = last_id
+                        stream.entries_added = added
+                        self._touch_write(tokens[1])
 
     def compact_aof(self):
         """Compacts the AOF size down to only active and living keys"""
@@ -657,6 +830,15 @@ class KedisStore:
                             mem = flat_list[i]
                             scr = flat_list[i + 1]
                             f.write(f"ZADD {key} {scr} {mem}\n")
+                    elif isinstance(value, Stream):
+                        for sid_text, fields in value.range():
+                            f.write(
+                                " ".join(self._stream_entry_tokens(key, sid_text, fields))
+                                + "\n"
+                            )
+                        f.write(
+                            f"XSTATE {key} {format_id(value.last_id)} {value.entries_added}\n"
+                        )
                     elif isinstance(value, HyperLogLog):
                         encoded = base64.b64encode(value.to_bytes()).decode("ascii")
                         f.write(f"PFLOAD {key} {encoded}\n")
@@ -1057,7 +1239,12 @@ class KedisStore:
             self._lru_invalidate(destkey)
 
         self._log_operation("BITOP", operation, destkey, *srckeys)
-        self._touch_write(destkey)
+        if destkey in self._data:
+            self._touch_write(destkey)
+        else:
+            # Empty result removed the key. Do not re-add it to the LRU tracker
+            # (that would leave a ghost slot), but WATCH must still see a change.
+            self._bump_version(destkey)
         return len(result)
 
     # ------------------------------------------------------------------
@@ -1133,6 +1320,143 @@ class KedisStore:
         self._log_operation("PFMERGE", destkey, *srckeys)
         self._touch_write(destkey)
 
+    # ------------------------------------------------------------------
+    # STREAM OPERATIONS
+    # A Stream object lives directly in _data (see stream.py). Every record in
+    # the AOF carries a fully resolved ID, so replay rebuilds identical
+    # entries. Field text that cannot survive the whitespace-tokenized AOF is
+    # stored as XADDB64 (base64 of a JSON list). Compaction rewrites a stream
+    # as one XADD per entry plus an internal XSTATE record that restores the
+    # top ID and lifetime counter.
+    # ------------------------------------------------------------------
+
+    def _stream_or_none(self, key: str):
+        self._evict_if_expired(key)
+        val = self._data.get(key)
+        if val is not None and not isinstance(val, Stream):
+            raise TypeError(self._WRONGTYPE)
+        return val
+
+    @staticmethod
+    def _stream_entry_tokens(key: str, sid_text: str, fields: list) -> list:
+        if all(_is_bare_token(f) for f in fields):
+            return ["XADD", key, sid_text, *fields]
+        blob = base64.b64encode(json.dumps(list(fields)).encode("ascii")).decode(
+            "ascii"
+        )
+        return ["XADDB64", key, sid_text, blob]
+
+    def xadd(
+        self,
+        key: str,
+        fields: list,
+        id_spec: str = "*",
+        maxlen=None,
+        minid=None,
+        nomkstream: bool = False,
+    ):
+        """Appends an entry. Returns its ID, or None when NOMKSTREAM and the
+        key does not exist. Raises StreamError / TypeError without changing
+        anything."""
+        if maxlen is not None and maxlen < 0:
+            raise StreamError("ERR The MAXLEN argument must be >= 0.")
+        minid_t = parse_id(minid) if minid is not None else None
+
+        stream = self._stream_or_none(key)
+        created = stream is None
+        if created:
+            if nomkstream:
+                return None
+            stream = Stream()
+
+        sid = stream.add(fields, id_spec)  # validates before it mutates
+        if created:
+            self._data[key] = stream
+        removed = 0
+        if maxlen is not None or minid_t is not None:
+            removed = stream.trim(maxlen=maxlen, minid=minid_t)
+
+        self._log_operation(*self._stream_entry_tokens(key, sid, fields))
+        if removed:
+            self._log_operation("XTRIM", key, "MAXLEN", len(stream))
+        self._touch_write(key)
+        return sid
+
+    def xlen(self, key: str) -> int:
+        stream = self._stream_or_none(key)
+        self._touch_read(key)
+        return 0 if stream is None else len(stream)
+
+    def xrange(self, key: str, start: str = "-", end: str = "+", count=None) -> list:
+        lo, hi = parse_bound(start, True), parse_bound(end, False)
+        stream = self._stream_or_none(key)
+        self._touch_read(key)
+        return [] if stream is None else stream.range(lo, hi, count)
+
+    def xrevrange(self, key: str, end: str = "+", start: str = "-", count=None) -> list:
+        hi, lo = parse_bound(end, False), parse_bound(start, True)
+        stream = self._stream_or_none(key)
+        self._touch_read(key)
+        return [] if stream is None else stream.revrange(hi, lo, count)
+
+    def xread(self, streams: list, count=None) -> list:
+        """streams: [(key, id_text)]. '$' means "the stream's current last ID".
+        Returns [(key, entries)] for the streams that have new entries."""
+        plan = []
+        for key, id_text in streams:  # validate everything before reading
+            stream = self._stream_or_none(key)
+            if stream is None:
+                sid = None
+            elif id_text == "$":
+                sid = stream.last_id
+            else:
+                sid = parse_id(id_text)
+            plan.append((key, stream, sid))
+        out = []
+        for key, stream, sid in plan:
+            self._touch_read(key)
+            if stream is None:
+                continue
+            entries = stream.read_after(sid, count)
+            if entries:
+                out.append((key, entries))
+        return out
+
+    def xresolve_ids(self, streams: list) -> list:
+        """Pins every '$' to a concrete ID. A blocking XREAD must do this once,
+        up front, or it would miss entries added while it waits."""
+        resolved = []
+        for key, id_text in streams:
+            if id_text == "$":
+                stream = self._stream_or_none(key)
+                id_text = "0-0" if stream is None else format_id(stream.last_id)
+            resolved.append((key, id_text))
+        return resolved
+
+    def xdel(self, key: str, *id_texts: str) -> int:
+        ids = [parse_id(t) for t in id_texts]
+        stream = self._stream_or_none(key)
+        if stream is None:
+            return 0
+        removed = stream.delete(*ids)
+        if removed:
+            self._log_operation("XDEL", key, *[format_id(i) for i in ids])
+            self._touch_write(key)
+        return removed
+
+    def xtrim(self, key: str, maxlen=None, minid=None) -> int:
+        if (maxlen is None) == (minid is None):
+            raise StreamError("ERR syntax error, XTRIM needs MAXLEN or MINID")
+        minid_t = parse_id(minid) if minid is not None else None
+        stream = self._stream_or_none(key)
+        if stream is None:
+            return 0
+        removed = stream.trim(maxlen=maxlen, minid=minid_t)
+        if removed:
+            self._log_operation("XTRIM", key, "MAXLEN", len(stream))
+            self._touch_write(key)
+        return removed
+
     def type_of(self, key: str) -> str:
         self._evict_if_expired(key)
         self._touch_read(key)
@@ -1147,6 +1471,8 @@ class KedisStore:
             return "hash"
         elif isinstance(val, SkipList):
             return "zset"
+        elif isinstance(val, Stream):
+            return "stream"
         else:
             return "string"
 
@@ -1160,6 +1486,7 @@ class KedisStore:
             "hash_fields": 0,
             "zset_nodes": 0,
             "hll_keys": 0,
+            "stream_entries": 0,
         }
         for val in self._data.values():
             if isinstance(val, deque):
@@ -1172,8 +1499,11 @@ class KedisStore:
                 stats["zset_nodes"] += len(val)
             elif isinstance(val, HyperLogLog):
                 stats["hll_keys"] += 1
+            elif isinstance(val, Stream):
+                stats["stream_entries"] += len(val)
             else:
                 stats["string_chars"] += len(str(val))
 
         stats["lru_cache"] = self.lru_stats()
+        stats["housekeeping"] = self.housekeeping_stats()
         return stats

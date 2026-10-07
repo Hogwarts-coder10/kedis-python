@@ -9,6 +9,7 @@ from rich.console import Console
 from .commands import CommandHandler
 from .parser import CommandParser, KESPEncoder
 from .store import KedisStore
+from .stream import StreamError
 from .ui import UI
 
 console = Console()
@@ -52,6 +53,90 @@ async def loop_latency_monitor(store):
 
         # Floor to 0 (sometimes sleep wakes up a fraction early), round to 2 decimals
         store.current_lag_ms = max(0.0, round(lag, 2))
+
+
+HOUSEKEEPING_INTERVAL = 30.0  # seconds between maintenance passes
+
+# ----------------------------------------------------------------------
+# BLOCKING READS (XREAD ... BLOCK)
+# A blocked session parks on a future. Writers call notify_stream_waiters()
+# after a write completes; every parked reader wakes, re-reads, and goes back
+# to sleep if its streams still have nothing new. Futures belong to the running
+# loop, so there is no module-level loop-bound object to get wrong.
+# ----------------------------------------------------------------------
+stream_waiters: set = set()
+_BLOCK_POLL = 0.5  # how often a blocked session checks that its client is alive
+
+
+def notify_stream_waiters():
+    for fut in list(stream_waiters):
+        if not fut.done():
+            fut.set_result(None)
+    stream_waiters.clear()
+
+
+async def blocking_xread(session, tokens: list):
+    """Runs XREAD; honours BLOCK. Returns the reply object (None = nil)."""
+    try:
+        count, block_ms, streams = global_handler.parse_xread(tokens)
+    except StreamError:
+        block_ms = None
+    if block_ms is None:  # no BLOCK (or a syntax error the handler will report)
+        return await asyncio.to_thread(global_handler.execute, tokens, session.writer)
+
+    try:
+        # '$' must mean "last ID right now", fixed once, before we wait.
+        resolved = global_handler.resolve_stream_ids(streams)
+    except StreamError as e:
+        return f"-{e}"
+    except TypeError as e:
+        return f"-ERR {e}"
+
+    loop = asyncio.get_running_loop()
+    deadline = None if block_ms == 0 else loop.time() + block_ms / 1000
+
+    while True:
+        # Register BEFORE reading: a write landing between the read and the
+        # wait would otherwise be missed until the next unrelated write.
+        wake = loop.create_future()
+        stream_waiters.add(wake)
+        try:
+            try:
+                result = await asyncio.to_thread(
+                    global_handler.xread_nonblocking, resolved, count
+                )
+            except TypeError as e:
+                return f"-ERR {e}"
+            if result is not None:
+                return result
+            while True:
+                if session.reader.at_eof() or session.writer.is_closing():
+                    raise ConnectionResetError("client left while blocked")
+                remaining = None if deadline is None else deadline - loop.time()
+                if remaining is not None and remaining <= 0:
+                    return None  # timed out: nil, like Redis
+                step = _BLOCK_POLL if remaining is None else min(_BLOCK_POLL, remaining)
+                try:
+                    await asyncio.wait_for(asyncio.shield(wake), step)
+                    break  # woken by a writer: read again
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            stream_waiters.discard(wake)
+            if not wake.done():
+                wake.cancel()
+
+
+async def housekeeping_loop(handler, interval: float = HOUSEKEEPING_INTERVAL):
+    """Periodic store maintenance: expiry sweep, LRU/expiry reconciliation and
+    container compaction. Runs in a worker thread, under the engine lock, like
+    every other command, so it never overlaps a client write."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(handler.run_housekeeping)
+        except Exception as e:  # maintenance must never take the server down
+            console.print(f"[bold red]❌ Housekeeping pass failed: {repr(e)}[/bold red]")
 
 
 async def init_replication_stream(host: str, port: int):
@@ -148,6 +233,7 @@ async def init_replication_stream(host: str, port: int):
 
                     # Execute the mirrored write locally using your handler
                     await asyncio.to_thread(global_handler.execute, tokens, None)
+                    notify_stream_waiters()
                     console.print(
                         f"[magenta]🔄 [REPLICATION Live] Executed: {' '.join(tokens)}[/magenta]"
                     )
@@ -272,6 +358,7 @@ class AsyncKedisSession:
             results.append(result)
 
         self.tx_queue.clear()
+        notify_stream_waiters()
 
         # Format and send the array of results back to the client
         response = f"A{len(results)}\n".encode("utf-8")
@@ -407,11 +494,17 @@ class AsyncKedisSession:
                             del intake_buffer[:consumed]
                             continue
 
-                        response = await asyncio.to_thread(
-                            global_handler.execute, tokens, self.writer
-                        )
+                        if cmd == "XREAD":
+                            response = await blocking_xread(self, tokens)
+                        else:
+                            response = await asyncio.to_thread(
+                                global_handler.execute, tokens, self.writer
+                            )
                         kesp_bytes = KESPEncoder.encode(response)
                         await self.send(kesp_bytes)
+
+                        if cmd in write_commands:
+                            notify_stream_waiters()
 
                         # 📡 PHASE 3: LIVE COMMAND FORWARDING
                         if server_role == "master" and cmd in write_commands:
@@ -419,10 +512,14 @@ class AsyncKedisSession:
                                 f"[cyan]📡 [BROADCAST] Firing {cmd} down the slipstream to {len(connected_replicas)} followers...[/cyan]"
                             )
 
-                            header = f"A{len(tokens)}\n".encode("utf-8")
+                            # XADD is forwarded with the ID this master assigned
+                            forwarded = global_handler.replication_tokens(
+                                tokens, response
+                            )
+                            header = f"A{len(forwarded)}\n".encode("utf-8")
                             body = b"".join(
                                 f"S{len(t.encode('utf-8'))}\n{t}\n".encode("utf-8")
-                                for t in tokens
+                                for t in forwarded
                             )
                             broadcast_payload = header + body
 
@@ -477,6 +574,7 @@ async def main():
 
     server = await asyncio.start_server(handle_connection, HOST, PORT)
     asyncio.create_task(loop_latency_monitor(global_store))
+    housekeeping_task = asyncio.create_task(housekeeping_loop(global_handler))  # noqa: F841
 
     # --- THE OS SIGNAL TRAP ---
     def shutdown_sequence(sig_name):

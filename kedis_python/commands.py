@@ -2,7 +2,9 @@ import threading
 import time
 from typing import Any
 
+from .parser import BulkString
 from .store import KedisStore
+from .stream import StreamError
 
 
 class CommandHandler:
@@ -54,6 +56,14 @@ class CommandHandler:
             "PFADD": self._handle_pfadd,
             "PFCOUNT": self._handle_pfcount,
             "PFMERGE": self._handle_pfmerge,
+            "HOUSEKEEP": self._handle_housekeep,
+            "XADD": self._handle_xadd,
+            "XLEN": self._handle_xlen,
+            "XRANGE": self._handle_xrange,
+            "XREVRANGE": self._handle_xrevrange,
+            "XREAD": self._handle_xread,
+            "XDEL": self._handle_xdel,
+            "XTRIM": self._handle_xtrim,
         }
 
     @property
@@ -79,6 +89,9 @@ class CommandHandler:
             "BITOP",
             "PFADD",
             "PFMERGE",
+            "XADD",
+            "XDEL",
+            "XTRIM",
         }
 
     def execute(self, tokens: list[str], client_socket=None):
@@ -455,6 +468,7 @@ class CommandHandler:
     def _handle_stats(self, tokens: list[str]):
         stats = self.store.get_engine_stats()
         lru = stats.get("lru_cache", {})
+        hk = stats.get("housekeeping", {})
 
         return (
             f"Total Keys:{stats.get('total_keys', 0)}\n"
@@ -468,8 +482,249 @@ class CommandHandler:
             f"LRU Hits:{lru.get('hits', 0)}\n"
             f"LRU Misses:{lru.get('misses', 0)}\n"
             f"Hit Rate:{lru.get('hit_rate_pct', 0.0)}%\n"
-            f"LRU Tracked:{lru.get('tracked_keys', 0)} / {lru.get('max_size', 128)}"
+            f"LRU Tracked:{lru.get('tracked_keys', 0)} / {lru.get('max_size', 1024)}\n"
+            "---\n"
+            f"Housekeeping Runs:{hk.get('runs', 0)}\n"
+            f"Expired Swept:{hk.get('expired', 0)}\n"
+            f"LRU Ghosts Fixed:{hk.get('lru_orphans', 0)}\n"
+            f"Bytes Reclaimed:{hk.get('reclaimed_bytes', 0)}"
         )
+
+    # ------------------------------------------------------------------
+    # STREAMS
+    # Replies are nested arrays exactly like Redis: XRANGE -> [[id, [f, v..]]],
+    # XREAD -> [[key, [[id, [f, v..]]]]]. Everything that is user data is
+    # wrapped in BulkString so values like "OK" or "ERROR ..." stay data.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_int(text: str, message: str = "ERR value is not an integer or out of range"):
+        try:
+            return int(text)
+        except ValueError:
+            raise StreamError(message)
+
+    @staticmethod
+    def _format_entries(entries) -> list:
+        return [
+            [BulkString(sid), [BulkString(x) for x in fields]] for sid, fields in entries
+        ]
+
+    def _parse_trim(self, tokens: list, i: int, command: str):
+        """Parses `MAXLEN|MINID [=|~] threshold [LIMIT n]` starting at tokens[i].
+        Returns (maxlen, minid, next_index). '~' is accepted but trimming is
+        always exact, and LIMIT is accepted and ignored."""
+        strategy = tokens[i].upper()
+        i += 1
+        if i < len(tokens) and tokens[i] in ("=", "~"):
+            i += 1
+        if i >= len(tokens):
+            raise StreamError("ERR syntax error")
+        maxlen = minid = None
+        if strategy == "MAXLEN":
+            maxlen = self._to_int(tokens[i])
+        else:
+            minid = tokens[i]
+        i += 1
+        if i < len(tokens) and tokens[i].upper() == "LIMIT":
+            if i + 1 >= len(tokens):
+                raise StreamError("ERR syntax error")
+            self._to_int(tokens[i + 1])
+            i += 2
+        return maxlen, minid, i
+
+    def _parse_xadd(self, tokens: list) -> dict:
+        """XADD key [NOMKSTREAM] [MAXLEN|MINID [=|~] n [LIMIT c]] id|* field value ..."""
+        i = 2
+        opts = {"nomkstream": False, "maxlen": None, "minid": None}
+        while i < len(tokens):
+            word = tokens[i].upper()
+            if word == "NOMKSTREAM":
+                opts["nomkstream"] = True
+                i += 1
+            elif word in ("MAXLEN", "MINID"):
+                if opts["maxlen"] is not None or opts["minid"] is not None:
+                    raise StreamError("ERR syntax error")
+                opts["maxlen"], opts["minid"], i = self._parse_trim(tokens, i, "xadd")
+            else:
+                break
+        if i >= len(tokens):
+            raise StreamError("ERR wrong number of arguments for 'xadd' command")
+        fields = tokens[i + 1 :]
+        if not fields or len(fields) % 2:
+            raise StreamError("ERR wrong number of arguments for 'xadd' command")
+        return {**opts, "id_index": i, "id": tokens[i], "fields": fields}
+
+    def _handle_xadd(self, tokens: list[str]):
+        if len(tokens) < 5:
+            return "-ERR wrong number of arguments for 'xadd' command"
+        try:
+            p = self._parse_xadd(tokens)
+            sid = self.store.xadd(
+                tokens[1],
+                p["fields"],
+                p["id"],
+                maxlen=p["maxlen"],
+                minid=p["minid"],
+                nomkstream=p["nomkstream"],
+            )
+        except StreamError as e:
+            return f"-{e}"
+        except TypeError as e:
+            return f"-ERR {e}"
+        return None if sid is None else BulkString(sid)
+
+    def replication_tokens(self, tokens: list, response) -> list:
+        """What a master should forward to replicas for this command.
+        XADD must carry the ID the master actually assigned: a replica that
+        saw '*' would pick its own clock-based ID and the two would diverge."""
+        if (
+            tokens
+            and tokens[0].upper() == "XADD"
+            and isinstance(response, str)
+            and not response.startswith("-")
+        ):
+            try:
+                id_index = self._parse_xadd(tokens)["id_index"]
+            except StreamError:
+                return tokens
+            forwarded = list(tokens)
+            forwarded[id_index] = str(response)
+            return forwarded
+        return tokens
+
+    def _handle_xlen(self, tokens: list[str]):
+        if len(tokens) != 2:
+            return "-ERR wrong number of arguments for 'xlen' command"
+        try:
+            return self.store.xlen(tokens[1])
+        except TypeError as e:
+            return f"-ERR {e}"
+
+    def _range_command(self, tokens: list, reverse: bool):
+        name = "xrevrange" if reverse else "xrange"
+        if len(tokens) not in (4, 6):
+            return f"-ERR wrong number of arguments for '{name}' command"
+        count = None
+        try:
+            if len(tokens) == 6:
+                if tokens[4].upper() != "COUNT":
+                    return "-ERR syntax error"
+                count = self._to_int(tokens[5])
+            if reverse:
+                entries = self.store.xrevrange(tokens[1], tokens[2], tokens[3], count)
+            else:
+                entries = self.store.xrange(tokens[1], tokens[2], tokens[3], count)
+        except StreamError as e:
+            return f"-{e}"
+        except TypeError as e:
+            return f"-ERR {e}"
+        return self._format_entries(entries)
+
+    def _handle_xrange(self, tokens: list[str]):
+        return self._range_command(tokens, reverse=False)
+
+    def _handle_xrevrange(self, tokens: list[str]):
+        return self._range_command(tokens, reverse=True)
+
+    @staticmethod
+    def parse_xread(tokens: list):
+        """XREAD [COUNT n] [BLOCK ms] STREAMS key... id...
+        Returns (count, block_ms, [(key, id), ...]); count None = unlimited,
+        block_ms None = do not block (0 = block forever)."""
+        count = block_ms = None
+        i = 1
+        while i < len(tokens):
+            word = tokens[i].upper()
+            if word == "COUNT":
+                if i + 1 >= len(tokens):
+                    raise StreamError("ERR syntax error")
+                n = CommandHandler._to_int(tokens[i + 1])
+                count = None if n <= 0 else n  # Redis: COUNT 0 means no limit
+                i += 2
+            elif word == "BLOCK":
+                if i + 1 >= len(tokens):
+                    raise StreamError("ERR syntax error")
+                block_ms = CommandHandler._to_int(
+                    tokens[i + 1], "ERR timeout is not an integer or out of range"
+                )
+                if block_ms < 0:
+                    raise StreamError("ERR timeout is negative")
+                i += 2
+            elif word == "STREAMS":
+                i += 1
+                break
+            else:
+                raise StreamError("ERR syntax error")
+        else:
+            raise StreamError("ERR syntax error")
+        rest = tokens[i:]
+        if not rest or len(rest) % 2:
+            raise StreamError(
+                "ERR Unbalanced 'xread' list of streams: for each stream key "
+                "an ID or '$' must be specified."
+            )
+        half = len(rest) // 2
+        return count, block_ms, list(zip(rest[:half], rest[half:]))
+
+    def _xread_reply(self, streams: list, count):
+        out = self.store.xread(streams, count)
+        if not out:
+            return None
+        return [[BulkString(key), self._format_entries(entries)] for key, entries in out]
+
+    def _handle_xread(self, tokens: list[str]):
+        # Executed inline (also inside MULTI) this never blocks: BLOCK is
+        # honoured by the async server, which waits for writers to wake it.
+        try:
+            count, _block, streams = self.parse_xread(tokens)
+            return self._xread_reply(streams, count)
+        except StreamError as e:
+            return f"-{e}"
+        except TypeError as e:
+            return f"-ERR {e}"
+
+    def resolve_stream_ids(self, streams: list) -> list:
+        with self._engine_lock:
+            return self.store.xresolve_ids(streams)
+
+    def xread_nonblocking(self, streams: list, count):
+        with self._engine_lock:
+            return self._xread_reply(streams, count)
+
+    def _handle_xdel(self, tokens: list[str]):
+        if len(tokens) < 3:
+            return "-ERR wrong number of arguments for 'xdel' command"
+        try:
+            return self.store.xdel(tokens[1], *tokens[2:])
+        except StreamError as e:
+            return f"-{e}"
+        except TypeError as e:
+            return f"-ERR {e}"
+
+    def _handle_xtrim(self, tokens: list[str]):
+        if len(tokens) < 4:
+            return "-ERR wrong number of arguments for 'xtrim' command"
+        try:
+            maxlen, minid, end = self._parse_trim(tokens, 2, "xtrim")
+            if end != len(tokens):
+                return "-ERR syntax error"
+            return self.store.xtrim(tokens[1], maxlen=maxlen, minid=minid)
+        except StreamError as e:
+            return f"-{e}"
+        except TypeError as e:
+            return f"-ERR {e}"
+
+    def run_housekeeping(self) -> dict:
+        """Entry point for the background task: one pass under the engine lock."""
+        with self._engine_lock:
+            return self.store.housekeeping()
+
+    def _handle_housekeep(self, tokens: list[str]):
+        if len(tokens) != 1:
+            return "-ERR wrong number of arguments for 'housekeep' command"
+        report = self.store.housekeeping()  # execute() already holds the lock
+        return "\n".join(f"{k}:{v}" for k, v in report.items())
 
     def _handle_subscribe(self, tokens: list[str], client_socket):
         if client_socket is None:
