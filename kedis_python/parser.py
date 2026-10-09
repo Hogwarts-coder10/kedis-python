@@ -144,6 +144,115 @@ class BulkString(str):
     __slots__ = ()
 
 
+class Status(str):
+    """A decoded simple status reply ('+OK', '+QUEUED', ...)."""
+
+    __slots__ = ()
+
+
+class ErrorReply(str):
+    """A decoded KESP error reply ('E<message>')."""
+
+    __slots__ = ()
+
+
+class LegacyError(ErrorReply):
+    """A raw '-ERR ...' line, which the server still writes by hand for
+    MULTI/WATCH/read-only replies. The text keeps its leading '-'."""
+
+    __slots__ = ()
+
+
+class IncompleteReply(Exception):
+    """The buffer ends in the middle of a reply: read more bytes, retry."""
+
+
+class ReplyProtocolError(ValueError):
+    """The peer sent bytes that are not a valid KESP reply."""
+
+
+class KESPDecoder:
+    """Client-side decoder for server replies (the mirror of KESPEncoder).
+
+    decode(buf) returns (value, bytes_consumed) and raises IncompleteReply
+    when the buffer holds only part of a reply, so callers can keep reading
+    until a whole reply has arrived. Values:
+
+        None               N         (nil)
+        int                I<n>
+        Status             +text
+        ErrorReply         Etext
+        LegacyError        -text     (leading '-' kept)
+        BulkString         S<len>    (binary-safe: counted in bytes)
+        list               A<n>      (elements may themselves be lists)
+    """
+
+    MAX_DEPTH = 32  # nesting guard, so a hostile reply can't blow the stack
+    MAX_LINE = 64 * 1024  # a header/status line longer than this is garbage
+
+    @staticmethod
+    def decode(buf, pos: int = 0, _depth: int = 0):
+        if _depth > KESPDecoder.MAX_DEPTH:
+            raise ReplyProtocolError("reply nested too deeply")
+        if pos >= len(buf):
+            raise IncompleteReply
+
+        nl = buf.find(b"\n", pos)
+        if nl == -1:
+            if len(buf) - pos > KESPDecoder.MAX_LINE:
+                raise ReplyProtocolError("reply line too long")
+            raise IncompleteReply
+
+        line = bytes(buf[pos:nl])
+        if line.endswith(b"\r"):  # the hand-written replies end in \r\n
+            line = line[:-1]
+        after = nl + 1
+        sigil, rest = line[:1], line[1:]
+
+        if sigil == b"N":
+            return None, after
+        if sigil == b"I":
+            return KESPDecoder._number(rest), after
+        if sigil == b"+":
+            return Status(rest.decode("utf-8", "replace")), after
+        if sigil == b"E":
+            return ErrorReply(rest.decode("utf-8", "replace")), after
+        if sigil == b"-":
+            return LegacyError(line.decode("utf-8", "replace")), after
+
+        if sigil == b"S":
+            length = KESPDecoder._number(rest)
+            if length < 0 or length > CommandParser.MAX_BULK_LENGTH:
+                raise ReplyProtocolError("invalid bulk length")
+            end = after + length
+            if len(buf) < end + 1:
+                raise IncompleteReply
+            if buf[end : end + 1] != b"\n":
+                raise ReplyProtocolError("bulk string not newline-terminated")
+            text = bytes(buf[after:end]).decode("utf-8", "replace")
+            return BulkString(text), end + 1
+
+        if sigil == b"A":
+            count = KESPDecoder._number(rest)
+            if count < 0 or count > CommandParser.MAX_ARRAY_LENGTH:
+                raise ReplyProtocolError("invalid array length")
+            items = []
+            for _ in range(count):
+                item, after = KESPDecoder.decode(buf, after, _depth + 1)
+                items.append(item)
+            return items, after
+
+        # Anything else is a plain text line from an older/foreign server.
+        return Status(line.decode("utf-8", "replace")), after
+
+    @staticmethod
+    def _number(raw: bytes) -> int:
+        try:
+            return int(raw.decode("ascii"))
+        except (ValueError, UnicodeDecodeError):
+            raise ReplyProtocolError("invalid number in reply header") from None
+
+
 class KESPEncoder:
     @staticmethod
     def encode(data) -> bytes:

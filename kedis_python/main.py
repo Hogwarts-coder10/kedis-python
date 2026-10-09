@@ -18,7 +18,14 @@ if (
 
 from .commands import CommandHandler
 from .network import NetworkManager
-from .parser import CommandParser
+from .parser import (
+    BulkString,
+    CommandParser,
+    ErrorReply,
+    IncompleteReply,
+    KESPDecoder,
+    LegacyError,
+)
 from .store import KedisStore
 from .ui import UI, console
 
@@ -595,13 +602,14 @@ class KedisClient:
                 # TCP MODE: Send raw KESP bytes across the wire
                 try:
                     self.network.sock.sendall(kesp_payload)
-                    kesp_bytes = self.network.sock.recv(4096)
+                    kesp_bytes = self.network.read_reply()
                 except AttributeError:
                     # Fallback if NetworkManager doesn't expose the raw socket
                     kesp_bytes = self.network.send_command(kesp_payload.decode("utf-8"))
 
             # 2. TRANSLATE KESP BYTES BACK TO UI TEXT
-            response_text = self._decode_kesp_for_ui(kesp_bytes)
+            value = self._decode_kesp_value(kesp_bytes)
+            response_text = self._format_reply(value)
 
         except OSError:
             self._handle_tcp_crash()
@@ -610,6 +618,13 @@ class KedisClient:
             console.print(
                 f"[bold red](error) ERR internal client error: {str(e)}[/bold red]"
             )
+            return
+
+        # Stream replies are nested arrays of user data, so they are drawn
+        # from the decoded value, ahead of the text-matching branches below.
+        if cmd in self.STREAM_VIEWS and self._render_stream_reply(
+            cmd, raw_input, value
+        ):
             return
 
         # --- THE GRAND UX INTERCEPTOR (UNIFIED) ---
@@ -712,6 +727,23 @@ class KedisClient:
         )
         return header + body
 
+    STREAM_VIEWS = {
+        "XRANGE": "Stream Range",
+        "XREVRANGE": "Stream Range (newest first)",
+        "XREAD": "Stream Read",
+    }
+
+    def _decode_kesp_value(self, raw_bytes):
+        """KESP bytes -> Python value (see parser.KESPDecoder). Nested arrays
+        stay nested. Text that lost its final newline is still accepted."""
+        if isinstance(raw_bytes, str):
+            raw_bytes = raw_bytes.encode("utf-8")
+        try:
+            value, _ = KESPDecoder.decode(raw_bytes)
+        except IncompleteReply:
+            value, _ = KESPDecoder.decode(bytes(raw_bytes) + b"\n")
+        return value
+
     def _decode_kesp_for_ui(self, raw_bytes: bytes) -> str:
         """
         Translates raw KESP bytes into the human-readable text strings
@@ -721,70 +753,111 @@ class KedisClient:
             return "(connection closed)"
 
         try:
-            # 🛡️ THE FIX: Safely handle both raw bytes and pre-decoded text strings
-            text = (
-                raw_bytes.decode("utf-8")
-                if isinstance(raw_bytes, bytes)
-                else str(raw_bytes)
-            )
-            if not text:
-                return ""
-
-            sigil = text[0]
-
-            if sigil == "+":
-                return text[1:].strip()
-            elif sigil == "E":
-                return f"(error) {text[1:].strip()}"
-            elif sigil == "I":
-                return f"(integer) {text[1:].strip()}"
-            elif sigil == "N":
-                return "(nil)"
-            elif sigil == "S":
-                parts = text.split("\n", 1)
-                if len(parts) > 1:
-                    data = parts[1].rsplit("\n", 1)[0]
-                    return f'"{data}"'
-            elif sigil == "A":
-                # 🚀 Format KESP Arrays specifically so UI.render_table() can parse them
-                lines = text.strip().split("\n")
-                if len(lines) <= 1:
-                    return "(empty array)"
-
-                output = []
-                idx = 1
-                item_num = 1
-
-                while idx < len(lines):
-                    if lines[idx].startswith("S"):
-                        output.append(f"{item_num}) {lines[idx + 1]}")
-                        idx += 2
-                    elif lines[idx].startswith("I"):
-                        output.append(f"{item_num}) {lines[idx][1:]}")
-                        idx += 1
-
-                    elif lines[idx].startswith("+"):  # ADDED Simple Strings
-                        output.append(f"{item_num}) {lines[idx][1:]}")
-                        idx += 1
-
-                    elif lines[idx].startswith("E"):  # 🚀 ADDED: Errors
-                        output.append(f"{item_num}) (error) {lines[idx][1:]}")
-                        idx += 1
-
-                    elif lines[idx].startswith("N"):
-                        output.append(f"{item_num}) (nil)")
-                        idx += 1
-                    else:
-                        idx += 1
-                        continue
-                    item_num += 1
-
-                return "\n".join(output) if output else "(empty array)"
-
-            return text.strip()
-
+            return self._format_reply(self._decode_kesp_value(raw_bytes))
         except Exception as e:
             return f"(decoder error) {e}"
+
+    @staticmethod
+    def _scalar_text(value, quote: bool) -> str:
+        if value is None:
+            return "(nil)"
+        if isinstance(value, LegacyError):
+            return str(value)
+        if isinstance(value, ErrorReply):
+            return f"(error) {value}"
+        if isinstance(value, BulkString):
+            return f'"{value}"' if quote else str(value)
+        if isinstance(value, str):  # simple status
+            return str(value)
+        return f"(integer) {value}" if quote else str(value)
+
+    @staticmethod
+    def _has_nested(items) -> bool:
+        return any(isinstance(item, list) for item in items)
+
+    def _format_array(self, items, nested: bool) -> list[str]:
+        """Numbered lines for one array. Flat arrays keep the exact
+        '1) value' layout the table renderers parse; nested ones use the
+        redis-cli style, indenting children under their parent."""
+        lines = []
+        for n, item in enumerate(items, 1):
+            prefix = f"{n}) "
+            if isinstance(item, list):
+                sub = self._format_array(item, nested) if item else ["(empty array)"]
+            else:
+                text = self._scalar_text(item, quote=nested)
+                if nested and isinstance(item, BulkString):
+                    body = (
+                        str(item)
+                        .replace("\\", "\\\\")
+                        .replace('"', '\\"')
+                        .replace("\n", "\\n")
+                    )
+                    text = f'"{body}"'
+                sub = [text]
+            lines.append(prefix + sub[0])
+            lines.extend(" " * len(prefix) + extra for extra in sub[1:])
+        return lines
+
+    def _format_reply(self, value) -> str:
+        if isinstance(value, list):
+            if not value:
+                return "(empty array)"
+            return "\n".join(self._format_array(value, self._has_nested(value)))
+        return self._scalar_text(value, quote=True)
+
+    @staticmethod
+    def _stream_entries(raw):
+        """[[id, [f, v, ...]], ...] -> [(id, [(f, v), ...]), ...]; None if
+        the reply is not shaped like stream entries."""
+        out = []
+        for entry in raw:
+            if not (
+                isinstance(entry, list)
+                and len(entry) == 2
+                and isinstance(entry[0], str)
+                and isinstance(entry[1], list)
+            ):
+                return None
+            fields = entry[1]
+            if len(fields) % 2 or not all(isinstance(f, str) for f in fields):
+                return None
+            pairs = [(str(fields[i]), str(fields[i + 1])) for i in range(0, len(fields), 2)]
+            out.append((str(entry[0]), pairs))
+        return out
+
+    def _render_stream_reply(self, cmd, raw_input, value) -> bool:
+        """Draws XRANGE / XREVRANGE / XREAD replies as stream tables.
+        Returns False (nothing printed) when the reply doesn't fit, so the
+        generic text path still shows it."""
+        if not isinstance(value, list) or not value:
+            return False
+
+        title = self.STREAM_VIEWS[cmd]
+        groups = []
+        if cmd == "XREAD":  # [[key, entries], ...]
+            for item in value:
+                if not (
+                    isinstance(item, list)
+                    and len(item) == 2
+                    and isinstance(item[0], str)
+                    and isinstance(item[1], list)
+                ):
+                    return False
+                entries = self._stream_entries(item[1])
+                if entries is None:
+                    return False
+                groups.append((str(item[0]), entries))
+        else:  # XRANGE / XREVRANGE: [entries] for the key typed by the user
+            entries = self._stream_entries(value)
+            if entries is None:
+                return False
+            parts = raw_input.split()
+            groups.append((parts[1] if len(parts) > 1 else "stream", entries))
+
+        for key, entries in groups:
+            UI.render_stream(key, entries, title)
+        return True
 
     def _handle_tcp_crash(self):
         """Gracefully recovers if the TCP server explodes mid-query."""

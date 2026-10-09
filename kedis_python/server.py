@@ -477,7 +477,7 @@ class AsyncKedisSession:
 
                     elif self.in_transaction:
                         self.tx_queue.append(tokens)
-                        await self.send(b"+OK")
+                        await self.send(b"+OK\n")
 
                     else:
                         # 🛡️ PHASE 4: THE READ-ONLY FIREWALL

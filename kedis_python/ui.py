@@ -1,4 +1,5 @@
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -263,3 +264,33 @@ class UI:
                 except IndexError:
                     continue
             console.print(table)
+
+    @staticmethod
+    def render_stream(key, entries, title="Stream"):
+        """Draws stream entries as a table. `entries` is a list of
+        (entry_id, [(field, value), ...]). All text is escaped: stream
+        values are user data and must never be read as rich markup."""
+        noun = "entry" if len(entries) == 1 else "entries"
+        plain_title = f"🌊 {title}: {key} ({len(entries)} {noun})"
+        table = Table(
+            title=f"🌊 {title}: [cyan]{escape(key)}[/cyan] [dim]({len(entries)} {noun})[/dim]",
+            border_style="cyan",
+            title_justify="left",
+            # wide enough that the title never wraps onto a second line
+            min_width=min(len(plain_title) + 2, console.width),
+        )
+        table.add_column("ID", style="cyan", no_wrap=True)
+        table.add_column("Field", style="yellow", justify="right")
+        table.add_column("Value", style="green", min_width=25, overflow="fold")
+
+        for entry_id, pairs in entries:
+            if not pairs:
+                table.add_row(escape(entry_id), "", "", end_section=True)
+            for n, (field, val) in enumerate(pairs):
+                table.add_row(
+                    escape(entry_id) if n == 0 else "",
+                    escape(field),
+                    escape(val),
+                    end_section=(n == len(pairs) - 1),
+                )
+        console.print(table)
