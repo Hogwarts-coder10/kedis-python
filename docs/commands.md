@@ -63,6 +63,247 @@ Flushes the transaction queue and exits the `MULTI` state without executing any 
 
 ---
 
+## 🧱 Lists, Sets, Hashes, Sorted Sets, Bitmaps & HyperLogLog
+
+A key holds **one type at a time**. Running a command from the wrong family against it returns `WRONGTYPE Operation against a key holding the wrong kind of value`, and plain `SET` overwrites whatever was there. Every command below is written to the AOF, so the data survives a restart, and every key type honours `EXPIRE` and `TTL`.
+
+---
+
+## 📜 Lists
+
+Ordered sequences with fast pushes and pops at both ends. A list that loses its last element disappears.
+
+### `LPUSH key value [value ...]`
+Pushes values onto the **head** of the list, creating it if needed. Several values are pushed one at a time, so the last one ends up first.
+* **Returns:** `(integer)` The length of the list after the push.
+* **Example:** `LPUSH tasks urgent`
+
+### `RPUSH key value [value ...]`
+Pushes values onto the **tail** of the list, creating it if needed.
+* **Returns:** `(integer)` The length of the list after the push.
+* **Example:** `RPUSH tasks later`
+
+### `LPOP key`
+Removes and returns the first element. There is no `COUNT` argument.
+* **Returns:** The element as a Bulk String, or `(nil)` if the key doesn't exist.
+* **Example:** `LPOP tasks`
+
+### `RPOP key`
+Removes and returns the last element.
+* **Returns:** The element as a Bulk String, or `(nil)` if the key doesn't exist.
+* **Example:** `RPOP tasks`
+
+### `LRANGE key start stop`
+Returns the elements from index `start` to index `stop`, both inclusive. Index `0` is the head. `-1` as `stop` means "through the last element", and a `stop` past the end is clamped.
+* **Returns:** An Array of elements, or an empty Array if the key doesn't exist.
+* **Example:** `LRANGE tasks 0 -1`
+* **Limit:** `-1` is the only negative index supported, and only as `stop`. A negative `start` (or any other negative `stop`) returns an error.
+
+```
+> RPUSH tasks a b c
+(integer) 3
+> LPUSH tasks x y
+(integer) 5
+> LRANGE tasks 0 -1
+1) y
+2) x
+3) a
+4) b
+5) c
+> LPOP tasks
+"y"
+```
+
+> **Not implemented yet:** `LLEN`, `LINDEX`, `LSET`, `LTRIM`, `LINSERT`, `LREM`, `BLPOP`
+
+---
+
+## 🎯 Sets
+
+Unordered collections of unique strings.
+
+### `SADD key member [member ...]`
+Adds members, creating the set if needed. Members already present are ignored.
+* **Returns:** `(integer)` How many members were **newly** added.
+* **Example:** `SADD skills python systems`
+
+### `SREM key member [member ...]`
+Removes members. Missing members are ignored, and a set that loses its last member disappears.
+* **Returns:** `(integer)` How many members were actually removed.
+* **Example:** `SREM skills python`
+
+### `SMEMBERS key`
+Returns every member, in no particular order.
+* **Returns:** An Array of members, or an empty Array if the key doesn't exist.
+* **Example:** `SMEMBERS skills`
+
+```
+> SADD skills python python systems
+(integer) 2
+> SADD skills python
+(integer) 0
+> SMEMBERS skills
+1) python
+2) systems
+> SREM skills python nope
+(integer) 1
+```
+
+> **Not implemented yet:** `SISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SPOP`
+
+---
+
+## 🗂️ Hashes
+
+A map of fields to string values under one key, kept in insertion order.
+
+### `HSET key field value`
+Sets one field. **Everything after the field name is the value**, joined with single spaces, so `HSET user bio likes databases` stores `likes databases`. Only one field per call.
+* **Returns:** `(integer)` `1` if the field is new, `0` if an existing field was overwritten.
+* **Example:** `HSET user name karthik`
+
+### `HGET key field`
+* **Returns:** The value as a Bulk String, or `(nil)` if the key or field doesn't exist.
+* **Example:** `HGET user name`
+
+### `HGETALL key`
+Returns every field and value.
+* **Returns:** A flat Array alternating field and value (`field1, value1, field2, value2, ...`), or an empty Array if the key doesn't exist.
+* **Example:** `HGETALL user`
+
+```
+> HSET user name karthik
+(integer) 1
+> HSET user name Karthik V
+(integer) 0
+> HSET user city amaravati
+(integer) 1
+> HGET user name
+"Karthik V"
+> HGETALL user
+1) name
+2) Karthik V
+3) city
+4) amaravati
+```
+
+> **Not implemented yet:** `HDEL`, `HLEN`, `HEXISTS`, `HMGET`, `HKEYS`, `HVALS`, `HINCRBY`
+
+---
+
+## 🏆 Sorted Sets
+
+Unique members ordered by a floating-point score, backed by a skip list with rank-aware spans, so ranked range queries stay fast. Members with equal scores are ordered by name.
+
+### `ZADD key score member [score member ...]`
+Adds members, or updates the score of members that already exist. Pairs are applied one at a time from left to right, so if a later score isn't a valid number the error is returned but the pairs before it stay added.
+* **Returns:** `(integer)` How many members were **newly** added. Score updates are not counted.
+* **Example:** `ZADD leaderboard 100 karthik 250 ada`
+
+### `ZRANGE key start stop [WITHSCORES]`
+Returns members by rank, lowest score first. Rank `0` is the lowest, negative ranks count from the end (`-1` is the highest), and a `stop` past the end is clamped. With `WITHSCORES` (any case) each member is followed by its score.
+* **Returns:** An Array of members, or a flat Array alternating member and score with `WITHSCORES`. Empty if the key doesn't exist or the range is empty.
+* **Example:** `ZRANGE leaderboard 0 -1 WITHSCORES`
+
+```
+> ZADD board 100 karthik 250 ada
+(integer) 2
+> ZADD board 300 karthik
+(integer) 0
+> ZRANGE board 0 -1
+1) ada
+2) karthik
+> ZRANGE board 0 -1 WITHSCORES
+1) ada
+2) 250
+3) karthik
+4) 300
+```
+
+> **Not implemented yet:** `ZREM`, `ZSCORE`, `ZRANK`, `ZCARD`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZINCRBY`
+
+---
+
+## 🔦 Bitmaps
+
+Bitmaps are not a separate type. Exactly as in Redis, they are bit operations on an ordinary **string**, so `TYPE` reports `string` and `GET`, `SET`, `DEL` and `EXPIRE` work on the same key. Bit `0` is the **most significant** bit of the first byte, matching Redis, and the string grows with zero bytes as needed.
+
+### `SETBIT key offset bit`
+Sets the bit at `offset` (0 or more) to `bit` (`0` or `1`), extending the string if the offset is past its end.
+* **Returns:** `(integer)` The bit's **previous** value.
+* **Example:** `SETBIT flags 7 1`
+
+### `GETBIT key offset`
+* **Returns:** `(integer)` The bit at `offset`. A missing key, or an offset past the end, reads as `0`.
+* **Example:** `GETBIT flags 7`
+
+### `BITCOUNT key [start end]`
+Counts the bits set to 1. With a range, `start` and `end` are **byte** positions (inclusive, not bit offsets), and negative values count from the end. Give both or neither.
+* **Returns:** `(integer)` The number of set bits, `0` if the key doesn't exist.
+* **Example:** `BITCOUNT flags 0 0`
+
+### `BITOP AND|OR|XOR|NOT destkey key [key ...]`
+Combines strings bit by bit and stores the result in `destkey`. Shorter sources are padded with zero bytes. `NOT` takes exactly one source key. If the result is empty, `destkey` is removed.
+* **Returns:** `(integer)` The length of the result in bytes.
+* **Example:** `BITOP OR either a b`
+
+```
+> SETBIT a 0 1
+(integer) 0
+> SETBIT a 1 1
+(integer) 0
+> SETBIT b 1 1
+(integer) 0
+> SETBIT b 2 1
+(integer) 0
+> BITOP OR either a b
+(integer) 1
+> BITCOUNT either
+(integer) 3
+```
+
+> **Note:** a key written with plain `SET` containing multi-byte UTF-8 text (emoji, non-Latin scripts) is treated one character at a time, not one byte at a time, so bit operations on it won't match the UTF-8 bytes.
+
+> **Not implemented yet:** `BITPOS`, `BITFIELD`
+
+---
+
+## 🔭 HyperLogLog
+
+A probabilistic counter of **distinct** elements that uses a fixed ~16 KiB per key however many items you add. It uses 16,384 registers, the same as Redis, for a standard error of about 0.81%, so counts are estimates (small sets are usually exact). Hashing is stable across restarts, so counts survive persistence. Like Redis, `TYPE` reports `string`.
+
+### `PFADD key [element ...]`
+Adds elements to the counter, creating it if needed. With no elements it just creates an empty counter.
+* **Returns:** `(integer)` `1` if the counter's estimate changed or the key was created, `0` otherwise.
+* **Example:** `PFADD visitors alice bob carol`
+
+### `PFCOUNT key [key ...]`
+Estimates the number of distinct elements. With several keys it returns the size of their **union** without modifying any of them. Missing keys count as empty.
+* **Returns:** `(integer)` The estimated cardinality.
+* **Example:** `PFCOUNT visitors other`
+
+### `PFMERGE destkey [sourcekey ...]`
+Merges the source counters into `destkey` (created if needed, existing contents kept).
+* **Returns:** `+OK`
+* **Example:** `PFMERGE all visitors other`
+
+```
+> PFADD visitors alice bob carol
+(integer) 1
+> PFADD visitors alice
+(integer) 0
+> PFADD other carol erin
+(integer) 1
+> PFCOUNT visitors other
+(integer) 4
+> PFMERGE all visitors other
+OK
+> PFCOUNT all
+(integer) 4
+```
+
+---
+
 ## 🌊 Streams & Consumer Groups
 
 Append-only event logs and the worker groups that share them. How the pieces behave (IDs, blocking, pending lists, persistence, limits) is explained in [Streams & Consumer Groups](streams.md).
