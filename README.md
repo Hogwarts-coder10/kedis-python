@@ -35,6 +35,7 @@ Dive into the internal grimoire to understand how Kedis achieves microsecond lat
 * [Persistence & I/O Drivetrain](docs/persistence.md)
 * [Command Spellbook](docs/commands.md)
 * [TTL & Lifespan Mechanics](docs/ttl.md)
+* [Streams & Consumer Groups](docs/streams.md)
 * [Pub/Sub Broadcasts](docs/pubsub.md)
 * [Benchmarks & Telemetry](docs/benchmarks.md)
 * [Future Roadmap](docs/roadmap.md)
@@ -92,6 +93,20 @@ ZRANGE leaderboard
 ```
 
 Implemented using a custom Skip List inspired by Redis sorted set internals, with rank-aware span tracking for fast positional queries.
+
+### Streams & Consumer Groups
+
+```bash
+XADD orders * item book qty 2
+XREAD BLOCK 5000 STREAMS orders $
+
+XGROUP CREATE orders shipping 0
+XREADGROUP GROUP shipping worker1 COUNT 10 STREAMS orders >
+XPENDING orders shipping
+XACK orders shipping 1718000000000-0
+```
+
+Append-only event logs with blocking reads, and consumer groups that share a stream between workers with a pending list and acknowledgements. Streams persist through the AOF, `COMPACT` and snapshots, and replicate with the exact IDs and group state the master chose. See [Streams & Consumer Groups](docs/streams.md).
 
 ---
 
@@ -276,6 +291,7 @@ The project includes automated tests covering:
 * data structures
 * persistence recovery
 * expiration behavior
+* streams and consumer groups, from the data structure up to live TCP sessions
 
 Additional coverage is actively being expanded as the project evolves.
 
@@ -347,6 +363,7 @@ Current limitations include:
 * limited fault tolerance compared to production databases
 * no memory-based eviction ceiling (LRU tracks usage, but isn't yet tied to a hard memory limit)
 * AOF persistence is not buffered — writes can trigger a sync depending on config
+* consumer groups have no `XCLAIM`/`XAUTOCLAIM` yet; the full list of stream limits is in [docs/streams.md](docs/streams.md#-known-limits)
 
 These limitations are intentional learning opportunities and areas of active development.
 

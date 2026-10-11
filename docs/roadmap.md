@@ -46,8 +46,8 @@ Expand the engine beyond simple key-value storage.
 
 - [x] Bitmaps
 - [x] HyperLogLog
-- [ ] Stream data type
-- [ ] Consumer Groups
+- [x] Stream data type
+- [x] Consumer Groups
 - [ ] Background memory defragmentation
 
 ---
