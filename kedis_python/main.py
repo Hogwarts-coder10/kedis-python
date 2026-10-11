@@ -68,7 +68,7 @@ class KedisClient:
         # 🚀 DYNAMIC AUTOCOMPLETE GENERATOR (TCP MODE)
         try:
             temp_handler = CommandHandler(None)
-            engine_commands = list(temp_handler._commands.keys())
+            engine_commands = list(temp_handler.public_commands)
         except Exception:
             # Fallback if CommandHandler strict-requires a store to initialize
             engine_commands = [
@@ -193,7 +193,7 @@ class KedisClient:
         self.handler = CommandHandler(self.store)
 
         # 🚀 DYNAMIC AUTOCOMPLETE GENERATOR (LOCAL MODE)
-        engine_commands = list(self.handler._commands.keys())
+        engine_commands = list(self.handler.public_commands)
         cli_commands = [
             "MODE",
             "INFO",

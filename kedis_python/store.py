@@ -10,7 +10,16 @@ from typing import Any, Optional
 
 from .hyperloglog import HyperLogLog
 from .skiplist import SkipList
-from .stream import Stream, StreamError, format_id, parse_bound, parse_id
+from .stream import (
+    GROUP_RECORD_KINDS,
+    MIN_ID,
+    Stream,
+    StreamError,
+    check_name,
+    format_id,
+    parse_bound,
+    parse_id,
+)
 
 
 def _is_bare_token(text: str) -> bool:
@@ -39,6 +48,11 @@ class KedisStore:
         self._expires: dict[str, float] = {}
         # Track the exact mutation of every key to prevent race conditions
         self._versions: dict[str, int] = {}
+
+        # Resolved consumer-group records produced by the command being
+        # executed. The command layer drains them (under the engine lock) so
+        # the server can forward exactly these records to replicas.
+        self._group_outbox: list = []
 
         # ---------------------------------------------------------
         # TRUE LRU SURVIVAL TRACKER
@@ -793,6 +807,13 @@ class KedisStore:
                         except (ValueError, StreamError):
                             continue
                         self._touch_write(tokens[1])
+                elif cmd in GROUP_RECORD_KINDS and len(tokens) >= 3:
+                    # Resolved consumer-group records (see Stream.apply_group_record).
+                    # _log_operation is a no-op while recovering: no re-logging.
+                    try:
+                        self.apply_group_record(tokens)
+                    except (StreamError, TypeError, ValueError):
+                        continue
                 elif cmd == "XSTATE" and len(tokens) == 4:
                     # Internal AOF-only record written by compaction: restores
                     # the top ID and lifetime counter (also for empty streams).
@@ -839,6 +860,19 @@ class KedisStore:
                         f.write(
                             f"XSTATE {key} {format_id(value.last_id)} {value.entries_added}\n"
                         )
+                        for g in value.groups.values():
+                            f.write(f"XGROUP {key} {g.name} {format_id(g.last_id)}\n")
+                            for c in g.consumers.values():
+                                f.write(
+                                    f"XGCONS {key} {g.name} {c.name} "
+                                    f"{c.seen_ms} {c.active_ms}\n"
+                                )
+                            for sid in g._pel_ids:
+                                p = g.pel[sid]
+                                f.write(
+                                    f"XGPEL {key} {g.name} {p.consumer} "
+                                    f"{format_id(sid)} {p.delivery_ms} {p.count}\n"
+                                )
                     elif isinstance(value, HyperLogLog):
                         encoded = base64.b64encode(value.to_bytes()).decode("ascii")
                         f.write(f"PFLOAD {key} {encoded}\n")
@@ -1456,6 +1490,252 @@ class KedisStore:
             self._log_operation("XTRIM", key, "MAXLEN", len(stream))
             self._touch_write(key)
         return removed
+
+    # ------------------------------------------------------------------
+    # CONSUMER GROUPS
+    # Group state lives inside the Stream. A command first works out what it
+    # will do, expresses that as fully resolved records (ids, timestamps and
+    # delivery counts are decided here, never at replay time) and then pushes
+    # every record through apply_group_record. That one function is also what
+    # AOF replay and replicas call, so a replayed or replicated record always
+    # produces the state the master had.
+    # ------------------------------------------------------------------
+    _ERR_NEEDS_KEY = (
+        "ERR The XGROUP subcommand requires the key to exist. Note that for "
+        "CREATE you may want to use the MKSTREAM option to create an empty "
+        "stream automatically."
+    )
+    _ERR_DOLLAR = (
+        "ERR The $ ID is meaningless in the context of XREADGROUP: you want to "
+        "read the history of this consumer by specifying a proper ID, or use "
+        "the > ID to get new messages."
+    )
+
+    @staticmethod
+    def _now_ms() -> int:
+        return int(time.time() * 1000)
+
+    def apply_group_record(self, tokens: list, log: bool = True):
+        """Applies one resolved group record: [KIND, key, *args]. Used by live
+        commands, AOF replay (where logging is a no-op) and replicas."""
+        kind, key = tokens[0].upper(), tokens[1]
+        if kind not in GROUP_RECORD_KINDS:
+            raise StreamError("ERR Invalid consumer group record")
+        stream = self._data.get(key)
+        created = stream is None
+        if created:
+            if kind != "XGROUP":  # only a group create may make the stream (MKSTREAM)
+                raise StreamError("ERR Invalid consumer group record")
+            stream = Stream()
+        elif not isinstance(stream, Stream):
+            raise TypeError(self._WRONGTYPE)
+        result = stream.apply_group_record(kind, tokens[2:])  # validates first
+        if created:
+            self._data[key] = stream
+        self._touch_write(key)
+        if log:
+            self._log_operation(kind, key, *tokens[2:])
+        return result
+
+    def _commit_group_records(self, records: list) -> None:
+        for record in records:
+            self.apply_group_record(record)
+            self._group_outbox.append(record)
+
+    def drain_group_records(self) -> list:
+        """Hands over (and forgets) the records the last command produced."""
+        out, self._group_outbox = self._group_outbox, []
+        return out
+
+    def _group_of(self, key: str, group: str, context: str):
+        """(stream, group) or a NOGROUP error worded like Redis for `context`."""
+        stream = self._stream_or_none(key)
+        found = None if stream is None else stream.groups.get(group)
+        if found is None:
+            if context == "xreadgroup":
+                raise StreamError(
+                    f"NOGROUP No such key '{key}' or consumer group '{group}' "
+                    "in XREADGROUP with GROUP option"
+                )
+            if context == "xpending":
+                raise StreamError(
+                    f"NOGROUP No such key '{key}' or consumer group '{group}'"
+                )
+            raise StreamError(
+                f"NOGROUP No such consumer group '{group}' for key name '{key}'"
+            )
+        return stream, found
+
+    def _stream_for_xgroup(self, key: str):
+        stream = self._stream_or_none(key)
+        if stream is None:
+            raise StreamError(self._ERR_NEEDS_KEY)
+        return stream
+
+    def xgroup_create(self, key, group, id_text, mkstream: bool = False) -> str:
+        check_name(group)
+        stream = self._stream_or_none(key)
+        if stream is None and not mkstream:
+            raise StreamError(self._ERR_NEEDS_KEY)
+        if stream is not None and group in stream.groups:
+            raise StreamError("BUSYGROUP Consumer Group name already exists")
+        if id_text == "$":
+            last_id = MIN_ID if stream is None else stream.last_id
+        else:
+            last_id = parse_id(id_text)
+        self._commit_group_records([["XGROUP", key, group, format_id(last_id)]])
+        return "OK"
+
+    def xgroup_setid(self, key, group, id_text) -> str:
+        stream = self._stream_for_xgroup(key)
+        self._group_of(key, group, "xgroup")
+        last_id = stream.last_id if id_text == "$" else parse_id(id_text)
+        self._commit_group_records([["XGROUP", key, group, format_id(last_id)]])
+        return "OK"
+
+    def xgroup_destroy(self, key, group) -> int:
+        stream = self._stream_for_xgroup(key)
+        if group not in stream.groups:
+            return 0
+        self._commit_group_records([["XGDEL", key, group]])
+        return 1
+
+    def xgroup_createconsumer(self, key, group, consumer) -> int:
+        check_name(consumer)
+        self._stream_for_xgroup(key)
+        _, g = self._group_of(key, group, "xgroup")
+        if consumer in g.consumers:
+            return 0
+        self._commit_group_records(
+            [["XGCONS", key, group, consumer, str(self._now_ms()), "-1"]]
+        )
+        return 1
+
+    def xgroup_delconsumer(self, key, group, consumer) -> int:
+        """Returns how many pending entries the consumer still had."""
+        self._stream_for_xgroup(key)
+        _, g = self._group_of(key, group, "xgroup")
+        if consumer not in g.consumers:
+            return 0
+        pending = g.pending_counts().get(consumer, 0)
+        self._commit_group_records([["XGCDEL", key, group, consumer]])
+        return pending
+
+    def xreadgroup(self, group, consumer, streams, count=None, noack=False) -> list:
+        """streams: [(key, '>' | id)]. Returns [(key, entries)] where entries
+        are (id, fields) and fields is None for a pending entry that has since
+        been deleted. '>' streams with nothing new are left out; history
+        streams (an explicit id) are always present, even when empty."""
+        check_name(group)
+        check_name(consumer)
+        plan = []
+        for key, id_text in streams:  # validate everything before mutating anything
+            stream, g = self._group_of(key, group, "xreadgroup")
+            if id_text == "$":
+                raise StreamError(self._ERR_DOLLAR)
+            plan.append((key, stream, g, None if id_text == ">" else parse_id(id_text)))
+
+        now = str(self._now_ms())
+        out = []
+        for key, stream, g, from_id in plan:  # sequential: a repeated key sees its own deliveries
+            records = []
+            if consumer not in g.consumers:
+                records.append(["XGCONS", key, group, consumer, now, "-1"])
+            entries = []
+            if from_id is None:  # '>' : entries nobody in the group has seen
+                entries = stream.read_after(g.last_id, count)
+                if entries:
+                    if not noack:
+                        for id_text, _fields in entries:
+                            prev = g.pel.get(parse_id(id_text))
+                            tries = 1 if prev is None else prev.count + 1
+                            records.append(
+                                ["XGPEL", key, group, consumer, id_text, now, str(tries)]
+                            )
+                    records.append(["XGLAST", key, group, entries[-1][0]])
+                    out.append((key, entries))
+            else:  # history: this consumer's own pending entries after from_id
+                for pid in g.pending_after(consumer, from_id, count):
+                    id_text, fields = format_id(pid), stream.entry_fields(pid)
+                    entries.append((id_text, fields))
+                    if fields is not None:  # a redelivery, so it counts as an attempt
+                        tries = str(g.pel[pid].count + 1)
+                        records.append(["XGPEL", key, group, consumer, id_text, now, tries])
+                out.append((key, entries))
+            self._commit_group_records(records)
+            self._touch_read(key)
+        return out
+
+    def xack(self, key, group, *id_texts) -> int:
+        ids = [parse_id(t) for t in id_texts]
+        stream = self._stream_or_none(key)
+        g = None if stream is None else stream.groups.get(group)
+        if g is None:
+            return 0
+        owned = [sid for sid in dict.fromkeys(ids) if sid in g.pel]
+        if owned:
+            self._commit_group_records(
+                [["XACK", key, group, *[format_id(sid) for sid in owned]]]
+            )
+        return len(owned)
+
+    def xpending_summary(self, key, group):
+        """(total, min_id, max_id, [(consumer, count), ...]); ids None when empty."""
+        _, g = self._group_of(key, group, "xpending")
+        if not g.pel:
+            return 0, None, None, []
+        counts = sorted(g.pending_counts().items())
+        return len(g.pel), format_id(g._pel_ids[0]), format_id(g._pel_ids[-1]), counts
+
+    def xpending_range(
+        self, key, group, start, end, count, consumer=None, min_idle=None
+    ) -> list:
+        """[(id, consumer, idle_ms, delivery_count), ...]"""
+        lo, hi = parse_bound(start, True), parse_bound(end, False)
+        _, g = self._group_of(key, group, "xpending")
+        now = self._now_ms()
+        out = []
+        if count <= 0:
+            return out
+        for sid in g.pending_ids(lo, hi):
+            p = g.pel[sid]
+            idle = max(0, now - p.delivery_ms)
+            if consumer is not None and p.consumer != consumer:
+                continue
+            if min_idle is not None and idle < min_idle:
+                continue
+            out.append((format_id(sid), p.consumer, idle, p.count))
+            if len(out) >= count:
+                break
+        return out
+
+    def xinfo_groups(self, key) -> list:
+        """[(name, consumers, pending, last_delivered_id), ...] sorted by name."""
+        stream = self._stream_or_none(key)
+        if stream is None:
+            raise StreamError("ERR no such key")
+        return [
+            (g.name, len(g.consumers), len(g.pel), format_id(g.last_id))
+            for g in sorted(stream.groups.values(), key=lambda g: g.name)
+        ]
+
+    def xinfo_consumers(self, key, group) -> list:
+        """[(name, pending, idle_ms, inactive_ms), ...] sorted by name."""
+        stream = self._stream_or_none(key)
+        if stream is None:
+            raise StreamError("ERR no such key")
+        _, g = self._group_of(key, group, "xgroup")
+        now = self._now_ms()
+        pending = g.pending_counts()
+        return [
+            (
+                c.name,
+                pending.get(c.name, 0),
+                max(0, now - c.seen_ms),
+                -1 if c.active_ms < 0 else max(0, now - c.active_ms),
+            )
+            for c in sorted(g.consumers.values(), key=lambda c: c.name)
+        ]
 
     def type_of(self, key: str) -> str:
         self._evict_if_expired(key)

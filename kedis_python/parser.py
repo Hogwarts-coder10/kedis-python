@@ -120,13 +120,10 @@ class CommandParser:
                 return ["ERROR", "-ERR Malformed KESP payload"], len(raw_data)
 
         if tokens and len(tokens) > 0 and tokens[0] != "ERROR":
+            # Only the command name is normalised. Every other token is data
+            # (keys, values, field names) until a handler says otherwise, so
+            # handlers match their own options case-insensitively.
             tokens[0] = tokens[0].upper()
-            OPTION_FLAGS = {"WITHSCORES", "ALPHA", "LIMIT", "BY", "ASC", "DESC"}
-
-            tokens = [
-                t.upper() if isinstance(t, str) and t.upper() in OPTION_FLAGS else t
-                for t in tokens
-            ]
 
         return tokens, bytes_consumed
 

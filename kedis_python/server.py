@@ -75,6 +75,91 @@ def notify_stream_waiters():
     stream_waiters.clear()
 
 
+def _encode_command(tokens: list) -> bytes:
+    """A command as the KESP array a replica reads from the slipstream."""
+    body = b"".join(f"S{len(t.encode('utf-8'))}\n{t}\n".encode("utf-8") for t in tokens)
+    return f"A{len(tokens)}\n".encode("utf-8") + body
+
+
+async def broadcast_to_replicas(forwards: list, label: str) -> None:
+    """Writes already-resolved commands to every follower; drops dead ones."""
+    if not forwards:
+        return
+    console.print(
+        f"[cyan]📡 [BROADCAST] Firing {label} down the slipstream to {len(connected_replicas)} followers...[/cyan]"
+    )
+    payload = b"".join(_encode_command(forwarded) for forwarded in forwards)
+    dead_replicas = []
+    for rep_writer in connected_replicas:
+        try:
+            rep_writer.write(payload)
+            await rep_writer.drain()
+        except Exception:
+            dead_replicas.append(rep_writer)
+
+    for dead in dead_replicas:
+        connected_replicas.remove(dead)
+        console.print(
+            "[yellow]⚠️ [REPLICATION] Follower disconnected. Removed from Live Stream.[/yellow]"
+        )
+
+
+async def wait_for_stream_data(session, block_ms: int, attempt):
+    """The wait loop shared by XREAD and XREADGROUP.
+
+    `attempt` is a synchronous callable, run in a worker thread, that returns
+    (reply, records). A reply of None means "nothing yet": park until a writer
+    wakes us (or the deadline passes) and try again. Anything else, including
+    an error string, is final. Returns (reply, records); reply is None on
+    timeout.
+
+    Records from every attempt are kept, not just the last: the first pass of
+    an XREADGROUP registers its consumer even when nothing is delivered, and
+    that change has to reach replicas whatever happens next."""
+    loop = asyncio.get_running_loop()
+    deadline = None if block_ms == 0 else loop.time() + block_ms / 1000
+    carried: list = []
+
+    while True:
+        # Register BEFORE reading: a write landing between the read and the
+        # wait would otherwise be missed until the next unrelated write.
+        wake = loop.create_future()
+        stream_waiters.add(wake)
+        try:
+            try:
+                reply, records = await asyncio.to_thread(attempt)
+            except (StreamError, TypeError) as e:
+                return global_handler.error_reply(e), carried
+            carried.extend(records)
+            if reply is not None:
+                return reply, carried
+            while True:
+                if session.reader.at_eof() or session.writer.is_closing():
+                    # Nobody will get a reply, but the group changes made so
+                    # far (a new consumer, say) are real: send them on.
+                    if server_role == "master":
+                        await broadcast_to_replicas(
+                            global_handler.replication_payloads(
+                                ["XREADGROUP"], None, carried
+                            ),
+                            "XREADGROUP",
+                        )
+                    raise ConnectionResetError("client left while blocked")
+                remaining = None if deadline is None else deadline - loop.time()
+                if remaining is not None and remaining <= 0:
+                    return None, carried  # timed out: nil, like Redis
+                step = _BLOCK_POLL if remaining is None else min(_BLOCK_POLL, remaining)
+                try:
+                    await asyncio.wait_for(asyncio.shield(wake), step)
+                    break  # woken by a writer: read again
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            stream_waiters.discard(wake)
+            if not wake.done():
+                wake.cancel()
+
+
 async def blocking_xread(session, tokens: list):
     """Runs XREAD; honours BLOCK. Returns the reply object (None = nil)."""
     try:
@@ -87,44 +172,38 @@ async def blocking_xread(session, tokens: list):
     try:
         # '$' must mean "last ID right now", fixed once, before we wait.
         resolved = global_handler.resolve_stream_ids(streams)
-    except StreamError as e:
-        return f"-{e}"
-    except TypeError as e:
-        return f"-ERR {e}"
+    except (StreamError, TypeError) as e:
+        return global_handler.error_reply(e)
 
-    loop = asyncio.get_running_loop()
-    deadline = None if block_ms == 0 else loop.time() + block_ms / 1000
+    reply, _ = await wait_for_stream_data(
+        session,
+        block_ms,
+        lambda: (global_handler.xread_nonblocking(resolved, count), []),
+    )
+    return reply
 
-    while True:
-        # Register BEFORE reading: a write landing between the read and the
-        # wait would otherwise be missed until the next unrelated write.
-        wake = loop.create_future()
-        stream_waiters.add(wake)
-        try:
-            try:
-                result = await asyncio.to_thread(
-                    global_handler.xread_nonblocking, resolved, count
-                )
-            except TypeError as e:
-                return f"-ERR {e}"
-            if result is not None:
-                return result
-            while True:
-                if session.reader.at_eof() or session.writer.is_closing():
-                    raise ConnectionResetError("client left while blocked")
-                remaining = None if deadline is None else deadline - loop.time()
-                if remaining is not None and remaining <= 0:
-                    return None  # timed out: nil, like Redis
-                step = _BLOCK_POLL if remaining is None else min(_BLOCK_POLL, remaining)
-                try:
-                    await asyncio.wait_for(asyncio.shield(wake), step)
-                    break  # woken by a writer: read again
-                except asyncio.TimeoutError:
-                    continue
-        finally:
-            stream_waiters.discard(wake)
-            if not wake.done():
-                wake.cancel()
+
+async def blocking_xreadgroup(session, tokens: list):
+    """Runs XREADGROUP; honours BLOCK. Returns (reply, records): the records
+    are the group changes the read made, to be forwarded to replicas. A read of
+    a consumer's own history (an explicit ID) always answers at once."""
+    try:
+        group, consumer, count, block_ms, noack, streams = (
+            global_handler.parse_xreadgroup(tokens)
+        )
+    except StreamError:
+        block_ms = None
+    if block_ms is None:  # no BLOCK (or a syntax error the handler will report)
+        return await asyncio.to_thread(
+            global_handler.execute_records, tokens, session.writer
+        )
+    return await wait_for_stream_data(
+        session,
+        block_ms,
+        lambda: global_handler.xreadgroup_attempt(
+            group, consumer, streams, count, noack
+        ),
+    )
 
 
 async def housekeeping_loop(handler, interval: float = HOUSEKEEPING_INTERVAL):
@@ -495,10 +574,12 @@ class AsyncKedisSession:
                             continue
 
                         if cmd == "XREAD":
-                            response = await blocking_xread(self, tokens)
+                            response, records = await blocking_xread(self, tokens), []
+                        elif cmd == "XREADGROUP":
+                            response, records = await blocking_xreadgroup(self, tokens)
                         else:
-                            response = await asyncio.to_thread(
-                                global_handler.execute, tokens, self.writer
+                            response, records = await asyncio.to_thread(
+                                global_handler.execute_records, tokens, self.writer
                             )
                         kesp_bytes = KESPEncoder.encode(response)
                         await self.send(kesp_bytes)
@@ -507,35 +588,15 @@ class AsyncKedisSession:
                             notify_stream_waiters()
 
                         # 📡 PHASE 3: LIVE COMMAND FORWARDING
-                        if server_role == "master" and cmd in write_commands:
-                            console.print(
-                                f"[cyan]📡 [BROADCAST] Firing {cmd} down the slipstream to {len(connected_replicas)} followers...[/cyan]"
-                            )
-
-                            # XADD is forwarded with the ID this master assigned
-                            forwarded = global_handler.replication_tokens(
-                                tokens, response
-                            )
-                            header = f"A{len(forwarded)}\n".encode("utf-8")
-                            body = b"".join(
-                                f"S{len(t.encode('utf-8'))}\n{t}\n".encode("utf-8")
-                                for t in forwarded
-                            )
-                            broadcast_payload = header + body
-
-                            dead_replicas = []
-                            for rep_writer in connected_replicas:
-                                try:
-                                    rep_writer.write(broadcast_payload)
-                                    await rep_writer.drain()
-                                except Exception:
-                                    dead_replicas.append(rep_writer)
-
-                            for dead in dead_replicas:
-                                connected_replicas.remove(dead)
-                                console.print(
-                                    "[yellow]⚠️ [REPLICATION] Follower disconnected. Removed from Live Stream.[/yellow]"
-                                )
+                        # XADD goes out with the ID this master assigned; group
+                        # commands go out as the resolved records they produced
+                        # (nothing at all if they changed nothing).
+                        forwards = (
+                            global_handler.replication_payloads(tokens, response, records)
+                            if server_role == "master" and cmd in write_commands
+                            else []
+                        )
+                        await broadcast_to_replicas(forwards, cmd)
 
                     # 🚀 FIX: Slicing for standard commands
                     del intake_buffer[:consumed]

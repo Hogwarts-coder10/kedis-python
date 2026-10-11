@@ -64,6 +64,12 @@ class CommandHandler:
             "XREAD": self._handle_xread,
             "XDEL": self._handle_xdel,
             "XTRIM": self._handle_xtrim,
+            "XGROUP": self._handle_xgroup,
+            "XREADGROUP": self._handle_xreadgroup,
+            "XACK": self._handle_xack,
+            "XPENDING": self._handle_xpending,
+            "XINFO": self._handle_xinfo,
+            "XGAPPLY": self._handle_xgapply,  # internal: replication only
         }
 
     @property
@@ -92,15 +98,36 @@ class CommandHandler:
             "XADD",
             "XDEL",
             "XTRIM",
+            "XGROUP",
+            "XREADGROUP",
+            "XACK",
         }
+
+    # Commands whose effect is carried to replicas as resolved records.
+    GROUP_COMMANDS = frozenset({"XGROUP", "XREADGROUP", "XACK"})
+
+    # Dispatchable, but never meant for a person to type (replication only).
+    INTERNAL_COMMANDS = frozenset({"XGAPPLY"})
+
+    @property
+    def public_commands(self) -> list[str]:
+        """Every command a client may issue: what the CLI offers for
+        autocomplete and typo suggestions."""
+        return [c for c in self._commands if c not in self.INTERNAL_COMMANDS]
 
     def execute(self, tokens: list[str], client_socket=None):
         """
         Routes parsed tokens to the correct storage operations in O(1) time.
         Returns raw Python types (int, list, str, None) for the KESP Encoder.
         """
+        return self.execute_records(tokens, client_socket)[0]
+
+    def execute_records(self, tokens: list[str], client_socket=None):
+        """Like execute(), but returns (result, group_records): the resolved
+        consumer-group records this command produced, which a master forwards
+        to replicas (see replication_payloads)."""
         if not tokens:
-            return "-ERR empty command or syntax error"
+            return "-ERR empty command or syntax error", []
 
         cmd = tokens[0].upper()
         args = tokens[
@@ -110,29 +137,36 @@ class CommandHandler:
         # 🚀 TRACK A: Start the high-precision telemetry stopwatch (in nanoseconds)
         start_time = time.perf_counter_ns()
         result = None
+        records = []
 
         try:
             with self._engine_lock:
-                if cmd in self._commands:
-                    if cmd in ["SUBSCRIBE", "PUBLISH"]:
-                        handler_function = self._commands[cmd]
-                        result = handler_function(tokens, client_socket)
+                try:
+                    if cmd == "XGAPPLY" and client_socket is not None:
+                        # Internal replication command: a network client
+                        # must not be able to write raw group records.
+                        result = f"-ERR unknown command '{cmd}'"
+                    elif cmd in self._commands:
+                        if cmd in ["SUBSCRIBE", "PUBLISH"]:
+                            handler_function = self._commands[cmd]
+                            result = handler_function(tokens, client_socket)
+                        else:
+                            handler_function = self._commands[cmd]
+                            # Note: Depending on how your handlers are registered,
+                            # they might expect 'tokens' or 'args'. Keeping your existing call:
+                            result = handler_function(tokens)
                     else:
-                        handler_function = self._commands[cmd]
-                        # Note: Depending on how your handlers are registered,
-                        # they might expect 'tokens' or 'args'. Keeping your existing call:
-                        result = handler_function(tokens)
-                    return result
-                else:
-                    result = f"-ERR unknown command '{cmd}'"
-                    return result
+                        result = f"-ERR unknown command '{cmd}'"
+                finally:
+                    records = self.store.drain_group_records()
+            return result, records
 
         except TypeError as e:
             result = f"-ERR wrong number of arguments for '{cmd}' command"
-            return result
+            return result, records
         except Exception as e:
             result = f"-ERR {str(e)}"
-            return result
+            return result, records
 
         finally:
             # 🚀 TRACK A: Stop the stopwatch, convert nanoseconds to microseconds
@@ -714,6 +748,255 @@ class CommandHandler:
             return f"-{e}"
         except TypeError as e:
             return f"-ERR {e}"
+
+    # ------------------------------------------------------------------
+    # CONSUMER GROUPS
+    # ------------------------------------------------------------------
+    @staticmethod
+    def error_reply(e) -> str:
+        """An error string the KESP encoder turns into an error reply. Codes
+        such as NOGROUP/BUSYGROUP are kept as the start of the message."""
+        msg = str(e)
+        return f"-{msg}" if msg.startswith("ERR ") else f"-ERR {msg}"
+
+    def _guarded(self, call):
+        try:
+            return call()
+        except (StreamError, TypeError) as e:
+            return self.error_reply(e)
+
+    @staticmethod
+    def _format_group_entries(entries) -> list:
+        # fields is None for a pending entry whose stream entry was deleted
+        return [
+            [BulkString(sid), None if fields is None else [BulkString(x) for x in fields]]
+            for sid, fields in entries
+        ]
+
+    def _handle_xgroup(self, tokens: list[str]):
+        """XGROUP CREATE key group id|$ [MKSTREAM] | SETID key group id|$ |
+        DESTROY key group | CREATECONSUMER key group c | DELCONSUMER key group c"""
+        if len(tokens) < 2:
+            return "-ERR wrong number of arguments for 'xgroup' command"
+        sub = tokens[1].upper()
+        store, n = self.store, len(tokens)
+
+        def create():
+            mkstream = False
+            for word in (w.upper() for w in tokens[5:]):
+                if word == "MKSTREAM":
+                    mkstream = True
+                elif word == "ENTRIESREAD":
+                    raise StreamError("ERR ENTRIESREAD is not supported")
+                else:
+                    raise StreamError("ERR syntax error")
+            return store.xgroup_create(tokens[2], tokens[3], tokens[4], mkstream)
+
+        def setid():
+            if n > 5:
+                if tokens[5].upper() == "ENTRIESREAD":
+                    raise StreamError("ERR ENTRIESREAD is not supported")
+                raise StreamError("ERR syntax error")
+            return store.xgroup_setid(tokens[2], tokens[3], tokens[4])
+
+        arity = {"CREATE": 5, "SETID": 5, "DESTROY": 4, "CREATECONSUMER": 5, "DELCONSUMER": 5}
+        if sub not in arity:
+            return f"-ERR unknown subcommand '{tokens[1]}' for 'xgroup' command"
+        if n < arity[sub]:
+            return "-ERR wrong number of arguments for 'xgroup' command"
+        if sub == "CREATE":
+            return self._guarded(create)
+        if sub == "SETID":
+            return self._guarded(setid)
+        if n != arity[sub]:
+            return "-ERR wrong number of arguments for 'xgroup' command"
+        if sub == "DESTROY":
+            return self._guarded(lambda: store.xgroup_destroy(tokens[2], tokens[3]))
+        if sub == "CREATECONSUMER":
+            return self._guarded(
+                lambda: store.xgroup_createconsumer(tokens[2], tokens[3], tokens[4])
+            )
+        return self._guarded(
+            lambda: store.xgroup_delconsumer(tokens[2], tokens[3], tokens[4])
+        )
+
+    @staticmethod
+    def parse_xreadgroup(tokens: list):
+        """XREADGROUP GROUP group consumer [COUNT n] [BLOCK ms] [NOACK]
+        STREAMS key... id...  Returns (group, consumer, count, block_ms, noack,
+        [(key, id), ...]); count None = unlimited, block_ms None = no BLOCK."""
+        group = consumer = count = block_ms = None
+        noack = False
+        i = 1
+        while i < len(tokens):
+            word = tokens[i].upper()
+            if word == "GROUP":
+                if i + 2 >= len(tokens):
+                    raise StreamError("ERR syntax error")
+                group, consumer = tokens[i + 1], tokens[i + 2]
+                i += 3
+            elif word == "COUNT":
+                if i + 1 >= len(tokens):
+                    raise StreamError("ERR syntax error")
+                n = CommandHandler._to_int(tokens[i + 1])
+                count = None if n <= 0 else n  # Redis: COUNT 0 means no limit
+                i += 2
+            elif word == "BLOCK":
+                if i + 1 >= len(tokens):
+                    raise StreamError("ERR syntax error")
+                block_ms = CommandHandler._to_int(
+                    tokens[i + 1], "ERR timeout is not an integer or out of range"
+                )
+                if block_ms < 0:
+                    raise StreamError("ERR timeout is negative")
+                i += 2
+            elif word == "NOACK":
+                noack = True
+                i += 1
+            elif word == "STREAMS":
+                i += 1
+                break
+            else:
+                raise StreamError("ERR syntax error")
+        else:
+            raise StreamError("ERR syntax error")
+        if group is None:
+            raise StreamError("ERR syntax error")
+        rest = tokens[i:]
+        if not rest or len(rest) % 2:
+            raise StreamError(
+                "ERR Unbalanced 'xreadgroup' list of streams: for each stream "
+                "key an ID or '>' must be specified."
+            )
+        half = len(rest) // 2
+        return group, consumer, count, block_ms, noack, list(zip(rest[:half], rest[half:]))
+
+    def _xreadgroup_reply(self, group, consumer, streams, count, noack):
+        out = self.store.xreadgroup(group, consumer, streams, count, noack)
+        if not out:
+            return None
+        return [[BulkString(key), self._format_group_entries(e)] for key, e in out]
+
+    def _handle_xreadgroup(self, tokens: list[str]):
+        # Executed inline (also inside MULTI) this never blocks: BLOCK is
+        # honoured by the async server, like XREAD.
+        def run():
+            group, consumer, count, _block, noack, streams = self.parse_xreadgroup(tokens)
+            return self._xreadgroup_reply(group, consumer, streams, count, noack)
+
+        return self._guarded(run)
+
+    def xreadgroup_attempt(self, group, consumer, streams, count, noack):
+        """One non-blocking XREADGROUP pass for the async server's wait loop.
+        Returns (reply, records): reply is None when there is nothing yet,
+        and the records must be forwarded to replicas."""
+        with self._engine_lock:
+            try:
+                reply = self._guarded(
+                    lambda: self._xreadgroup_reply(group, consumer, streams, count, noack)
+                )
+            finally:
+                records = self.store.drain_group_records()
+        return reply, records
+
+    def _handle_xack(self, tokens: list[str]):
+        if len(tokens) < 4:
+            return "-ERR wrong number of arguments for 'xack' command"
+        return self._guarded(lambda: self.store.xack(tokens[1], tokens[2], *tokens[3:]))
+
+    def _handle_xpending(self, tokens: list[str]):
+        """XPENDING key group [[IDLE min-idle] start end count [consumer]]"""
+        n = len(tokens)
+        if n < 3:
+            return "-ERR wrong number of arguments for 'xpending' command"
+        key, group = tokens[1], tokens[2]
+
+        def run():
+            if n == 3:
+                total, lo, hi, consumers = self.store.xpending_summary(key, group)
+                return [
+                    total,
+                    None if lo is None else BulkString(lo),
+                    None if hi is None else BulkString(hi),
+                    [[BulkString(c), BulkString(str(k))] for c, k in consumers] or None,
+                ]
+            i, min_idle = 3, None
+            if tokens[i].upper() == "IDLE":
+                if i + 1 >= n:
+                    raise StreamError("ERR syntax error")
+                min_idle = self._to_int(tokens[i + 1])
+                i += 2
+            if n - i not in (3, 4):
+                raise StreamError("ERR syntax error")
+            count = self._to_int(tokens[i + 2])
+            consumer = tokens[i + 3] if n - i == 4 else None
+            rows = self.store.xpending_range(
+                key, group, tokens[i], tokens[i + 1], count, consumer, min_idle
+            )
+            return [[BulkString(sid), BulkString(c), idle, k] for sid, c, idle, k in rows]
+
+        return self._guarded(run)
+
+    def _handle_xinfo(self, tokens: list[str]):
+        """XINFO GROUPS key | XINFO CONSUMERS key group"""
+        if len(tokens) < 3:
+            return "-ERR wrong number of arguments for 'xinfo' command"
+        sub = tokens[1].upper()
+
+        def groups():
+            return [
+                [
+                    "name", BulkString(name),
+                    "consumers", consumers,
+                    "pending", pending,
+                    "last-delivered-id", BulkString(last_id),
+                    "entries-read", None,  # not tracked
+                    "lag", None,  # not tracked
+                ]
+                for name, consumers, pending, last_id in self.store.xinfo_groups(tokens[2])
+            ]
+
+        def consumers():
+            return [
+                [
+                    "name", BulkString(name),
+                    "pending", pending,
+                    "idle", idle,
+                    "inactive", inactive,
+                ]
+                for name, pending, idle, inactive in self.store.xinfo_consumers(
+                    tokens[2], tokens[3]
+                )
+            ]
+
+        if sub == "GROUPS" and len(tokens) == 3:
+            return self._guarded(groups)
+        if sub == "CONSUMERS" and len(tokens) == 4:
+            return self._guarded(consumers)
+        if sub in ("GROUPS", "CONSUMERS"):
+            return "-ERR wrong number of arguments for 'xinfo' command"
+        return f"-ERR unknown subcommand '{tokens[1]}' for 'xinfo' command (supported: GROUPS, CONSUMERS)"
+
+    def _handle_xgapply(self, tokens: list[str]):
+        """Internal: XGAPPLY KIND key args... applies one resolved group
+        record sent by a master. execute() refuses it from network clients."""
+        if len(tokens) < 4:
+            return "-ERR wrong number of arguments for 'xgapply' command"
+
+        def apply():
+            self.store.apply_group_record(tokens[1:])
+            return "OK"
+
+        return self._guarded(apply)
+
+    def replication_payloads(self, tokens: list, response, records: list) -> list:
+        """The commands a master forwards to replicas for one executed write.
+        Group commands forward the resolved records they produced (wrapped in
+        XGAPPLY), never the raw command: a replica re-running XREADGROUP
+        would choose its own entries and timestamps."""
+        if tokens and tokens[0].upper() in self.GROUP_COMMANDS:
+            return [["XGAPPLY", *record] for record in records]
+        return [self.replication_tokens(tokens, response)]
 
     def run_housekeeping(self) -> dict:
         """Entry point for the background task: one pass under the engine lock."""
