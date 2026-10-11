@@ -718,6 +718,20 @@ class CommandHandler:
         except TypeError as e:
             return f"-ERR {e}"
 
+    @staticmethod
+    def requested_block_ms(tokens: list):
+        """The BLOCK timeout (ms) an XREAD/XREADGROUP asked for, or None if it
+        has no BLOCK, is malformed, or is some other command."""
+        try:
+            cmd = tokens[0].upper() if tokens else ""
+            if cmd == "XREAD":
+                return CommandHandler.parse_xread(tokens)[1]
+            if cmd == "XREADGROUP":
+                return CommandHandler.parse_xreadgroup(tokens)[3]
+        except StreamError:
+            pass
+        return None
+
     def resolve_stream_ids(self, streams: list) -> list:
         with self._engine_lock:
             return self.store.xresolve_ids(streams)

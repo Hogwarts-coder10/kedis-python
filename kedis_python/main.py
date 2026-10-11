@@ -591,6 +591,14 @@ class KedisClient:
                         return
                     if not tokens:
                         return
+                    if CommandHandler.requested_block_ms(tokens) is not None:
+                        # Nothing else can write in standalone mode, so a
+                        # blocked read could never be woken: say why it
+                        # answers at once instead of looking broken.
+                        console.print(
+                            "[dim]standalone mode has no other clients to wake a "
+                            "blocked read, so BLOCK returns immediately[/dim]"
+                        )
                     raw_response = self.handler.execute(tokens)
 
                 # Route the local Python response through the KESP Exhaust Encoder
