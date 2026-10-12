@@ -37,6 +37,14 @@ Checks the remaining lifespan of a volatile key.
 
 ---
 
+### `HELP [command|topic]`
+Shows the command reference. Without an argument, it prints an overview of all available commands and topics. Use `HELP <command>` to see detailed syntax, return values, and examples for a specific command.
+* **Returns:** A formatted help panel in the CLI.
+* **Example:** `HELP` or `HELP ZADD`
+
+---
+
+
 ## 🛡️ Transactions & Concurrency (Optimistic Locking)
 
 Kedis ensures thread-safe data mutations through isolated execution queues and version tracking.
