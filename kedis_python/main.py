@@ -17,6 +17,7 @@ if (
 
 
 from .commands import CommandHandler
+from .help_data import render, topics_hint
 from .network import NetworkManager
 from .parser import (
     BulkString,
@@ -503,69 +504,79 @@ class KedisClient:
             return True
 
         if cmd == "HELP":
-           if cmd == "HELP":
-            help_text = (
-                "[bold cyan]Core String Commands[/bold cyan]\n"
-                "  [green]SET[/green] key val          : Store a string value\n"
-                "  [green]GET[/green] key              : Retrieve a value\n"
-                "  [green]DEL[/green] key              : Remove a key\n"
-                "  [green]EXPIRE[/green] key sec       : Set a time-to-live (TTL)\n"
-                "  [green]TTL[/green] key              : Check remaining lifespan\n"
-                "  [green]FLUSHALL[/green]            : Wipe the entire database\n\n"
-                "[bold cyan]List Commands (Ordered)[/bold cyan]\n"
-                "  [green]LPUSH / RPUSH[/green] k v... : Push to head or tail\n"
-                "  [green]LPOP / RPOP[/green] key     : Pop from head or tail\n"
-                "  [green]LRANGE[/green] k start stop  : Get a list slice\n\n"
-                "[bold cyan]Set Commands (Unique)[/bold cyan]\n"
-                "  [green]SADD[/green] key val...      : Add unique members\n"
-                "  [green]SMEMBERS[/green] key         : View all members\n"
-                "  [green]SREM[/green] key val...      : Remove members\n\n"
-                "[bold cyan]Hash Commands (Telemetry)[/bold cyan]\n"
-                "  [green]HSET[/green] key field val   : Set a hash field\n"
-                "  [green]HGET[/green] key field       : Get a hash field\n"
-                "  [green]HGETALL[/green] key          : Get the full dossier\n\n"
-                "[bold cyan]Sorted Set Commands (Leaderboard)[/bold cyan]\n"
-                "  [green]ZADD[/green] key score val     : Add scored members\n"
-                "  [green]ZRANGE[/green] key start stop  : Get the sorted leaderboard\n\n"
-                "[bold cyan]Bitmap Commands (Bit Arrays)[/bold cyan]\n"
-                "  [green]SETBIT[/green] key offset bit : Set or clear a single bit\n"
-                "  [green]GETBIT[/green] key offset     : Read a single bit value\n"
-                "  [green]BITCOUNT[/green] key [s e]    : Count the number of set bits (1s)\n"
-                "  [green]BITOP[/green] op dest src...  : Bitwise AND, OR, XOR, or NOT\n\n"
-                "[bold cyan]HyperLogLog Commands (Cardinality)[/bold cyan]\n"
-                "  [green]PFADD[/green] key elem...     : Add elements (1 if the estimate changed)\n"
-                "  [green]PFCOUNT[/green] key...        : Approx. unique count (union if many keys)\n"
-                "  [green]PFMERGE[/green] dest src...   : Merge HyperLogLogs into dest\n\n"
-                "[bold cyan]Stream Commands (Append-only Logs)[/bold cyan]\n"
-                "  [green]XADD[/green] key [MAXLEN n] id|* f v... : Append an entry\n"
-                "  [green]XLEN[/green] key               : Number of entries\n"
-                "  [green]XRANGE[/green] key start end [COUNT n]  : Entries between IDs (- and + = ends)\n"
-                "  [green]XREVRANGE[/green] key end start [COUNT n] : Same, newest first\n"
-                "  [green]XREAD[/green] [COUNT n] [BLOCK ms] STREAMS key... id...  : Read new entries ($ = only new)\n"
-                "  [green]XDEL[/green] key id...         : Delete entries\n"
-                "  [green]XTRIM[/green] key MAXLEN|MINID n : Trim old entries\n\n"
-                "[bold purple]Client Commands (Dashboard)[/bold purple]\n"
-                "  [yellow]KEYS[/yellow]                 : Radar of all active keys\n"
-                "  [yellow]COMPACT[/yellow]              : Compress the AOF log file\n"
-                "  [yellow]SLOWLOG[/yellow]              : View slow query telemetry (GET, LEN, RESET)\n"
-                "  [yellow]LATENCY[/yellow]              : View async event loop lag (LAG, DOCTOR)\n"
-                "  [yellow]MODE[/yellow]                 : View current drivetrain (TCP/Local)\n"
-                "  [yellow]INFO[/yellow]                 : View engine telemetry and version\n"
-                "  [yellow]HELP[/yellow]                 : Show this command reference\n"
-                "  [yellow]DEBUG[/yellow]                : Toggle diagnostic logs\n"
-                "  [yellow]DISCONNECT[/yellow]           : Manually drop TCP link, go Standalone\n"
-                "  [yellow]RECONNECT[/yellow]            : Manually reconnect to TCP server\n"
-                "  [yellow]STATS[/yellow]                : Deep Memory Map\n"
-                "  [yellow]CONFIG[/yellow]               : Hot-swap engine dials mid-flight\n"
-                "  [yellow]CLEAR / CLS[/yellow]          : Clear the terminal screen\n"
-                "  [yellow]EXIT / QUIT[/yellow]          : Shut down the client\n"
-            )
-
-            UI.print_panel(help_text, "Kedis Command Reference", "yellow")
-            return True
-
-            UI.print_panel(help_text, "Kedis Command Reference", "yellow")
-            return True
+            tokens = raw_input.split()
+            
+            if len(tokens) == 1:
+                # User just typed "HELP" - show your existing global cheat sheet
+                help_text = (
+                    "[bold cyan]Core String Commands[/bold cyan]\n"
+                    "  [green]SET[/green] key val          : Store a string value\n"
+                    "  [green]GET[/green] key              : Retrieve a value\n"
+                    "  [green]DEL[/green] key              : Remove a key\n"
+                    "  [green]EXPIRE[/green] key sec       : Set a time-to-live (TTL)\n"
+                    "  [green]TTL[/green] key              : Check remaining lifespan\n"
+                    "  [green]FLUSHALL[/green]            : Wipe the entire database\n\n"
+                    "[bold cyan]List Commands (Ordered)[/bold cyan]\n"
+                    "  [green]LPUSH / RPUSH[/green] k v... : Push to head or tail\n"
+                    "  [green]LPOP / RPOP[/green] key     : Pop from head or tail\n"
+                    "  [green]LRANGE[/green] k start stop  : Get a list slice\n\n"
+                    "[bold cyan]Set Commands (Unique)[/bold cyan]\n"
+                    "  [green]SADD[/green] key val...      : Add unique members\n"
+                    "  [green]SMEMBERS[/green] key         : View all members\n"
+                    "  [green]SREM[/green] key val...      : Remove members\n\n"
+                    "[bold cyan]Hash Commands (Telemetry)[/bold cyan]\n"
+                    "  [green]HSET[/green] key field val   : Set a hash field\n"
+                    "  [green]HGET[/green] key field       : Get a hash field\n"
+                    "  [green]HGETALL[/green] key          : Get the full dossier\n\n"
+                    "[bold cyan]Sorted Set Commands (Leaderboard)[/bold cyan]\n"
+                    "  [green]ZADD[/green] key score val     : Add scored members\n"
+                    "  [green]ZRANGE[/green] key start stop  : Get the sorted leaderboard\n\n"
+                    "[bold cyan]Bitmap Commands (Bit Arrays)[/bold cyan]\n"
+                    "  [green]SETBIT[/green] key offset bit : Set or clear a single bit\n"
+                    "  [green]GETBIT[/green] key offset     : Read a single bit value\n"
+                    "  [green]BITCOUNT[/green] key [s e]    : Count the number of set bits (1s)\n"
+                    "  [green]BITOP[/green] op dest src...  : Bitwise AND, OR, XOR, or NOT\n\n"
+                    "[bold cyan]HyperLogLog Commands (Cardinality)[/bold cyan]\n"
+                    "  [green]PFADD[/green] key elem...     : Add elements (1 if the estimate changed)\n"
+                    "  [green]PFCOUNT[/green] key...        : Approx. unique count (union if many keys)\n"
+                    "  [green]PFMERGE[/green] dest src...   : Merge HyperLogLogs into dest\n\n"
+                    "[bold cyan]Stream Commands (Append-only Logs)[/bold cyan]\n"
+                    "  [green]XADD[/green] key [MAXLEN n] id|* f v... : Append an entry\n"
+                    "  [green]XLEN[/green] key               : Number of entries\n"
+                    "  [green]XRANGE[/green] key start end [COUNT n]  : Entries between IDs (- and + = ends)\n"
+                    "  [green]XREVRANGE[/green] key end start [COUNT n] : Same, newest first\n"
+                    "  [green]XREAD[/green] [COUNT n] [BLOCK ms] STREAMS key... id...  : Read new entries ($ = only new)\n"
+                    "  [green]XDEL[/green] key id...         : Delete entries\n"
+                    "  [green]XTRIM[/green] key MAXLEN|MINID n : Trim old entries\n\n"
+                    "[bold purple]Client Commands (Dashboard)[/bold purple]\n"
+                    "  [yellow]KEYS[/yellow]                 : Radar of all active keys\n"
+                    "  [yellow]COMPACT[/yellow]              : Compress the AOF log file\n"
+                    "  [yellow]SLOWLOG[/yellow]              : View slow query telemetry (GET, LEN, RESET)\n"
+                    "  [yellow]LATENCY[/yellow]              : View async event loop lag (LAG, DOCTOR)\n"
+                    "  [yellow]MODE[/yellow]                 : View current drivetrain (TCP/Local)\n"
+                    "  [yellow]INFO[/yellow]                 : View engine telemetry and version\n"
+                    "  [yellow]HELP[/yellow]                 : Show this command reference\n"
+                    "  [yellow]DEBUG[/yellow]                : Toggle diagnostic logs\n"
+                    "  [yellow]DISCONNECT[/yellow]           : Manually drop TCP link, go Standalone\n"
+                    "  [yellow]RECONNECT[/yellow]            : Manually reconnect to TCP server\n"
+                    "  [yellow]STATS[/yellow]                : Deep Memory Map\n"
+                    "  [yellow]CONFIG[/yellow]               : Hot-swap engine dials mid-flight\n"
+                    "  [yellow]CLEAR / CLS[/yellow]          : Clear the terminal screen\n"
+                    "  [yellow]EXIT / QUIT[/yellow]          : Shut down the client\n"
+                )
+                UI.print_panel(help_text, "Kedis Command Reference", "yellow")
+                console.print(topics_hint())
+                return True
+                
+            else:
+                target = tokens[1]
+                help_output = render(target)
+                
+                if help_output:
+                    console.print(f"\n{help_output}\n")
+                else:
+                    console.print(f"[bold red](error) No detailed help available for '{target.upper()}'[/bold red]")
+                return True
 
         return False
 
