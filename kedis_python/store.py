@@ -1,6 +1,7 @@
 import base64
 import itertools
 import json
+import math
 import os
 import sys
 import threading
@@ -1133,10 +1134,13 @@ class KedisStore:
             raise TypeError(
                 "WRONGTYPE Operation against a key holding the wrong kind of value"
             )
+        score = float(score)
+        if math.isnan(score):
+            raise ValueError("value is not a valid float")
         if key not in self._data:
             self._data[key] = SkipList()
 
-        is_new = self._data[key].insert(float(score), member)
+        is_new = self._data[key].insert(score, member)
         self._log_operation("ZADD", key, score, member)
         self._touch_write(key)
         return is_new

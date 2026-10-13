@@ -203,7 +203,7 @@ Returns every field and value.
 Unique members ordered by a floating-point score, backed by a skip list with rank-aware spans, so ranked range queries stay fast. Members with equal scores are ordered by name.
 
 ### `ZADD key score member [score member ...]`
-Adds members, or updates the score of members that already exist. Pairs are applied one at a time from left to right, so if a later score isn't a valid number the error is returned but the pairs before it stay added.
+Adds members, or updates the score of members that already exist. Every score is checked before anything is applied, so if any score isn't a valid number (`nan` is rejected; `inf` and `-inf` are allowed) the error is returned and nothing is added or changed. If a member appears twice, the last score wins.
 * **Returns:** `(integer)` How many members were **newly** added. Score updates are not counted.
 * **Example:** `ZADD leaderboard 100 karthik 250 ada`
 

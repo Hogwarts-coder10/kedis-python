@@ -146,10 +146,6 @@ class TestDocumentedBehaviour:
 class TestDocumentedLimits:
     """Current behaviour the docs list as limits. If you fix one, update the docs."""
 
-    def test_zadd_applies_pairs_one_at_a_time(self, h):
-        assert run(h, "ZADD z 1 a x b").startswith("-ERR")
-        assert run(h, "ZRANGE z 0 -1") == ["a"]  # the pair before the bad score stayed
-
     def test_hset_takes_a_single_field(self, h):
         run(h, "HSET u a 1 b 2")
         assert run(h, "HGETALL u") == ["a", "1 b 2"]

@@ -194,9 +194,9 @@ _ENTRIES = [
     _c(
         "ZADD", "ZADD key score member [score member ...]",
         "Add members to a sorted set, or update scores",
-        "Members with equal scores are ordered by name. Pairs are applied one at a time from "
-        "left to right, so if a later score isn't a valid number the error is returned but the "
-        "pairs before it stay added.",
+        "Members with equal scores are ordered by name. Every score is checked "
+        "before anything is applied, so one bad score (nan is rejected; inf and -inf are "
+        "allowed) means nothing is added or changed. If a member repeats, the last score wins.",
         "(integer) how many members were newly added (score updates aren't counted)",
         ["ZADD leaderboard 100 karthik 250 ada"],
     ),

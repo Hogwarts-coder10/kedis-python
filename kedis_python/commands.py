@@ -1,3 +1,4 @@
+import math
 import threading
 import time
 from typing import Any
@@ -386,9 +387,15 @@ class CommandHandler:
         key = tokens[1]
         added = 0
         try:
+            # Validate every pair before applying any: a bad score anywhere
+            # means nothing is added.
+            pairs = []
             for i in range(2, len(tokens), 2):
                 score = float(tokens[i])
-                member = tokens[i + 1]
+                if math.isnan(score):
+                    raise ValueError
+                pairs.append((score, tokens[i + 1]))
+            for score, member in pairs:
                 added += self.store.zadd(key, score, member)
             return added
         except ValueError:
