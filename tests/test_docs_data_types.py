@@ -146,12 +146,6 @@ class TestDocumentedBehaviour:
 class TestDocumentedLimits:
     """Current behaviour the docs list as limits. If you fix one, update the docs."""
 
-    def test_lrange_supports_only_minus_one_as_a_negative_index(self, h):
-        run(h, "RPUSH l a b c")
-        assert run(h, "LRANGE l 1 -1") == ["b", "c"]
-        assert run(h, "LRANGE l -2 -1").startswith("-ERR")
-        assert run(h, "LRANGE l 0 -2").startswith("-ERR")
-
     def test_zadd_applies_pairs_one_at_a_time(self, h):
         assert run(h, "ZADD z 1 a x b").startswith("-ERR")
         assert run(h, "ZRANGE z 0 -1") == ["a"]  # the pair before the bad score stayed

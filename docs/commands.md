@@ -102,10 +102,9 @@ Removes and returns the last element.
 * **Example:** `RPOP tasks`
 
 ### `LRANGE key start stop`
-Returns the elements from index `start` to index `stop`, both inclusive. Index `0` is the head. `-1` as `stop` means "through the last element", and a `stop` past the end is clamped.
+Returns the elements from index `start` to index `stop`, both inclusive. Index `0` is the head. Negative indexes count from the tail (`-1` is the last element, `-2` the one before it), so `LRANGE tasks 0 -1` is the whole list. An out-of-range `start` is clamped to the head, a `stop` past the end is clamped to the tail, and an empty or inverted range returns an empty Array.
 * **Returns:** An Array of elements, or an empty Array if the key doesn't exist.
-* **Example:** `LRANGE tasks 0 -1`
-* **Limit:** `-1` is the only negative index supported, and only as `stop`. A negative `start` (or any other negative `stop`) returns an error.
+* **Example:** `LRANGE tasks 0 -1`, or `LRANGE tasks -2 -1` for the last two elements
 
 ```
 > RPUSH tasks a b c

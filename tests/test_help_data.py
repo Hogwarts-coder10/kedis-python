@@ -151,12 +151,6 @@ class TestExamplesRun:
 
 
 class TestNotesArePinned:
-    def test_lrange_only_supports_minus_one_as_stop(self, h):
-        run(h, "RPUSH l a b c")
-        assert run(h, "LRANGE l 0 -1") == ["a", "b", "c"]
-        assert str(run(h, "LRANGE l -2 -1")).startswith("-ERR")
-        assert str(run(h, "LRANGE l 0 -2")).startswith("-ERR")
-
     def test_del_and_exists_take_a_single_key(self, h):
         run(h, "SET a 1")
         run(h, "SET b 2")

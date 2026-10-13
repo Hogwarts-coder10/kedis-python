@@ -967,8 +967,18 @@ class KedisStore:
             )
 
         target_list = self._data[key]
-        actual_stop = None if stop == -1 else stop + 1
-        return list(itertools.islice(target_list, start, actual_stop))
+        length = len(target_list)
+        # Negative indexes count from the tail (-1 is the last element); an
+        # out-of-range start is clamped to the head, a stop past the end to
+        # the tail, and an inverted or empty range yields [].
+        if start < 0:
+            start = max(length + start, 0)
+        if stop < 0:
+            stop = length + stop
+        stop = min(stop, length - 1)
+        if start > stop:
+            return []
+        return list(itertools.islice(target_list, start, stop + 1))
 
     def rpush(self, key: str, *values: str) -> int:
         self._evict_if_expired(key)

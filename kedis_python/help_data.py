@@ -139,14 +139,11 @@ _ENTRIES = [
     _c(
         "LRANGE", "LRANGE key start stop",
         "Get a slice of a list by index",
-        "Index 0 is the head and both ends are inclusive. A stop of -1 means 'through the last "
-        "element'; a stop past the end is clamped.",
+        "Index 0 is the head and both ends are inclusive. Negative indexes count from the tail "
+        "(-1 is the last element), so 0 -1 is the whole list. A start before the head and a stop "
+        "past the end are clamped; an empty or inverted range gives an empty array.",
         "an array of elements (empty if the key doesn't exist)",
-        ["LRANGE tasks 0 -1", "LRANGE tasks 0 2"],
-        # Current limit, also in docs/commands.md and pinned by
-        # tests/test_docs_data_types.py: update all three when it is fixed.
-        notes=["-1 is the only negative index supported, and only as stop. Any other negative "
-               "index returns an error."],
+        ["LRANGE tasks 0 -1", "LRANGE tasks 0 2", "LRANGE tasks -2 -1"],
     ),
     # ------------------------------------------------------------------- sets
     _c(
