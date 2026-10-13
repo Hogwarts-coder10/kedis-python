@@ -431,7 +431,7 @@ class KedisClient:
             return True
 
         if cmd == "INFO":
-            version = "0.1.4"
+            version = "0.1.5"
             codename = "Echo"
 
             if self.local_mode:

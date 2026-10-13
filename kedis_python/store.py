@@ -1755,12 +1755,12 @@ class KedisStore:
         self._evict_if_expired(key)
         self._touch_read(key)
         if key not in self._data:
-            return "None"
+            return "none"
         val = self._data[key]
         if isinstance(val, deque):
-            return "List"
+            return "list"
         elif isinstance(val, set):
-            return "Set"
+            return "set"
         elif isinstance(val, dict):
             return "hash"
         elif isinstance(val, SkipList):

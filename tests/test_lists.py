@@ -35,7 +35,7 @@ def run_diagnostics():
         print("\n⏩ Testing TYPE_OF...")
         key_type = store.type_of("race_cars")
         print(f"  Type detected: {key_type}")
-        assert key_type == "List", "TYPE_OF failed to recognize deque as a List!"
+        assert key_type == "list", "TYPE_OF failed to recognize deque as a List!"
         print("✓ Type checking successful.")
 
         # 4. Test Pop Mechanics

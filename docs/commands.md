@@ -21,6 +21,11 @@ Removes one or more specified keys from the storage engine. Ignores keys that do
 * **Returns:** `(integer)` The number of keys successfully removed.
 * **Example:** `DEL session_123 session_456`
 
+### `TYPE key`
+Reports the type of the value stored at a key. The names are lowercase: `string`, `list`, `set`, `hash`, `zset` or `stream`. Bitmaps and HyperLogLogs are strings underneath, so they report `string`, as in Redis. `KEYS` uses the same names.
+* **Returns:** The type name as a string, or `none` if the key does not exist.
+* **Example:** `TYPE tasks`
+
 ---
 
 ## ⏳ Lifespan & Expiration

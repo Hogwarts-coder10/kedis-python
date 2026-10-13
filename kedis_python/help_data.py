@@ -70,9 +70,12 @@ _ENTRIES = [
     _c(
         "TYPE", "TYPE key",
         "Get the type of a key's value",
-        "Bitmaps and HyperLogLogs are strings underneath, so they report string, as in Redis.",
-        "the type name (string, hash, zset, stream, ...), or (nil) if the key doesn't exist",
-        ["TYPE tasks"],
+        "The names are lowercase: string, list, set, hash, zset or stream. Bitmaps and "
+        "HyperLogLogs are strings underneath, so they report string, as in Redis. A key that "
+        "doesn't exist reports none.",
+        "the type name as a string (string, list, set, hash, zset, stream), or none if the key "
+        "doesn't exist",
+        ["TYPE tasks", "TYPE missing"],
     ),
     _c(
         "KEYS", "KEYS",
