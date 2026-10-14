@@ -169,6 +169,76 @@ class UI:
         else:
             console.print(f"[bold red]{response}[/bold red]")
 
+    # HOUSEKEEP counters, in display order: (name, label, what it means).
+    # `fixes` are the counters that mean something was repaired or freed.
+    HOUSEKEEP_ROWS = (
+        ("expired", "Expired keys swept", "keys past their TTL that nobody had touched"),
+        ("expire_orphans", "Orphan expiry entries", "TTL records whose key was already gone"),
+        ("lru_orphans", "Orphan LRU entries", "eviction slots held by keys that no longer exist"),
+        ("lru_adopted", "Untracked keys adopted", "keys the LRU had lost sight of, now first to evict"),
+        ("reclaimed_bytes", "Memory reclaimed", "wasted container space given back"),
+        ("duration_ms", "Duration", "time the pass took"),
+        ("keys", "Keys now", "keys in the store after the pass"),
+    )
+    HOUSEKEEP_FIXES = ("expired", "expire_orphans", "lru_orphans", "lru_adopted", "reclaimed_bytes")
+
+    @staticmethod
+    def _human_bytes(n):
+        size = float(n)
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+            size /= 1024
+
+    @staticmethod
+    def render_housekeep(response):
+        """Draws the HOUSEKEEP report (name:value lines) as a table. Anything
+        that isn't a report (an error) is printed as plain text."""
+        counters = {}
+        for line in str(response).split("\n"):
+            name, sep, value = line.partition(":")
+            if not sep or " " in name:
+                console.print(f"[bold red]{escape(str(response))}[/bold red]")
+                return
+            counters[name.strip()] = value.strip()
+
+        table = Table(
+            title="🧹 Housekeeping Pass",
+            border_style="cyan",
+            title_justify="left",
+        )
+        table.add_column("Check", style="cyan", no_wrap=True)
+        table.add_column("Result", justify="right", no_wrap=True)
+        table.add_column("What it means", style="dim")
+
+        def cell(name, value):
+            if name == "reclaimed_bytes" and value.isdigit():
+                shown = UI._human_bytes(int(value))
+            elif name == "duration_ms":
+                shown = f"{value} ms"
+            else:
+                shown = value
+            fixed = name in UI.HOUSEKEEP_FIXES and value not in ("0", "")
+            return f"[bold green]{escape(shown)}[/bold green]" if fixed else f"[yellow]{escape(shown)}[/yellow]"
+
+        known = {name for name, _, _ in UI.HOUSEKEEP_ROWS}
+        for name, label, meaning in UI.HOUSEKEEP_ROWS:
+            if name in counters:
+                table.add_row(label, cell(name, counters[name]), meaning)
+        for name, value in counters.items():  # a counter added later still shows up
+            if name not in known:
+                table.add_row(escape(name), f"[yellow]{escape(value)}[/yellow]", "")
+
+        console.print(table)
+        changed = any(
+            counters.get(n, "0") not in ("0", "") for n in UI.HOUSEKEEP_FIXES
+        )
+        console.print(
+            "[green]Cleaned up: see the highlighted rows.[/green]"
+            if changed
+            else "[dim]Nothing needed cleaning: the store is already tidy.[/dim]"
+        )
+
     @staticmethod
     def render_wrongtype(response, raw_input):
         if "Expected" in response and "Found" in response:

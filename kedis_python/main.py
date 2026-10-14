@@ -679,7 +679,12 @@ class KedisClient:
                 )
 
         elif cmd == "STATS":
-            UI.render_stats(response_text)
+            UI.render_stats(value if isinstance(value, str) else response_text)
+
+        elif cmd == "HOUSEKEEP":
+            # response_text wraps a string reply in quotes; the table parses the
+            # report itself, so give it the decoded text.
+            UI.render_housekeep(value if isinstance(value, str) else response_text)
 
         elif cmd == "CONFIG":
             tokens = raw_input.split()
