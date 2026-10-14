@@ -767,6 +767,7 @@ class KedisClient:
         "XRANGE": "Stream Range",
         "XREVRANGE": "Stream Range (newest first)",
         "XREAD": "Stream Read",
+        "XREADGROUP": "Group Read",
     }
 
     def _decode_kesp_value(self, raw_bytes):
@@ -863,15 +864,25 @@ class KedisClient:
         return out
 
     def _render_stream_reply(self, cmd, raw_input, value) -> bool:
-        """Draws XRANGE / XREVRANGE / XREAD replies as stream tables.
-        Returns False (nothing printed) when the reply doesn't fit, so the
-        generic text path still shows it."""
+        """Draws XRANGE / XREVRANGE / XREAD / XREADGROUP replies as stream
+        tables. Returns False (nothing printed) when the reply doesn't fit, so
+        the generic text path still shows it."""
         if not isinstance(value, list) or not value:
             return False
 
         title = self.STREAM_VIEWS[cmd]
         groups = []
-        if cmd == "XREAD":  # [[key, entries], ...]
+        if cmd == "XREADGROUP":  # name the reader in the title: "Group Read (g/c)"
+            words = raw_input.split()
+            upper = [w.upper() for w in words]
+            if "GROUP" in upper and upper.index("GROUP") + 2 < len(words):
+                at = upper.index("GROUP")
+                # Typed names are user data: escape them so brackets in a
+                # group or consumer name can't be read as markup.
+                from rich.markup import escape
+
+                title = f"{title} ({escape(words[at + 1])}/{escape(words[at + 2])})"
+        if cmd in ("XREAD", "XREADGROUP"):  # [[key, entries], ...]
             for item in value:
                 if not (
                     isinstance(item, list)

@@ -48,7 +48,7 @@ Expand the engine beyond simple key-value storage.
 - [x] HyperLogLog
 - [x] Stream data type
 - [x] Consumer Groups
-- [ ] Background memory defragmentation
+- [x] Background memory defragmentation (Periodic HouseKeeping of LRU)
 
 ---
 
