@@ -17,6 +17,9 @@ class CommandHandler:
 
         # Pub / Sub SwitchBoard
         self._channels = {}
+        # The server's event loop, set per connection; pub/sub pushes are queued
+        # onto it because commands run in worker threads.
+        self.event_loop = None
 
         # The O(1) Dispatch Table
         self._commands = {
@@ -1070,15 +1073,35 @@ class CommandHandler:
         dead_sockets = []
         for sock in subscribers:
             try:
-                sock.sendall(kesp_payload)
+                self._push(sock, kesp_payload)
                 receivers += 1
             except Exception:
                 dead_sockets.append(sock)
 
         for dead in dead_sockets:
             subscribers.remove(dead)
+        if not subscribers:
+            del self._channels[channel]
 
-        return
+        return receivers
+
+    def _push(self, sub, payload: bytes) -> None:
+        """Delivers one pub/sub message to a subscriber, raising if it is gone.
+
+        The server hands subscribers over as asyncio StreamWriters, and it runs
+        commands in worker threads, where a StreamWriter must not be touched
+        directly: the write is queued onto the event loop instead. A plain
+        socket (any object with sendall) is written to directly."""
+        if hasattr(sub, "sendall"):
+            sub.sendall(payload)
+            return
+        if sub.is_closing():
+            raise ConnectionError("subscriber is gone")
+        loop = self.event_loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(sub.write, payload)
+        else:
+            sub.write(payload)
 
     def cmd_slowlog(self, tokens: list[str]) -> Any:
         if len(tokens) < 2:

@@ -169,6 +169,5 @@ class TestNotesArePinned:
         assert str(run(h, "XINFO STREAM s")).startswith("-ERR")
         assert "nil" in help_data.COMMANDS["XINFO"].notes[0]
 
-    def test_the_publish_known_issue_is_still_documented(self):
-        # Remove this note (and fix PUBLISH's return value) together.
-        assert "Known issue" in help_data.COMMANDS["PUBLISH"].notes[0]
+    def test_publish_no_longer_carries_a_known_issue_note(self):
+        assert not help_data.COMMANDS["PUBLISH"].notes

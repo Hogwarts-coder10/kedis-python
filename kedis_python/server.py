@@ -625,6 +625,7 @@ async def handle_connection(reader, writer):
     """
     Spawns a new isolated session object for every incoming TCP connection.
     """
+    global_handler.event_loop = asyncio.get_running_loop()  # pub/sub pushes are queued onto it
     session = AsyncKedisSession(reader, writer)
     await session.run()
 

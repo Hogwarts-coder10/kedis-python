@@ -445,12 +445,8 @@ _ENTRIES = [
         "Send a message to a channel",
         "Everything after the channel is the message, joined with single spaces. It is "
         "delivered to every current subscriber at once and nothing is stored.",
-        "(integer) 0 when nobody is subscribed to the channel",
+        "(integer) the number of subscribers it was delivered to, 0 if nobody is subscribed",
         ["PUBLISH news hello world"],
-        # Known bug, pinned by tests/test_help_data.py: remove this note when
-        # PUBLISH is fixed to return the number of receivers.
-        notes=["Known issue: when the channel has subscribers it currently replies (nil) "
-               "instead of the number of receivers."],
     ),
     # ------------------------------------------------------------ persistence
     _c(
