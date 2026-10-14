@@ -17,9 +17,14 @@ Retrieves the string value associated with a key.
 * **Example:** `GET session_123`
 
 ### `DEL key [key ...]`
-Removes one or more specified keys from the storage engine. Ignores keys that do not exist.
+Removes one or more specified keys from the storage engine, whatever type they hold. Ignores keys that do not exist; a key named twice is only deleted (and counted) once.
 * **Returns:** `(integer)` The number of keys successfully removed.
 * **Example:** `DEL session_123 session_456`
+
+### `EXISTS key [key ...]`
+Checks whether one or more keys exist. An expired key counts as missing, and a key named twice is counted twice (`EXISTS a a` returns `2` when `a` exists).
+* **Returns:** `(integer)` How many of the given keys exist.
+* **Example:** `EXISTS session_123 session_456`
 
 ### `TYPE key`
 Reports the type of the value stored at a key. The names are lowercase: `string`, `list`, `set`, `hash`, `zset` or `stream`. Bitmaps and HyperLogLogs are strings underneath, so they report `string`, as in Redis. `KEYS` uses the same names.

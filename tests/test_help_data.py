@@ -151,13 +151,13 @@ class TestExamplesRun:
 
 
 class TestNotesArePinned:
-    def test_del_and_exists_take_a_single_key(self, h):
+    def test_del_and_exists_take_several_keys(self, h):
         run(h, "SET a 1")
         run(h, "SET b 2")
-        assert str(run(h, "DEL a b")).startswith("-ERR")
-        assert str(run(h, "EXISTS a b")).startswith("-ERR")
-        assert "DEL key" in help_data.COMMANDS["DEL"].syntax
-        assert "..." not in help_data.COMMANDS["DEL"].syntax
+        assert run(h, "EXISTS a b c") == 2
+        assert run(h, "DEL a b c") == 2
+        for name in ("DEL", "EXISTS"):
+            assert "[key ...]" in help_data.COMMANDS[name].syntax
 
     def test_xgroup_entriesread_is_not_supported(self, h):
         run(h, "XADD s * a 1")

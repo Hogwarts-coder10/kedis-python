@@ -512,7 +512,7 @@ class KedisClient:
                     "[bold cyan]Core String Commands[/bold cyan]\n"
                     "  [green]SET[/green] key val          : Store a string value\n"
                     "  [green]GET[/green] key              : Retrieve a value\n"
-                    "  [green]DEL[/green] key              : Remove a key\n"
+                    "  [green]DEL[/green] key [key ...]    : Remove one or more keys\n"
                     "  [green]EXPIRE[/green] key sec       : Set a time-to-live (TTL)\n"
                     "  [green]TTL[/green] key              : Check remaining lifespan\n"
                     "  [green]FLUSHALL[/green]            : Wipe the entire database\n\n"

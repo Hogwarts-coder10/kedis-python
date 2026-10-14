@@ -54,18 +54,20 @@ _ENTRIES = [
     ),
     # --------------------------------------------------------------- keyspace
     _c(
-        "DEL", "DEL key",
-        "Delete a key",
-        "Removes the key whatever type it holds. One key per call.",
-        "(integer) 1 if the key was deleted, 0 if it didn't exist",
-        ["DEL session_123"],
+        "DEL", "DEL key [key ...]",
+        "Delete one or more keys",
+        "Removes each key whatever type it holds. Keys that don't exist are ignored, and a key "
+        "named twice is only deleted (and counted) once.",
+        "(integer) the number of keys that were deleted",
+        ["DEL session_123", "DEL session_123 session_456"],
     ),
     _c(
-        "EXISTS", "EXISTS key",
-        "Check whether a key exists",
-        "A key that has expired counts as missing. One key per call.",
-        "(integer) 1 if it exists, 0 if not",
-        ["EXISTS session_123"],
+        "EXISTS", "EXISTS key [key ...]",
+        "Check whether keys exist",
+        "A key that has expired counts as missing. A key named twice is counted twice, so "
+        "EXISTS a a returns 2 when a exists.",
+        "(integer) how many of the given keys exist",
+        ["EXISTS session_123", "EXISTS session_123 session_456"],
     ),
     _c(
         "TYPE", "TYPE key",

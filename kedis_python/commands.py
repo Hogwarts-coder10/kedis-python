@@ -228,14 +228,15 @@ class CommandHandler:
             return f"-ERR {str(e)}"
 
     def _handle_del(self, tokens: list[str]):
-        if len(tokens) != 2:
+        if len(tokens) < 2:
             return "-ERR wrong number of arguments for 'DEL' command"
-        return self.store.delete(tokens[1])
+        return sum(self.store.delete(key) for key in tokens[1:])
 
     def _handle_exists(self, tokens: list[str]):
-        if len(tokens) != 2:
+        if len(tokens) < 2:
             return "-ERR wrong number of arguments for 'EXISTS' command"
-        return self.store.exists(tokens[1])
+        # Like Redis, a key named twice counts twice.
+        return sum(self.store.exists(key) for key in tokens[1:])
 
     def _handle_expire(self, tokens: list[str]):
         if len(tokens) != 3:
