@@ -171,3 +171,41 @@ class TestNotesArePinned:
 
     def test_publish_no_longer_carries_a_known_issue_note(self):
         assert not help_data.COMMANDS["PUBLISH"].notes
+
+
+class TestPlainOverview:
+    """The plain `HELP` cheat sheet is a hand-written block in main.py; keep it
+    from falling behind the commands."""
+
+    def test_every_command_appears_in_the_overview(self):
+        import re
+        from pathlib import Path
+
+        import kedis_python.main as cli
+
+        source = Path(cli.__file__).read_text(encoding="utf-8")
+        start = source.index("help_text = (")
+        overview = source[start : source.index("UI.print_panel(help_text", start)]
+        missing = [n for n in help_data.COMMANDS if not re.search(rf"\b{n}\b", overview)]
+        assert not missing, f"missing from the plain HELP overview: {missing}"
+
+    def test_bracketed_text_survives_rendering(self):
+        """Rich reads [lowercase ...] as a style tag and silently drops it, so
+        optional-argument brackets in the overview must be escaped as \\[...]."""
+        import io
+        from pathlib import Path
+
+        from rich.console import Console
+
+        import kedis_python.main as cli
+
+        source = Path(cli.__file__).read_text(encoding="utf-8")
+        start = source.index("help_text = (")
+        block = source[start : source.index("UI.print_panel(help_text", start)]
+        namespace = {}
+        exec(block.replace("\n                ", "\n").strip(), {}, namespace)  # noqa: S102
+        console = Console(file=io.StringIO(), width=200, force_terminal=False)
+        console.print(namespace["help_text"])
+        rendered = console.file.getvalue()
+        for shown in ("DEL key [key ...]", "EXISTS key [key ...]", "BITCOUNT key [s e]", "key [group]"):
+            assert shown in rendered, f"{shown!r} was swallowed by Rich markup"

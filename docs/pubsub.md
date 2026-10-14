@@ -4,30 +4,27 @@ Beyond standard key-value storage, Kedis operates as a high-speed message broker
 
 ## The Channel Matrix
 
-To maintain microsecond routing, Pub/Sub data does not touch the main storage dictionary or the AOF persistence log. It is entirely volatile and resides in a dedicated routing table called the **Channel Matrix**.
+To keep routing cheap, Pub/Sub data does not touch the main storage dictionary or the AOF persistence log. It is entirely volatile and resides in a dedicated routing table called the **Channel Matrix**.
 
-Internally, this is a Python dictionary that maps a string channel name to a `Set` of active `AsyncKedisSession` network sockets:
-`_channels["f1_telemetry"] = {client_socket_A, client_socket_B}`
+Internally, this is a Python dictionary that maps a channel name to a list of the subscribed connections' stream writers:
+`_channels["f1_telemetry"] = [writer_A, writer_B]`
 
-## State Transition: The `SUBSCRIBE` Lock
+## `SUBSCRIBE`
 
-When a client issues a `SUBSCRIBE` command, their network connection undergoes a strict state transition:
-1. The engine adds their socket to the requested channel's `Set`.
-2. The client is placed into **Subscriber Mode**. 
-3. In this mode, the client's command parser is heavily restricted. They can no longer issue standard commands like `SET` or `GET`. The socket is locked open, acting purely as a read-only intake manifold waiting for incoming broadcasts.
+`SUBSCRIBE channel` adds the calling connection to that channel and replies with the confirmation array `subscribe, channel, 1`. It takes one channel per call and needs a network connection: in standalone mode it returns an error.
+
+A subscribed connection is **not** locked into a special mode. It can keep running ordinary commands like `SET` and `GET` on the same connection, and broadcasts simply arrive on it between replies. There is no `UNSUBSCRIBE` yet; a connection leaves its channels when it disconnects (see below).
 
 ## Broadcast Mechanics: `PUBLISH`
 
-When a producer client sends `PUBLISH f1_telemetry "Verstappen P1"`, the event loop executes the broadcast instantly:
-1. The Command Dispatcher looks up `f1_telemetry` in the Channel Matrix.
-2. It iterates through the `Set` of subscribed client sockets.
-3. It rapidly streams a KESP Array payload (containing the channel name and the message) down each active socket.
-4. It returns an `(integer)` to the publisher, representing the total number of clients that successfully received the broadcast.
+When a producer client sends `PUBLISH f1_telemetry "Verstappen P1"`:
+1. The engine looks up `f1_telemetry` in the Channel Matrix. A channel nobody listens to replies `0` and nothing else happens.
+2. Everything after the channel is joined with single spaces into one message.
+3. For each subscribed connection, it queues a KESP Array push (`message`, the channel, the message) onto the event loop, which writes it to that client's socket. Commands run in worker threads, and an asyncio writer must only be touched from the loop, so the write is handed over rather than done directly.
+4. It returns an `(integer)` to the publisher: the number of subscribers it was delivered to.
 
-Because this iteration happens directly on the `asyncio` event loop, the fan-out is nearly instantaneous and does not block other engine operations.
+Messages from one publisher reach a subscriber in the order they were published. If a client publishes to a channel it is itself subscribed to, the pushed message can arrive before the integer reply.
 
-## Network Drops & `UNSUBSCRIBE`
+## Network Drops
 
-If a subscribed client forcefully disconnects or drops off the network, the TCP Server immediately catches the broken pipe exception. The engine's garbage collector surgically removes that specific socket from all channel `Sets` in the matrix, ensuring that future broadcasts do not attempt to write to dead connections. 
-
-Clients can also gracefully exit Subscriber Mode by issuing the `UNSUBSCRIBE` command, which unlocks their socket and returns them to normal operating parameters.
+A subscriber that disconnects is noticed the next time something is published to its channel: its connection is found closed, it is removed from the channel and it is not counted. A channel whose last subscriber is gone is deleted. Until that next `PUBLISH`, a quiet channel keeps its dead entries, which costs nothing but a little memory.
