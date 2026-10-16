@@ -26,6 +26,7 @@ from .parser import (
     IncompleteReply,
     KESPDecoder,
     LegacyError,
+    ProtocolError,
 )
 from .store import KedisStore
 from .ui import UI, console
@@ -614,8 +615,8 @@ class KedisClient:
                 else:
                     # Feed the KESP bytes to the intake parser
                     tokens, consumed = CommandParser.parse(kesp_payload)
-                    if tokens and tokens[0] == "ERROR":
-                        console.print(f"[red]{tokens[1]}[/red]")
+                    if isinstance(tokens, ProtocolError):
+                        console.print(f"[red]{tokens.message}[/red]")
                         return
                     if not tokens:
                         return

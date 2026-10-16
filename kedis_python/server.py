@@ -7,7 +7,7 @@ import time
 from rich.console import Console
 
 from .commands import CommandHandler
-from .parser import CommandParser, KESPEncoder
+from .parser import CommandParser, KESPEncoder, ProtocolError
 from .store import KedisStore
 from .stream import StreamError
 from .ui import UI
@@ -459,6 +459,7 @@ class AsyncKedisSession:
 
         # The Surge Tank : Buffers the fragmmented TCP packets
         intake_buffer = bytearray()
+        protocol_failed = False
 
         while True:
             try:
@@ -481,14 +482,19 @@ class AsyncKedisSession:
                     except Exception:
                         break  # Wait for next TCP packet
 
-                    if tokens and tokens[0] == "ERROR":
-                        clean_err = tokens[1].replace("-ERR", " ")
+                    if isinstance(tokens, ProtocolError):
+                        # The stream cannot be resynchronised once a frame is
+                        # malformed: tell the client why, then drop it.
+                        clean_err = tokens.message.replace("-ERR", "").strip()
                         await self.send(f"E{clean_err}\n".encode("utf-8"))
-                        # 🚀 FIX: Slicing
-                        del intake_buffer[:consumed]
-                        continue
+                        intake_buffer.clear()
+                        protocol_failed = True
+                        break
 
                     if not tokens:
+                        if consumed:  # blank line / empty array: nothing to run
+                            del intake_buffer[:consumed]
+                            continue
                         break  # Parser returned nothing, wait for more data
 
                     # Execute the fully assembled command
@@ -600,6 +606,9 @@ class AsyncKedisSession:
 
                     # 🚀 FIX: Slicing for standard commands
                     del intake_buffer[:consumed]
+
+                if protocol_failed:
+                    break  # fall through to the close below
 
             except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
                 break  # client vanished; fall through to cleanup

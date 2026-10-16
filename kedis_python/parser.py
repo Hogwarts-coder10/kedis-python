@@ -1,131 +1,173 @@
+import re
+
+
+class ProtocolError(list):
+    """What CommandParser.parse() returns, in place of a token list, when the
+    bytes are not valid KESP.
+
+    It is a list shaped ["ERROR", message] so older callers that look at
+    tokens[0] / tokens[1] keep working, but callers should test for the type:
+    a client can send a *command* named ERROR, and that must stay an ordinary
+    command rather than being mistaken for a framing failure.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(["ERROR", message])
+        self.message = message
+
+
 class CommandParser:
     # --- Protocol hardening limits, mirroring the guards real Redis puts
     # on its own wire protocol. Without these, a client can make the
     # server buffer network input without limit — either by never
     # sending a terminator, or by declaring an absurd array/string
     # length and then slow-drip feeding bytes forever.
-    MAX_INLINE_LENGTH = 64 * 1024  # cap on an unterminated inline command
+    MAX_INLINE_LENGTH = 64 * 1024  # cap on an inline command line
     MAX_HEADER_LINE = 32  # more than enough for "A123456\n" / "S123456\n"
     MAX_ARRAY_LENGTH = 1024 * 1024  # cap on a declared element count
     MAX_BULK_LENGTH = 512 * 1024 * 1024  # cap on a single declared string length
 
-    @staticmethod
-    def parse(raw_data: bytes) -> tuple[list[str], int]:
-        """
-        Parses incoming network data. Returns a tuple of (tokens, bytes_consumed).
-        If the payload is incomplete, returns ([], 0) to wait for more data.
-        """
+    # Header numbers are canonical ASCII decimals: no sign, no spaces, no
+    # underscores, no leading zeros, no non-ASCII digits (all of which int()
+    # would quietly accept).
+    _COUNT = re.compile(rb"(?:0|[1-9][0-9]*)")
 
-        if not raw_data:
-            return [], 0
+    @staticmethod
+    def parse(raw_data: bytes):
+        """
+        Parses incoming network data. Returns (tokens, bytes_consumed).
+
+        - ([], 0): the next frame is incomplete, wait for more data.
+        - (tokens, n): one complete command; n bytes belong to it (and to any
+          blank frames in front of it).
+        - ([], n) with n > 0: only blank frames (empty line / empty array),
+          which carry no command. The caller must drop n bytes.
+        - (ProtocolError, n): the stream is not valid KESP. It cannot be
+          resynchronised, so the caller should reply and close the connection.
+        """
+        pos = 0
+        while pos < len(raw_data):
+            tokens, end = CommandParser._parse_frame(raw_data, pos)
+            if tokens is None:  # frame incomplete
+                return [], pos  # pos > 0 only if blank frames were skipped
+            if isinstance(tokens, ProtocolError):
+                return tokens, end
+            if tokens:
+                # Only the command name is normalised. Every other token is data
+                # (keys, values, field names) until a handler says otherwise, so
+                # handlers match their own options case-insensitively.
+                tokens[0] = tokens[0].upper()
+                return tokens, end
+            pos = end  # blank frame: skip it and keep scanning
+        return [], pos
+
+    @staticmethod
+    def _count(raw_data: bytes, start: int, end: int):
+        """The canonical decimal in raw_data[start:end], or None."""
+        field = raw_data[start:end]
+        if not CommandParser._COUNT.fullmatch(field):
+            return None
+        return int(field)
+
+    @staticmethod
+    def _parse_frame(raw_data: bytes, pos: int):
+        """Parses one frame starting at pos. Returns (tokens, end), where
+        tokens is a list (possibly empty), a ProtocolError, or None when the
+        frame is incomplete. For a ProtocolError, end is len(raw_data)."""
+        total = len(raw_data)
+
+        def fail(message):
+            return ProtocolError(message), total
 
         try:
-            first_byte = raw_data[:1].decode("utf-8")
-
+            first_byte = raw_data[pos : pos + 1].decode("utf-8")
         except UnicodeDecodeError:
-            return ["ERROR", "-ERR Malformed payload"], len(raw_data)
-
-        tokens = []
-        bytes_consumed = 0
+            return fail("-ERR Malformed payload")
 
         # Inline fallback — newline-terminated, exactly like Redis's own
         # inline command mode. This is what protects it against
         # fragmentation: a command split across two TCP packets is NOT
         # treated as complete until its terminator actually arrives.
         if first_byte != "A":
-            nl_index = raw_data.find(b"\n")
+            nl_index = raw_data.find(b"\n", pos)
 
             if nl_index == -1:
                 # No terminator yet — bound how long we'll wait, so a
                 # client that never sends '\n' can't grow the intake
                 # buffer without limit.
-                if len(raw_data) > CommandParser.MAX_INLINE_LENGTH:
-                    return ["ERROR", "-ERR Protocol error: too big inline request"], len(
-                        raw_data
-                    )
-                return [], 0  # incomplete, wait for the newline
+                if total - pos > CommandParser.MAX_INLINE_LENGTH:
+                    return fail("-ERR Protocol error: too big inline request")
+                return None, pos  # incomplete, wait for the newline
 
-            bytes_consumed = nl_index + 1
+            if nl_index - pos > CommandParser.MAX_INLINE_LENGTH:
+                return fail("-ERR Protocol error: too big inline request")
 
             try:
-                tokens = raw_data[:nl_index].decode("utf-8").strip().split()
+                tokens = raw_data[pos:nl_index].decode("utf-8").strip().split()
             except UnicodeDecodeError:
-                return ["ERROR", "-ERR Invalid text encoding"], bytes_consumed
+                return ProtocolError("-ERR Invalid text encoding"), nl_index + 1
+            return tokens, nl_index + 1
 
-        else:
-            # KESP Decoder: Strict, Binary-safe byte counting
-            try:
-                pointer = 0
-                nl_index = raw_data.find(b"\n", pointer)
+        # KESP Decoder: Strict, Binary-safe byte counting
+        try:
+            nl_index = raw_data.find(b"\n", pos)
 
-                if nl_index == -1:
-                    if len(raw_data) > CommandParser.MAX_HEADER_LINE:
-                        return [
-                            "ERROR",
-                            "-ERR Protocol error: invalid array header",
-                        ], len(raw_data)
-                    return [], 0  # Incomplete array header, wait for more bytes
+            if nl_index == -1:
+                if total - pos > CommandParser.MAX_HEADER_LINE:
+                    return fail("-ERR Protocol error: invalid array header")
+                return None, pos  # Incomplete array header, wait for more bytes
 
-                expected_args = int(raw_data[pointer + 1 : nl_index].decode("utf-8"))
+            if nl_index - pos > CommandParser.MAX_HEADER_LINE:
+                return fail("-ERR Protocol error: invalid array header")
 
-                if expected_args < 0 or expected_args > CommandParser.MAX_ARRAY_LENGTH:
-                    return [
-                        "ERROR",
-                        "-ERR Protocol error: invalid multibulk length",
-                    ], len(raw_data)
+            expected_args = CommandParser._count(raw_data, pos + 1, nl_index)
+            if expected_args is None or expected_args > CommandParser.MAX_ARRAY_LENGTH:
+                return fail("-ERR Protocol error: invalid multibulk length")
 
-                pointer = nl_index + 1
+            pointer = nl_index + 1
+            tokens = []
 
-                for _ in range(expected_args):
-                    nl_idx = raw_data.find(b"\n", pointer)
-                    if nl_idx == -1:
-                        # Same reasoning as the inline cap: a client that
-                        # never terminates a bulk-string header shouldn't
-                        # be able to buffer forever either.
-                        if len(raw_data) - pointer > CommandParser.MAX_HEADER_LINE:
-                            return [
-                                "ERROR",
-                                "-ERR Protocol error: invalid bulk length",
-                            ], len(raw_data)
-                        return [], 0  # incomplete string header
+            for _ in range(expected_args):
+                if pointer >= total:
+                    return None, pos  # next element header not here yet
 
-                    # 🚀 FIX: Flipped the operator to catch invalid headers
-                    if raw_data[pointer : pointer + 1] != b"S":
-                        return ["ERROR", "-ERR Protocol Desync: Expected 'S'"], len(
-                            raw_data
-                        )
+                # Reject a wrong sigil as soon as it arrives, not after a newline.
+                if raw_data[pointer : pointer + 1] != b"S":
+                    return fail("-ERR Protocol Desync: Expected 'S'")
 
-                    str_len = int(raw_data[pointer + 1 : nl_idx].decode("utf-8"))
+                nl_idx = raw_data.find(b"\n", pointer)
+                if nl_idx == -1:
+                    # Same reasoning as the inline cap: a client that
+                    # never terminates a bulk-string header shouldn't
+                    # be able to buffer forever either.
+                    if total - pointer > CommandParser.MAX_HEADER_LINE:
+                        return fail("-ERR Protocol error: invalid bulk length")
+                    return None, pos  # incomplete string header
 
-                    if str_len < 0 or str_len > CommandParser.MAX_BULK_LENGTH:
-                        return [
-                            "ERROR",
-                            "-ERR Protocol error: invalid bulk length",
-                        ], len(raw_data)
+                if nl_idx - pointer > CommandParser.MAX_HEADER_LINE:
+                    return fail("-ERR Protocol error: invalid bulk length")
 
-                    pointer = nl_idx + 1
+                str_len = CommandParser._count(raw_data, pointer + 1, nl_idx)
+                if str_len is None or str_len > CommandParser.MAX_BULK_LENGTH:
+                    return fail("-ERR Protocol error: invalid bulk length")
 
-                    # Check if the full string + trailing newline has arrived yet
-                    if pointer + str_len + 1 > len(raw_data):
-                        return [], 0  # incomplete payload, wait for next payload
+                pointer = nl_idx + 1
+                payload_end = pointer + str_len
 
-                    data_bytes = raw_data[pointer : pointer + str_len]
-                    tokens.append(data_bytes.decode("utf-8"))
+                # Check if the full string + trailing newline has arrived yet
+                if payload_end + 1 > total:
+                    return None, pos  # incomplete payload, wait for next payload
 
-                    pointer += str_len + 1
+                if raw_data[payload_end : payload_end + 1] != b"\n":
+                    return fail("-ERR Protocol error: bulk string not newline-terminated")
 
-                bytes_consumed = pointer
+                tokens.append(raw_data[pointer:payload_end].decode("utf-8"))
+                pointer = payload_end + 1
 
-            except (ValueError, IndexError):
-                return ["ERROR", "-ERR Malformed KESP payload"], len(raw_data)
+            return tokens, pointer
 
-        if tokens and len(tokens) > 0 and tokens[0] != "ERROR":
-            # Only the command name is normalised. Every other token is data
-            # (keys, values, field names) until a handler says otherwise, so
-            # handlers match their own options case-insensitively.
-            tokens[0] = tokens[0].upper()
-
-        return tokens, bytes_consumed
+        except (ValueError, IndexError):
+            return fail("-ERR Malformed KESP payload")
 
 
 class BulkString(str):

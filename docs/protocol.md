@@ -86,3 +86,14 @@ A2
 ## Parsing Mechanics
 
 Because TCP streams do not guarantee that a full payload will arrive in a single packet, the engine's `CommandParser` reads from a `bytearray` Surge Tank. It scans the bytes for the matching sigils and terminating `\n` characters. If an Array sigil (`A3\n`) arrives, the parser knows it must wait until exactly three distinct elements have fully materialized in the tank before attempting to route the command.
+
+## Framing Rules and Protocol Errors
+
+The command decoder is strict about where one frame ends and the next begins:
+
+- Header lines (`A<count>`, `S<length>`) end in exactly `\n`. A `\r` before it is an error. The number is a canonical ASCII decimal: no sign, spaces, underscores or leading zeros (`A+1`, `S04`, `A1_0` are all rejected).
+- A bulk payload is exactly `<length>` bytes followed by exactly one `\n`. Anything else in that position is an error, so a wrong length can no longer shift the frame boundary silently.
+- Header lines are capped at 32 bytes, inline lines at 64 KiB, whether or not the terminator has arrived yet.
+- Blank lines and empty arrays (`A0`) are ignored between commands.
+
+A frame that breaks these rules cannot be resynchronised, so the server sends one error reply (`E<message>`) and then closes the connection. A command that happens to be named `ERROR` is an ordinary command and is not treated as a framing failure.
