@@ -5,6 +5,7 @@ import os
 
 import pytest
 
+from kedis_python import aof
 from kedis_python.commands import CommandHandler
 from kedis_python.hyperloglog import M, HyperLogLog, _hash64
 from kedis_python.store import KedisStore
@@ -38,6 +39,13 @@ def store(workdir):
 @pytest.fixture
 def handler(store):
     return CommandHandler(store)
+
+
+def aof_records(path="test.aof"):
+    """Every logged command in the AOF, as token lists."""
+    with open(path, "rb") as f:
+        data = f.read()
+    return [tokens for tokens, _ in aof.scan(data, aof.ScanResult())]
 
 
 def reopen(workdir):
@@ -328,8 +336,7 @@ class TestPersistence:
         expected = self._seed(s)
         assert s.compact_aof()
         s.shutdown()
-        with open(workdir / "test.aof") as f:
-            assert "PFLOAD a " in f.read()
+        assert any(r[:2] == ["PFLOAD", "a"] for r in aof_records(workdir / "test.aof"))
         s2 = reopen(workdir)  # no snapshot exists: PFLOAD path only
         try:
             assert self._counts(s2) == expected

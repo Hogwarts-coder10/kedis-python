@@ -5,6 +5,7 @@ import os
 
 import pytest
 
+from kedis_python import aof
 from kedis_python.store import KedisStore
 from kedis_python.stream import StreamError
 
@@ -16,6 +17,13 @@ def workdir(tmp_path, monkeypatch):
     """Isolated cwd: KedisStore reads/writes kedis.snapshot in the cwd."""
     monkeypatch.chdir(tmp_path)
     return tmp_path
+
+
+def aof_records(path="test.aof"):
+    """Every logged command in the AOF, as token lists."""
+    with open(path, "rb") as f:
+        data = f.read()
+    return [tokens for tokens, _ in aof.scan(data, aof.ScanResult())]
 
 
 def open_store():
@@ -282,7 +290,7 @@ class TestPersistence:
         s = open_store()
         s.xadd("s", ["temp", "21"], "1-0")
         s.shutdown()
-        assert "XADD s 1-0 temp 21" in open("test.aof").read().split("\n")
+        assert ["XADD", "s", "1-0", "temp", "21"] in aof_records()
 
     def test_compaction_round_trip(self, workdir):
         s = open_store()

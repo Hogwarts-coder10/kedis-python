@@ -1,14 +1,18 @@
 import base64
+import contextlib
 import itertools
 import json
 import math
+import mmap
 import os
+import shutil
 import sys
 import threading
 import time
 from collections import OrderedDict, deque
 from typing import Any, Optional
 
+from . import aof
 from .hyperloglog import HyperLogLog
 from .skiplist import SkipList
 from .stream import (
@@ -33,6 +37,10 @@ def _is_bare_token(text: str) -> bool:
 # matter and at least a quarter wasted.
 _HK_MIN_BYTES = 4096
 _HK_MIN_GAIN = 2048
+
+
+# Values per RPUSH/SADD record when compacting, so one record stays small.
+AOF_CHUNK = 1000
 
 
 class KedisStore:
@@ -92,7 +100,7 @@ class KedisStore:
         self.recover_from_aof()
 
         self._is_recovering = False
-        self.aof_file = open(self.aof_filename, "a")
+        self.aof_file = open(self.aof_filename, "ab")
 
         # SLOWLOG TELEMETRY ENGINE
         self.slowlog_slower_than = (
@@ -265,11 +273,7 @@ class KedisStore:
         if not tokens or not tokens[0]:
             return
 
-        command_string = " ".join(str(t) for t in tokens)
-        if not command_string:
-            return
-
-        self.aof_file.write(command_string + "\n")
+        self.aof_file.write(aof.encode_record(tokens))
 
         # Only block the main Python thread if the user demands absolute safety
         if self.appendfsync == "always":
@@ -621,13 +625,51 @@ class KedisStore:
             except Exception as e:
                 print(f"DEBUG: Load failed - {e}")
 
+    @contextlib.contextmanager
+    def _aof_records(self):
+        """Yields an iterator of token lists, one per logged command, read from
+        framed records or legacy lines (see aof.py). When the loop finishes, a
+        file that ends in a torn or malformed record is cut back to its last
+        good record so later appends are never stranded behind it."""
+        result = aof.ScanResult()
+        if os.path.getsize(self.aof_filename) == 0:
+            yield iter(())
+            return
+        with open(self.aof_filename, "rb") as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as buf:
+                yield (tokens for tokens, _ in aof.scan(buf, result))
+        if result.status != "ok":
+            self._repair_aof(result)
+
+    def _repair_aof(self, result):
+        path = self.aof_filename
+        if result.status == "corrupt":
+            backup = f"{path}.corrupt"
+            if os.path.exists(backup):
+                backup = f"{backup}.{int(time.time())}"
+            shutil.copyfile(path, backup)
+            print(
+                f"AOF: malformed record at byte {result.good_end} "
+                f"({result.reason}); replay stopped there. The original file was "
+                f"saved as {backup} and the log was cut back to the last good record."
+            )
+        else:
+            lost = os.path.getsize(path) - result.good_end
+            print(
+                f"AOF: discarded an incomplete final record ({lost} bytes) "
+                "left by an interrupted write."
+            )
+        with open(path, "r+b") as f:
+            f.truncate(result.good_end)
+            f.flush()
+            os.fsync(f.fileno())
+
     def recover_from_aof(self):
         if not os.path.exists(self.aof_filename):
             return
 
-        with open(self.aof_filename, "r") as f:
-            for line in f:
-                tokens = line.strip().split()
+        with self._aof_records() as records:
+            for tokens in records:
                 if not tokens:
                     continue
                 cmd = tokens[0].upper()
@@ -837,70 +879,65 @@ class KedisStore:
         aof_dir, aof_base = os.path.split(self.aof_filename)
         temp_file = os.path.join(aof_dir, f"temp_{aof_base}")
         try:
-            with open(temp_file, "w") as f:
+            with open(temp_file, "wb") as f:
+
+                def emit(*tokens):
+                    f.write(aof.encode_record(tokens))
+
                 for key, value in self._data.items():
                     if isinstance(value, deque):
-                        f.write(f"RPUSH {key} {' '.join(value)}\n")
+                        items = list(value)
+                        for i in range(0, len(items), AOF_CHUNK):
+                            emit("RPUSH", key, *items[i : i + AOF_CHUNK])
                     elif isinstance(value, set):
-                        f.write(f"SADD {key} {' '.join(value)}\n")
+                        members = list(value)
+                        for i in range(0, len(members), AOF_CHUNK):
+                            emit("SADD", key, *members[i : i + AOF_CHUNK])
                     elif isinstance(value, dict):
                         for h_field, h_val in value.items():
-                            f.write(f"HSET {key} {h_field} {h_val}\n")
+                            emit("HSET", key, h_field, h_val)
                     elif isinstance(value, SkipList):
                         flat_list = value.get_range(0, -1, withscores=True)
                         for i in range(0, len(flat_list), 2):
-                            mem = flat_list[i]
-                            scr = flat_list[i + 1]
-                            f.write(f"ZADD {key} {scr} {mem}\n")
+                            emit("ZADD", key, flat_list[i + 1], flat_list[i])
                     elif isinstance(value, Stream):
                         for sid_text, fields in value.range():
-                            f.write(
-                                " ".join(self._stream_entry_tokens(key, sid_text, fields))
-                                + "\n"
-                            )
-                        f.write(
-                            f"XSTATE {key} {format_id(value.last_id)} {value.entries_added}\n"
+                            emit(*self._stream_entry_tokens(key, sid_text, fields))
+                        emit(
+                            "XSTATE",
+                            key,
+                            format_id(value.last_id),
+                            value.entries_added,
                         )
                         for g in value.groups.values():
-                            f.write(f"XGROUP {key} {g.name} {format_id(g.last_id)}\n")
+                            emit("XGROUP", key, g.name, format_id(g.last_id))
                             for c in g.consumers.values():
-                                f.write(
-                                    f"XGCONS {key} {g.name} {c.name} "
-                                    f"{c.seen_ms} {c.active_ms}\n"
+                                emit(
+                                    "XGCONS", key, g.name, c.name, c.seen_ms, c.active_ms
                                 )
                             for sid in g._pel_ids:
                                 p = g.pel[sid]
-                                f.write(
-                                    f"XGPEL {key} {g.name} {p.consumer} "
-                                    f"{format_id(sid)} {p.delivery_ms} {p.count}\n"
+                                emit(
+                                    "XGPEL",
+                                    key,
+                                    g.name,
+                                    p.consumer,
+                                    format_id(sid),
+                                    p.delivery_ms,
+                                    p.count,
                                 )
                     elif isinstance(value, HyperLogLog):
-                        encoded = base64.b64encode(value.to_bytes()).decode("ascii")
-                        f.write(f"PFLOAD {key} {encoded}\n")
+                        emit(
+                            "PFLOAD",
+                            key,
+                            base64.b64encode(value.to_bytes()).decode("ascii"),
+                        )
                     else:
-                        text = str(value)
-                        # Bare tokens only: ASCII, printable, no whitespace.
-                        # Anything else (bitmaps especially) is base64-encoded
-                        # so it survives the whitespace-tokenized AOF format.
-                        if (
-                            text
-                            and text.isascii()
-                            and text.isprintable()
-                            and " " not in text
-                        ):
-                            f.write(f"SET {key} {text}\n")
-                        else:
-                            encoded = (
-                                base64.b64encode(
-                                    text.encode("utf-8", "surrogatepass")
-                                ).decode("ascii")
-                                or "-"
-                            )
-                            f.write(f"SETB64 {key} {encoded}\n")
+                        emit("SET", key, str(value))
 
                 for key, exp_time in self._expires.items():
                     if exp_time > time.time():
-                        f.write(f"EXPIREAT {key} {exp_time}\n")
+                        emit("EXPIREAT", key, exp_time)
 
             if os.name == "nt":
                 if hasattr(self, "aof_file") and not self.aof_file.closed:
@@ -909,12 +946,12 @@ class KedisStore:
                 if os.path.exists(self.aof_filename):
                     os.remove(self.aof_filename)
                 os.rename(temp_file, self.aof_filename)
-                self.aof_file = open(self.aof_filename, "a")
+                self.aof_file = open(self.aof_filename, "ab")
             else:
                 os.replace(temp_file, self.aof_filename)
                 if hasattr(self, "aof_file") and not self.aof_file.closed:
                     self.aof_file.close()
-                self.aof_file = open(self.aof_filename, "a")
+                self.aof_file = open(self.aof_filename, "ab")
             return True
         except Exception as e:
             if os.path.exists(temp_file):

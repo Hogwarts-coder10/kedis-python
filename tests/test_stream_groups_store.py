@@ -6,6 +6,7 @@ import os
 
 import pytest
 
+from kedis_python import aof
 from kedis_python.store import KedisStore
 from kedis_python.stream import StreamError
 
@@ -14,6 +15,13 @@ from kedis_python.stream import StreamError
 def workdir(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     return tmp_path
+
+
+def aof_records(path="test.aof"):
+    """Every logged command in the AOF, as token lists."""
+    with open(path, "rb") as f:
+        data = f.read()
+    return [tokens for tokens, _ in aof.scan(data, aof.ScanResult())]
 
 
 def open_store(aof="test.aof"):
@@ -524,11 +532,11 @@ class TestPersistence:
         s.xgroup_create("s", "g", "0")
         read(s, "c")
         s.shutdown()
-        lines = open("test.aof").read().split("\n")
-        assert "XGROUP s g 0-0" in lines
-        assert "XGCONS s g c 123 -1" in lines
-        assert "XGPEL s g c 1-0 123 1" in lines
-        assert "XGLAST s g 1-0" in lines
+        records = aof_records()
+        assert ["XGROUP", "s", "g", "0-0"] in records
+        assert ["XGCONS", "s", "g", "c", "123", "-1"] in records
+        assert ["XGPEL", "s", "g", "c", "1-0", "123", "1"] in records
+        assert ["XGLAST", "s", "g", "1-0"] in records
 
     def test_replay_does_not_relog(self, workdir):
         s = open_store()

@@ -5,6 +5,7 @@ import os
 
 import pytest
 
+from kedis_python import aof
 from kedis_python.store import KedisStore
 
 TRICKY_BYTES = [0, 9, 10, 13, 32, 127, 128, 160, 200, 255]  # incl. whitespace
@@ -40,6 +41,13 @@ def build_tricky_bitmap(store, key="bm"):
 def aof_lines(path="test.aof"):
     with open(path) as f:
         return [ln.rstrip("\n") for ln in f if ln.strip()]
+
+
+def aof_records(path="test.aof"):
+    """Every logged command in the AOF, as token lists."""
+    with open(path, "rb") as f:
+        data = f.read()
+    return [tokens for tokens, _ in aof.scan(data, aof.ScanResult())]
 
 
 # ----------------------------------------------------------------------
@@ -155,19 +163,20 @@ class TestCompaction:
     def test_compacted_aof_has_no_raw_whitespace_in_bitmap_record(self, workdir):
         s = open_store()
         build_tricky_bitmap(s)
+        live = s.get("bm")
         s.compact_aof()
         s.shutdown()
-        lines = aof_lines()
-        assert len(lines) == 1  # one record, no stray newline splitting it
-        assert lines[0].startswith("SETB64 bm ")
-        assert len(lines[0].split()) == 3
+        records = aof_records()
+        # One record that carries the value exactly, however many newlines,
+        # spaces or control characters the bitmap holds.
+        assert records == [["SET", "bm", live]]
 
     def test_plain_ascii_strings_stay_readable(self, workdir):
         s = open_store()
         s.set("plain", "hello")
         s.compact_aof()
         s.shutdown()
-        assert "SET plain hello" in aof_lines()
+        assert ["SET", "plain", "hello"] in aof_records()
 
     @pytest.mark.parametrize(
         "value",

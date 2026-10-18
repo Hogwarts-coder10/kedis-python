@@ -35,6 +35,21 @@ To prevent the `.aof` file from infinitely bloating, Kedis features a `COMPACT` 
 3. It writes a completely fresh, minimized `.aof` file containing only the commands needed to recreate the current state.
 4. The old, bloated log is hot-swapped for the new one, and normal logging resumes.
 
+## The Record Format
+
+Each logged command is one **KESP-framed record**, the same shape the wire protocol uses for commands:
+
+```
+A3\nS3\nSET\nS1\nk\nS5\na b\nc\n      <- SET k "a b\nc"
+```
+
+`A<count>` starts a record, and each token is `S<length>` followed by exactly that many bytes of UTF-8 and a `\n`. Because the length is counted, a token can hold anything: spaces, newlines, tabs, an empty string, even text that looks like another command. Earlier versions wrote one space-joined line per command, which could not hold such values and let a value containing a newline plant commands in the log.
+
+- **Old files still load.** Lines written by earlier versions are read as before, and a file may mix both: old lines first, framed records after. `COMPACT` rewrites everything in the new format.
+- **A crash while writing** can leave half a record at the end. Recovery drops it, cuts the file back to the last complete record and prints a notice, so later writes are never stranded behind the fragment.
+- **A malformed record** in the middle stops replay there. The original file is first saved as `<name>.corrupt`, then the log is cut back to the last good record so new writes stay replayable. Nothing after the damage is applied automatically; recover it from the backup if you need it.
+- **Compaction** writes lists and sets in records of at most 1,000 values, so no single record gets huge.
+
 ## 🌊 Streams in the Log
 
 Streams ([details](streams.md)) are logged as **fully resolved records**: every ID, timestamp and delivery count is fixed when the command runs, never recomputed at replay. Replaying the log therefore rebuilds the same entries (including every `*` ID) and the same group state, and replay never re-logs what it reads.
@@ -44,7 +59,7 @@ Streams ([details](streams.md)) are logged as **fully resolved records**: every 
 | Record | Meaning |
 | :-- | :-- |
 | `XADD key id field value ...` | One entry, with its final ID. Used when every field and value is a plain token. |
-| `XADDB64 key id <base64>` | The same entry, with the field list stored as base64-encoded JSON. Used when any text can't survive the whitespace-separated log: spaces, newlines, tabs or other non-printable characters, empty strings, or non-ASCII text. |
+| `XADDB64 key id <base64>` | The same entry, with the field list stored as base64-encoded JSON. Kept from the old line format: still written when an entry's text isn't plain (spaces, newlines, empty or non-ASCII text) and always readable. |
 | `XDEL key id ...` | Entries removed. |
 | `XTRIM key MAXLEN n` | A trim, always written as the exact resulting length (also used for `MAXLEN`/`MINID` on `XADD`). |
 | `XSTATE key last-id entries-added` | Written by `COMPACT` only: restores a stream's top ID and lifetime counter, which entries alone can't (an emptied stream still remembers its top ID). |
