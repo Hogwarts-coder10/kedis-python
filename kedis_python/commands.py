@@ -219,11 +219,17 @@ class CommandHandler:
         self.store.set(tokens[1], tokens[2])
         return "OK"
 
+    @staticmethod
+    def _data(value):
+        """A stored value as a reply: always data, never read as a status or
+        an error, whatever it looks like ("OK", "ERROR x", "-ERR y")."""
+        return BulkString(value) if isinstance(value, str) else value
+
     def _handle_get(self, tokens: list[str]):
         if len(tokens) != 2:
             return "-ERR wrong number of arguments for 'GET' command"
         try:
-            return self.store.get(tokens[1])
+            return self._data(self.store.get(tokens[1]))
         except TypeError as e:
             return f"-ERR {str(e)}"
 
@@ -315,7 +321,7 @@ class CommandHandler:
         if len(tokens) != 2:
             return "-ERR wrong number of arguments for 'lpop' command"
         try:
-            return self.store.lpop(tokens[1])
+            return self._data(self.store.lpop(tokens[1]))
         except TypeError as e:
             return f"-ERR {str(e)}"
 
@@ -323,7 +329,7 @@ class CommandHandler:
         if len(tokens) != 2:
             return "-ERR wrong number of arguments for 'rpop' command"
         try:
-            return self.store.rpop(tokens[1])
+            return self._data(self.store.rpop(tokens[1]))
         except TypeError as e:
             return f"-ERR {str(e)}"
 
@@ -365,7 +371,7 @@ class CommandHandler:
         if len(tokens) != 3:
             return "-ERR wrong number of arguments for 'hget' command"
         try:
-            return self.store.hget(tokens[1], tokens[2])
+            return self._data(self.store.hget(tokens[1], tokens[2]))
         except TypeError as e:
             return f"-ERR {str(e)}"
 

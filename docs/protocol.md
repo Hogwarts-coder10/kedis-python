@@ -103,3 +103,13 @@ A frame that breaks these rules cannot be resynchronised, so the server sends on
 `KESPDecoder` applies the same discipline to server replies. Header numbers (`I<n>`, `S<n>`, `A<n>`) are canonical ASCII decimals on lines of at most 32 bytes; `N` stands alone on its line; a trailing `\r` is only accepted on `+` and `-` lines, which the server writes as CRLF; and a reply starting with any other byte is an error instead of being guessed at as plain text. When the CLI hits such an error it drops the connection, because the next reply would be read from the middle of this one.
 
 `KESPDecoder.decode(buf, lenient=True)` restores the old tolerant behaviour (CRLF anywhere, junk after `N`, plain-text lines from foreign servers) and is slated for removal in 0.3. Loose numbers are rejected in both modes.
+
+## Reply Encoding Rules
+
+`KESPEncoder` guarantees that everything it returns is one complete reply the strict decoder accepts.
+
+- **Statuses and errors are replies, not data.** The magic strings (`OK`, `+OK`, `+QUEUED`, `-ERR ...`, `ERROR ...`) are only honoured for the reply itself, and an error must match the whole marker (`-ERR` or `ERROR`, then a space or the end). `ERRORS: 5` is data. The marker is removed once and the message is otherwise untouched.
+- **Strings inside arrays and dicts are always bulk strings.** A list item or hash field named `ERROR x` is data, never an error element. Handlers that return a stored value as the whole reply (`GET`, `HGET`, `LPOP`, `RPOP`) wrap it in `BulkString`, so a value such as `OK` or `-ERR y` reaches the client as data.
+- **Booleans are integers.** `True` is `I1`, `False` is `I0`.
+- **Error text is one line.** `\r` and `\n` in an error message become spaces so a message can't start a bogus reply.
+- **Anything unencodable becomes one error reply.** Integers of more than 31 digits, arrays above 1,048,576 elements, strings above 512 MiB, nesting deeper than 32 levels, strings that are not valid UTF-8 and unknown types produce a single `EInternal server error: ...` line instead of an exception or a half-written frame.

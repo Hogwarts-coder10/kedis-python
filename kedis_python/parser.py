@@ -333,58 +333,117 @@ class KESPDecoder:
         return int(raw)
 
 
+class ReplyEncodeError(ValueError):
+    """A value cannot be put on the wire as a reply the client would accept."""
+
+
 class KESPEncoder:
+    """Turns the values handlers return into KESP bytes.
+
+    The invariant: whatever encode() returns is a single complete reply that
+    the strict KESPDecoder accepts. A value that can't be encoded that way
+    (too deep, too large, not valid UTF-8, an unknown type) never raises into
+    the server loop and never leaves half a frame on the wire: the whole
+    reply becomes one 'E' error line instead.
+
+    Handlers express statuses and errors as magic strings ("OK", "-ERR ..."),
+    and that is only honoured for the reply itself. Strings *inside* an array
+    or dict are data, so a list item or a field named "ERROR x" can no longer
+    turn into an error element. Wrap a top-level data reply in BulkString.
+    """
+
+    _STATUSES = ("OK", "+OK", "+QUEUED")
+    _ERROR_PREFIXES = ("-ERR", "ERROR")
+
     @staticmethod
     def encode(data) -> bytes:
         """
         Translates raw Python objects from the router into strict KESP network bytes.
         """
+        try:
+            return KESPEncoder._encode(data, 0, True)
+        except ReplyEncodeError as exc:
+            return KESPEncoder._error_line(f"Internal server error: {exc}")
+
+    @staticmethod
+    def _error_line(text: str) -> bytes:
+        # One physical line: a newline in the text would start a bogus reply.
+        text = text.replace("\r", " ").replace("\n", " ")
+        return f"E{text}\n".encode("utf-8", "replace")
+
+    @staticmethod
+    def _bulk(text: str) -> bytes:
+        try:
+            raw = text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ReplyEncodeError("string is not valid UTF-8") from None
+        if len(raw) > CommandParser.MAX_BULK_LENGTH:
+            raise ReplyEncodeError("string too large")
+        return b"S%d\n%s\n" % (len(raw), raw)
+
+    @staticmethod
+    def _encode(data, depth: int, top: bool) -> bytes:
+        if depth > KESPDecoder.MAX_DEPTH:
+            raise ReplyEncodeError("reply nested too deeply")
+
         # 1. Null / Missing Data
         if data is None:
             return b"N\n"
 
-        # 2. Integers
-        elif isinstance(data, int):
-            return f"I{data}\n".encode("utf-8")
+        # 2. Booleans are integers in Python; test them first, or they would
+        #    be written as 'ITrue'.
+        if isinstance(data, bool):
+            return b"I1\n" if data else b"I0\n"
 
-        # 3. Strings & Status Messages
-        elif isinstance(data, str):
-            if isinstance(data, BulkString):
-                encoded_str = data.encode("utf-8")
-                return f"S{len(encoded_str)}\n".encode("utf-8") + encoded_str + b"\n"
+        # 3. Integers. Reject what the decoder's header limit would refuse
+        #    (and never ask Python to print a gigantic int).
+        if isinstance(data, int):
+            if data.bit_length() > 128:
+                raise ReplyEncodeError("integer out of range")
+            line = f"I{int(data)}\n".encode("ascii")
+            if len(line) - 1 > KESPDecoder.MAX_HEADER_LINE:
+                raise ReplyEncodeError("integer out of range")
+            return line
 
-            # Check for simple protocol statuses
-            if data in ["OK", "+OK", "+QUEUED"]:
+        # 4. Strings & Status Messages
+        if isinstance(data, str):
+            if isinstance(data, BulkString) or not top:
+                return KESPEncoder._bulk(data)
+
+            if data in KESPEncoder._STATUSES:
                 val = data if data.startswith("+") else f"+{data}"
                 return f"{val}\n".encode("utf-8")
 
-            # Check for errors
-            elif data.startswith("-ERR") or data.startswith("ERROR"):
-                clean_err = data.replace("-ERR ", "").replace("ERROR ", "")
-                return f"E{clean_err}\n".encode("utf-8")
+            for prefix in KESPEncoder._ERROR_PREFIXES:
+                if data == prefix or data.startswith(prefix + " "):
+                    # Only the leading marker goes; the message is kept as is.
+                    return KESPEncoder._error_line(data[len(prefix) + 1 :])
 
             # Otherwise, it's a standard Binary-Safe Bulk String
-            else:
-                encoded_str = data.encode("utf-8")
-                return f"S{len(encoded_str)}\n".encode("utf-8") + encoded_str + b"\n"
+            return KESPEncoder._bulk(data)
 
-        # 4. Arrays (Lists/Sets)
-        elif isinstance(data, (list, set, tuple)):
+        # 5. Arrays (Lists/Sets)
+        if isinstance(data, (list, set, tuple)):
+            if len(data) > CommandParser.MAX_ARRAY_LENGTH:
+                raise ReplyEncodeError("array too large")
             header = f"A{len(data)}\n".encode("utf-8")
             # Recursively encode every element inside the array
-            elements = b"".join(KESPEncoder.encode(item) for item in data)
+            elements = b"".join(
+                KESPEncoder._encode(item, depth + 1, False) for item in data
+            )
             return header + elements
 
-        # 🚀 5. Dictionaries (Flattens into an alternating Key-Value Array)
-        elif isinstance(data, dict):
+        # 6. Dictionaries (Flattens into an alternating Key-Value Array)
+        if isinstance(data, dict):
             # A dictionary of 3 items becomes a KESP array of 6 items [k1, v1, k2, v2...]
+            if len(data) * 2 > CommandParser.MAX_ARRAY_LENGTH:
+                raise ReplyEncodeError("array too large")
             header = f"A{len(data) * 2}\n".encode("utf-8")
             elements = b"".join(
-                KESPEncoder.encode(str(k)) + KESPEncoder.encode(v)
+                KESPEncoder._bulk(str(k)) + KESPEncoder._encode(v, depth + 1, False)
                 for k, v in data.items()
             )
             return header + elements
 
         # Fallback
-        else:
-            return b"EInternal server error: Unknown return type\n"
+        raise ReplyEncodeError("Unknown return type")
