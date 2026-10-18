@@ -224,34 +224,68 @@ class KESPDecoder:
         LegacyError        -text     (leading '-' kept)
         BulkString         S<len>    (binary-safe: counted in bytes)
         list               A<n>      (elements may themselves be lists)
+
+    The decoder is strict by default. Header numbers are canonical ASCII
+    decimals, 'N' stands alone on its line, a trailing '\\r' is only tolerated
+    on '+' and '-' lines (the server writes those by hand as CRLF), and a
+    reply that starts with any other byte is a ReplyProtocolError rather than
+    a guess. Pass lenient=True to get the old tolerant behaviour (CRLF on any
+    line, junk after 'N', plain-text lines from foreign servers returned as
+    Status). Loose numbers stay rejected either way. The flag is slated for
+    removal in 0.3.
     """
 
     MAX_DEPTH = 32  # nesting guard, so a hostile reply can't blow the stack
-    MAX_LINE = 64 * 1024  # a header/status line longer than this is garbage
+    MAX_LINE = 64 * 1024  # a status/error line longer than this is garbage
+    MAX_HEADER_LINE = 32  # I<n> / S<n> / A<n> headers are never longer
+
+    _COUNT = re.compile(rb"(?:0|[1-9][0-9]*)")
+    _INTEGER = re.compile(rb"(?:0|-?[1-9][0-9]*)")
+
+    _TEXT_SIGILS = (b"+", b"-", b"E")
+    _NUMERIC_SIGILS = (b"I", b"S", b"A")
 
     @staticmethod
-    def decode(buf, pos: int = 0, _depth: int = 0):
+    def decode(buf, pos: int = 0, _depth: int = 0, lenient: bool = False):
         if _depth > KESPDecoder.MAX_DEPTH:
             raise ReplyProtocolError("reply nested too deeply")
         if pos >= len(buf):
             raise IncompleteReply
 
+        sigil = bytes(buf[pos : pos + 1])
+        known = sigil == b"N" or sigil in (
+            KESPDecoder._TEXT_SIGILS + KESPDecoder._NUMERIC_SIGILS
+        )
+        if not known and not lenient:
+            # Fail on the first byte; don't wait for a newline that may never come.
+            raise ReplyProtocolError("unexpected reply type byte")
+
+        # Lines that carry free text may be long; everything else is a short header.
+        if sigil in KESPDecoder._NUMERIC_SIGILS or sigil == b"N":
+            limit = KESPDecoder.MAX_HEADER_LINE
+        else:
+            limit = KESPDecoder.MAX_LINE
+
         nl = buf.find(b"\n", pos)
         if nl == -1:
-            if len(buf) - pos > KESPDecoder.MAX_LINE:
+            if len(buf) - pos > limit:
                 raise ReplyProtocolError("reply line too long")
             raise IncompleteReply
+        if nl - pos > limit:
+            raise ReplyProtocolError("reply line too long")
 
         line = bytes(buf[pos:nl])
-        if line.endswith(b"\r"):  # the hand-written replies end in \r\n
-            line = line[:-1]
+        if line.endswith(b"\r") and (lenient or sigil in (b"+", b"-")):
+            line = line[:-1]  # the hand-written replies end in \r\n
         after = nl + 1
-        sigil, rest = line[:1], line[1:]
+        rest = line[1:]
 
         if sigil == b"N":
+            if rest and not lenient:
+                raise ReplyProtocolError("invalid nil reply")
             return None, after
         if sigil == b"I":
-            return KESPDecoder._number(rest), after
+            return KESPDecoder._integer(rest), after
         if sigil == b"+":
             return Status(rest.decode("utf-8", "replace")), after
         if sigil == b"E":
@@ -260,8 +294,8 @@ class KESPDecoder:
             return LegacyError(line.decode("utf-8", "replace")), after
 
         if sigil == b"S":
-            length = KESPDecoder._number(rest)
-            if length < 0 or length > CommandParser.MAX_BULK_LENGTH:
+            length = KESPDecoder._count(rest)
+            if length > CommandParser.MAX_BULK_LENGTH:
                 raise ReplyProtocolError("invalid bulk length")
             end = after + length
             if len(buf) < end + 1:
@@ -272,24 +306,31 @@ class KESPDecoder:
             return BulkString(text), end + 1
 
         if sigil == b"A":
-            count = KESPDecoder._number(rest)
-            if count < 0 or count > CommandParser.MAX_ARRAY_LENGTH:
+            count = KESPDecoder._count(rest)
+            if count > CommandParser.MAX_ARRAY_LENGTH:
                 raise ReplyProtocolError("invalid array length")
             items = []
             for _ in range(count):
-                item, after = KESPDecoder.decode(buf, after, _depth + 1)
+                item, after = KESPDecoder.decode(buf, after, _depth + 1, lenient)
                 items.append(item)
             return items, after
 
-        # Anything else is a plain text line from an older/foreign server.
+        # lenient only: a plain text line from an older/foreign server.
         return Status(line.decode("utf-8", "replace")), after
 
     @staticmethod
-    def _number(raw: bytes) -> int:
-        try:
-            return int(raw.decode("ascii"))
-        except (ValueError, UnicodeDecodeError):
-            raise ReplyProtocolError("invalid number in reply header") from None
+    def _count(raw: bytes) -> int:
+        """A non-negative canonical ASCII decimal (lengths and counts)."""
+        if not KESPDecoder._COUNT.fullmatch(raw):
+            raise ReplyProtocolError("invalid number in reply header")
+        return int(raw)
+
+    @staticmethod
+    def _integer(raw: bytes) -> int:
+        """A canonical ASCII decimal, optionally negative (I replies)."""
+        if not KESPDecoder._INTEGER.fullmatch(raw):
+            raise ReplyProtocolError("invalid number in reply header")
+        return int(raw)
 
 
 class KESPEncoder:

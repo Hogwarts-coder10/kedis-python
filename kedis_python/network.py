@@ -75,7 +75,10 @@ class NetworkManager:
                 except IncompleteReply:
                     pass
                 except ReplyProtocolError:
-                    self._rbuf.clear()  # can't resync a garbled stream
+                    # A garbled stream can't be resynchronised, and the next
+                    # reply would be read from the middle of this one: drop
+                    # the connection so the caller reconnects cleanly.
+                    self.disconnect()
                     raise
                 else:
                     reply = bytes(self._rbuf[:end])

@@ -97,3 +97,9 @@ The command decoder is strict about where one frame ends and the next begins:
 - Blank lines and empty arrays (`A0`) are ignored between commands.
 
 A frame that breaks these rules cannot be resynchronised, so the server sends one error reply (`E<message>`) and then closes the connection. A command that happens to be named `ERROR` is an ordinary command and is not treated as a framing failure.
+
+### Reply decoding (client side)
+
+`KESPDecoder` applies the same discipline to server replies. Header numbers (`I<n>`, `S<n>`, `A<n>`) are canonical ASCII decimals on lines of at most 32 bytes; `N` stands alone on its line; a trailing `\r` is only accepted on `+` and `-` lines, which the server writes as CRLF; and a reply starting with any other byte is an error instead of being guessed at as plain text. When the CLI hits such an error it drops the connection, because the next reply would be read from the middle of this one.
+
+`KESPDecoder.decode(buf, lenient=True)` restores the old tolerant behaviour (CRLF anywhere, junk after `N`, plain-text lines from foreign servers) and is slated for removal in 0.3. Loose numbers are rejected in both modes.
