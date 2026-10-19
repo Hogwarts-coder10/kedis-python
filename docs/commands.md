@@ -279,7 +279,7 @@ Combines strings bit by bit and stores the result in `destkey`. Shorter sources 
 (integer) 3
 ```
 
-> **Note:** bit operations work on the value's bytes. For text that is its UTF-8 encoding, so `BITCOUNT` on `é` (bytes `c3 a9`) is 8, as in Redis, and `GET` after `SETBIT` returns the real bytes. This changed in 0.1.5: a bitmap saved by an earlier version that holds a byte of `0x80` or above was stored one code point per byte and reads differently now, so rebuild such bitmaps (bitmaps whose bytes are all below `0x80` are unaffected).
+> **Note:** bit operations work on the value's bytes. For text that is its UTF-8 encoding, so `BITCOUNT` on `é` (bytes `c3 a9`) is 8, as in Redis, and `GET` after `SETBIT` returns the real bytes. This changed in 0.2.0: a bitmap saved by an earlier version that holds a byte of `0x80` or above was stored one code point per byte and reads differently now, so rebuild such bitmaps (bitmaps whose bytes are all below `0x80` are unaffected).
 
 > **Not implemented yet:** `BITPOS`, `BITFIELD`
 
