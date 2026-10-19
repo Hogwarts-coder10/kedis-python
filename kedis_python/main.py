@@ -25,10 +25,12 @@ from .parser import (
     ErrorReply,
     IncompleteReply,
     KESPDecoder,
+    KESPEncoder,
     LegacyError,
     ProtocolError,
 )
 from .store import KedisStore
+from .textcodec import printable, to_bytes, to_text
 from .ui import UI, console
 
 # --- The Command History Hook ---
@@ -642,7 +644,7 @@ class KedisClient:
                     kesp_bytes = self.network.read_reply()
                 except AttributeError:
                     # Fallback if NetworkManager doesn't expose the raw socket
-                    kesp_bytes = self.network.send_command(kesp_payload.decode("utf-8"))
+                    kesp_bytes = self.network.send_command(to_text(kesp_payload))
 
             # 2. TRANSLATE KESP BYTES BACK TO UI TEXT
             value = self._decode_kesp_value(kesp_bytes)
@@ -763,11 +765,7 @@ class KedisClient:
 
         if not tokens:
             return b""
-        header = f"A{len(tokens)}\n".encode("utf-8")
-        body = b"".join(
-            f"S{len(t.encode('utf-8'))}\n{t}\n".encode("utf-8") for t in tokens
-        )
-        return header + body
+        return KESPEncoder.encode_command(tokens)
 
     STREAM_VIEWS = {
         "XRANGE": "Stream Range",
@@ -780,11 +778,21 @@ class KedisClient:
         """KESP bytes -> Python value (see parser.KESPDecoder). Nested arrays
         stay nested. Text that lost its final newline is still accepted."""
         if isinstance(raw_bytes, str):
-            raw_bytes = raw_bytes.encode("utf-8")
+            raw_bytes = to_bytes(raw_bytes)
         try:
             value, _ = KESPDecoder.decode(raw_bytes)
         except IncompleteReply:
             value, _ = KESPDecoder.decode(bytes(raw_bytes) + b"\n")
+        return self._printable(value)
+
+    @classmethod
+    def _printable(cls, value):
+        """Shows raw (non-UTF-8) bytes as \\xNN so no table or message can
+        fail to print them. The reply's string types are kept."""
+        if isinstance(value, list):
+            return [cls._printable(v) for v in value]
+        if isinstance(value, str):
+            return type(value)(printable(value))
         return value
 
     def _decode_kesp_for_ui(self, raw_bytes: bytes) -> str:

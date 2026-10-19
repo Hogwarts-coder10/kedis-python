@@ -1,5 +1,7 @@
 import re
 
+from .textcodec import to_bytes, to_text
+
 
 class ProtocolError(list):
     """What CommandParser.parse() returns, in place of a token list, when the
@@ -79,16 +81,11 @@ class CommandParser:
         def fail(message):
             return ProtocolError(message), total
 
-        try:
-            first_byte = raw_data[pos : pos + 1].decode("utf-8")
-        except UnicodeDecodeError:
-            return fail("-ERR Malformed payload")
-
         # Inline fallback — newline-terminated, exactly like Redis's own
         # inline command mode. This is what protects it against
         # fragmentation: a command split across two TCP packets is NOT
         # treated as complete until its terminator actually arrives.
-        if first_byte != "A":
+        if raw_data[pos : pos + 1] != b"A":
             nl_index = raw_data.find(b"\n", pos)
 
             if nl_index == -1:
@@ -102,11 +99,7 @@ class CommandParser:
             if nl_index - pos > CommandParser.MAX_INLINE_LENGTH:
                 return fail("-ERR Protocol error: too big inline request")
 
-            try:
-                tokens = raw_data[pos:nl_index].decode("utf-8").strip().split()
-            except UnicodeDecodeError:
-                return ProtocolError("-ERR Invalid text encoding"), nl_index + 1
-            return tokens, nl_index + 1
+            return to_text(raw_data[pos:nl_index]).strip().split(), nl_index + 1
 
         # KESP Decoder: Strict, Binary-safe byte counting
         try:
@@ -161,7 +154,7 @@ class CommandParser:
                 if raw_data[payload_end : payload_end + 1] != b"\n":
                     return fail("-ERR Protocol error: bulk string not newline-terminated")
 
-                tokens.append(raw_data[pointer:payload_end].decode("utf-8"))
+                tokens.append(to_text(raw_data[pointer:payload_end]))
                 pointer = payload_end + 1
 
             return tokens, pointer
@@ -287,11 +280,11 @@ class KESPDecoder:
         if sigil == b"I":
             return KESPDecoder._integer(rest), after
         if sigil == b"+":
-            return Status(rest.decode("utf-8", "replace")), after
+            return Status(to_text(rest)), after
         if sigil == b"E":
-            return ErrorReply(rest.decode("utf-8", "replace")), after
+            return ErrorReply(to_text(rest)), after
         if sigil == b"-":
-            return LegacyError(line.decode("utf-8", "replace")), after
+            return LegacyError(to_text(line)), after
 
         if sigil == b"S":
             length = KESPDecoder._count(rest)
@@ -302,8 +295,7 @@ class KESPDecoder:
                 raise IncompleteReply
             if buf[end : end + 1] != b"\n":
                 raise ReplyProtocolError("bulk string not newline-terminated")
-            text = bytes(buf[after:end]).decode("utf-8", "replace")
-            return BulkString(text), end + 1
+            return BulkString(to_text(buf[after:end])), end + 1
 
         if sigil == b"A":
             count = KESPDecoder._count(rest)
@@ -316,7 +308,7 @@ class KESPDecoder:
             return items, after
 
         # lenient only: a plain text line from an older/foreign server.
-        return Status(line.decode("utf-8", "replace")), after
+        return Status(to_text(line)), after
 
     @staticmethod
     def _count(raw: bytes) -> int:
@@ -366,15 +358,29 @@ class KESPEncoder:
             return KESPEncoder._error_line(f"Internal server error: {exc}")
 
     @staticmethod
+    def encode_command(tokens) -> bytes:
+        """A command as the KESP array a server reads. Binary-safe: every token
+        is its exact bytes, whatever it holds."""
+        parts = [b"A%d\n" % len(tokens)]
+        for token in tokens:
+            raw = to_bytes(str(token))
+            parts += [b"S%d\n" % len(raw), raw, b"\n"]
+        return b"".join(parts)
+
+    @staticmethod
     def _error_line(text: str) -> bytes:
         # One physical line: a newline in the text would start a bogus reply.
         text = text.replace("\r", " ").replace("\n", " ")
-        return f"E{text}\n".encode("utf-8", "replace")
+        try:
+            raw = to_bytes(text)
+        except UnicodeEncodeError:
+            raw = text.encode("utf-8", "replace")
+        return b"E" + raw + b"\n"
 
     @staticmethod
     def _bulk(text: str) -> bytes:
         try:
-            raw = text.encode("utf-8")
+            raw = to_bytes(text)
         except UnicodeEncodeError:
             raise ReplyEncodeError("string is not valid UTF-8") from None
         if len(raw) > CommandParser.MAX_BULK_LENGTH:

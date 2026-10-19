@@ -77,8 +77,7 @@ def notify_stream_waiters():
 
 def _encode_command(tokens: list) -> bytes:
     """A command as the KESP array a replica reads from the slipstream."""
-    body = b"".join(f"S{len(t.encode('utf-8'))}\n{t}\n".encode("utf-8") for t in tokens)
-    return f"A{len(tokens)}\n".encode("utf-8") + body
+    return KESPEncoder.encode_command(tokens)
 
 
 async def broadcast_to_replicas(forwards: list, label: str) -> None:

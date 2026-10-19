@@ -2,6 +2,7 @@ import select
 import socket
 
 from .parser import IncompleteReply, KESPDecoder, ReplyProtocolError
+from .textcodec import to_bytes, to_text
 
 RECV_CHUNK = 64 * 1024
 
@@ -104,5 +105,5 @@ class NetworkManager:
         if not self.sock:
             raise OSError("Not connected to server.")
 
-        self.sock.sendall(raw_input.encode("utf-8"))
-        return self.read_reply().decode("utf-8", "replace").strip()
+        self.sock.sendall(to_bytes(raw_input))
+        return to_text(self.read_reply()).strip()

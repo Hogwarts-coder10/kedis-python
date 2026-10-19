@@ -151,9 +151,15 @@ def test_oversized_strings_are_rejected(monkeypatch):
     assert is_single_error_line(encode(BulkString("x" * 11)))
 
 
-@pytest.mark.parametrize("value", ["\udc80", BulkString("\ud800"), ["fine", "\ud800"]])
-def test_strings_that_are_not_valid_utf8_do_not_raise(value):
+@pytest.mark.parametrize("value", ["\ud800", BulkString("\ud800"), ["fine", "\ud800"]])
+def test_surrogates_no_byte_can_produce_do_not_raise(value):
     assert is_single_error_line(encode(value))
+
+
+def test_escaped_bytes_are_written_as_the_raw_bytes():
+    # U+DC80..U+DCFF stand for bytes that are not valid UTF-8 (see textcodec.py).
+    assert encode(BulkString("\udcff\udc80")) == b"S2\n\xff\x80\n"
+    assert encode(["a\udcc3", "\udce9"]) == b"A2\nS2\na\xc3\nS1\n\xe9\n"
 
 
 def test_unknown_types_become_an_error_reply():

@@ -3,7 +3,7 @@ import threading
 import time
 from typing import Any
 
-from .parser import BulkString
+from .parser import BulkString, KESPEncoder
 from .store import KedisStore
 from .stream import StreamError
 
@@ -1070,12 +1070,7 @@ class CommandHandler:
         receivers = 0
 
         # Construct raw KESP bytes for the broadcast push
-        kesp_payload = (
-            f"A3\n"
-            f"S7\nmessage\n"
-            f"S{len(channel.encode('utf-8'))}\n{channel}\n"
-            f"S{len(message.encode('utf-8'))}\n{message}\n"
-        ).encode("utf-8")
+        kesp_payload = KESPEncoder.encode_command(["message", channel, message])
 
         dead_sockets = []
         for sock in subscribers:

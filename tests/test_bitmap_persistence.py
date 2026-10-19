@@ -7,6 +7,7 @@ import pytest
 
 from kedis_python import aof
 from kedis_python.store import KedisStore
+from kedis_python.textcodec import to_bytes
 
 TRICKY_BYTES = [0, 9, 10, 13, 32, 127, 128, 160, 200, 255]  # incl. whitespace
 
@@ -111,7 +112,7 @@ class TestReplay:
         s2 = open_store()
         try:
             assert s2.get("bm") == live
-            assert [ord(c) for c in s2.get("bm")] == TRICKY_BYTES
+            assert list(to_bytes(s2.get("bm"))) == TRICKY_BYTES
         finally:
             s2.shutdown()
 
@@ -236,9 +237,11 @@ class TestCompaction:
         s = open_store()
         live = build_tricky_bitmap(s)
         s.compact_aof()
-        first = aof_lines()
+        with open("test.aof", "rb") as f:
+            first = f.read()
         s.compact_aof()
-        assert aof_lines() == first
+        with open("test.aof", "rb") as f:
+            assert f.read() == first
         s.shutdown()
         s2 = open_store()
         try:

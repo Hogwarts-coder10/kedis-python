@@ -14,6 +14,7 @@ import pytest
 
 from kedis_python.commands import CommandHandler
 from kedis_python.store import KedisStore
+from kedis_python.textcodec import to_bytes
 
 DOCS = Path(__file__).resolve().parent.parent / "docs" / "commands.md"
 
@@ -113,7 +114,7 @@ class TestDocumentedBehaviour:
         assert run(h, "BITCOUNT f 0 0") == 1
         assert run(h, "BITCOUNT f -1 -1") == 1
         run(h, "SETBIT g 0 1")
-        assert ord(h.store.get("g")) == 0b10000000
+        assert to_bytes(h.store.get("g")) == b"\x80"
 
     def test_bitop_pads_short_sources_and_reports_bytes(self, h):
         run(h, "SETBIT a 0 1")

@@ -10,6 +10,7 @@ Run: pytest test_bitmaps.py -v
 
 import pytest
 from kedis_python.store import KedisStore
+from kedis_python.textcodec import to_bytes, to_text
 
 
 @pytest.fixture
@@ -26,7 +27,12 @@ def store(tmp_path, monkeypatch):
 
 
 def byte_at(s: str, i: int) -> int:
-    return ord(s[i])
+    return to_bytes(s)[i]
+
+
+def raw(*values: int) -> str:
+    """The string whose bytes are `values` (any 0-255, not only ASCII)."""
+    return to_text(bytes(values))
 
 
 # ---------------------------------------------------------------------
@@ -120,29 +126,29 @@ def test_bitcount_with_negative_indices(store):
 # ---------------------------------------------------------------------
 
 def test_bitop_and(store):
-    store.set("a", chr(0b11001100))
-    store.set("b", chr(0b10101010))
+    store.set("a", raw(0b11001100))
+    store.set("b", raw(0b10101010))
     length = store.bitop("AND", "dest", "a", "b")
     assert length == 1
     assert byte_at(store.get("dest"), 0) == 0b10001000
 
 
 def test_bitop_or(store):
-    store.set("a", chr(0b11001100))
-    store.set("b", chr(0b10101010))
+    store.set("a", raw(0b11001100))
+    store.set("b", raw(0b10101010))
     store.bitop("OR", "dest", "a", "b")
     assert byte_at(store.get("dest"), 0) == 0b11101110
 
 
 def test_bitop_xor(store):
-    store.set("a", chr(0b11001100))
-    store.set("b", chr(0b10101010))
+    store.set("a", raw(0b11001100))
+    store.set("b", raw(0b10101010))
     store.bitop("XOR", "dest", "a", "b")
     assert byte_at(store.get("dest"), 0) == 0b01100110
 
 
 def test_bitop_not(store):
-    store.set("a", chr(0b11001100))
+    store.set("a", raw(0b11001100))
     store.bitop("NOT", "dest", "a")
     assert byte_at(store.get("dest"), 0) == 0b00110011
 
@@ -155,8 +161,8 @@ def test_bitop_not_rejects_multiple_sources(store):
 
 
 def test_bitop_pads_shorter_sources_with_zero_bytes(store):
-    store.set("short", chr(0b11111111))  # 1 byte
-    store.set("long", chr(0b11111111) + chr(0b11111111))  # 2 bytes
+    store.set("short", raw(0b11111111))  # 1 byte
+    store.set("long", raw(0b11111111, 0b11111111))  # 2 bytes
 
     length = store.bitop("AND", "dest", "short", "long")
     assert length == 2
@@ -173,7 +179,7 @@ def test_bitop_wrongtype_on_source_key(store):
 
 
 def test_bitop_missing_source_treated_as_zero_length(store):
-    store.set("a", chr(0b11111111))
+    store.set("a", raw(0b11111111))
     length = store.bitop("AND", "dest", "a", "does_not_exist")
     assert length == 1
     assert byte_at(store.get("dest"), 0) == 0b00000000

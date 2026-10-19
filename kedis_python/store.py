@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 from . import aof
 from .hyperloglog import HyperLogLog
+from .textcodec import to_bytes, to_text
 from .skiplist import SkipList
 from .stream import (
     GROUP_RECORD_KINDS,
@@ -1203,13 +1204,10 @@ class KedisStore:
     # for anything that isn't a list/set/hash/zset) and with the
     # existing KESP string encoder — no wire-protocol changes needed.
     #
-    # Caveat: this only round-trips correctly for byte values 0-255 per
-    # character. A key set via plain SET with multi-byte UTF-8 text
-    # (e.g. emoji, non-Latin scripts) does not map 1:1 to "one Python
-    # character = one byte", so bit operations on such a key act on its
-    # Unicode code points, not its UTF-8 byte encoding. That's a gap in
-    # the engine's existing str-based value model generally, not
-    # something specific to bitmaps.
+    # A bitmap is the value's bytes: its UTF-8 encoding, with bytes that
+    # are not valid UTF-8 carried as U+DC80..U+DCFF (see textcodec.py). So
+    # SETBIT/BITOP write exact bytes, GET returns them unchanged, and
+    # BITCOUNT on plain text counts the bits of its UTF-8 bytes, as Redis does.
     # ------------------------------------------------------------------
 
     def _get_bitmap_bytes(self, key: str) -> list[int]:
@@ -1221,7 +1219,7 @@ class KedisStore:
             raise TypeError(
                 "WRONGTYPE Operation against a key holding the wrong kind of value"
             )
-        return [ord(c) for c in val]
+        return list(to_bytes(val))
 
     def setbit(self, key: str, offset: int, bit: int) -> int:
         self._evict_if_expired(key)
@@ -1244,7 +1242,7 @@ class KedisStore:
 
         raw_bytes[byte_index] = (old_byte | mask) if bit == 1 else (old_byte & ~mask & 0xFF)
 
-        self._data[key] = "".join(chr(b) for b in raw_bytes)
+        self._data[key] = to_text(bytes(raw_bytes))
         self._log_operation("SETBIT", key, offset, bit)
         self._touch_write(key)
         return old_bit
@@ -1317,7 +1315,7 @@ class KedisStore:
                     result = [a ^ b for a, b in zip(result, other)]
 
         if result:
-            self._data[destkey] = "".join(chr(b) for b in result)
+            self._data[destkey] = to_text(bytes(result))
         elif destkey in self._data:
             del self._data[destkey]
             self._expires.pop(destkey, None)

@@ -112,4 +112,16 @@ A frame that breaks these rules cannot be resynchronised, so the server sends on
 - **Strings inside arrays and dicts are always bulk strings.** A list item or hash field named `ERROR x` is data, never an error element. Handlers that return a stored value as the whole reply (`GET`, `HGET`, `LPOP`, `RPOP`) wrap it in `BulkString`, so a value such as `OK` or `-ERR y` reaches the client as data.
 - **Booleans are integers.** `True` is `I1`, `False` is `I0`.
 - **Error text is one line.** `\r` and `\n` in an error message become spaces so a message can't start a bogus reply.
-- **Anything unencodable becomes one error reply.** Integers of more than 31 digits, arrays above 1,048,576 elements, strings above 512 MiB, nesting deeper than 32 levels, strings that are not valid UTF-8 and unknown types produce a single `EInternal server error: ...` line instead of an exception or a half-written frame.
+- **Anything unencodable becomes one error reply.** Integers of more than 31 digits, arrays above 1,048,576 elements, strings above 512 MiB, nesting deeper than 32 levels, text that no byte string can produce (a lone surrogate outside `U+DC80`-`U+DCFF`) and unknown types produce a single `EInternal server error: ...` line instead of an exception or a half-written frame.
+
+## Binary Safety
+
+Keys, values, field names, members and PUBLISH messages can be any bytes, in both directions. Inside the engine values are Python strings, and a byte that is not valid UTF-8 is carried as a lone surrogate `U+DC80`-`U+DCFF` (Python's `surrogateescape`), so every byte string round-trips exactly:
+
+- The command parser and the reply decoder turn payload bytes into text this way instead of rejecting or replacing them. A value such as `\xff\xfe\x00\x80` no longer closes the connection.
+- The encoder turns those characters back into the original bytes, so `GET` returns exactly what `SET` stored.
+- The AOF and snapshots keep them intact (the AOF writes strings with `surrogatepass`, snapshots use JSON `\u` escapes), as does the replication snapshot.
+- Bit operations work on those bytes (see `BITCOUNT` in `commands.md`).
+- The CLI shows raw bytes as `\xNN` rather than failing to print them. A literal backslash in a value is shown as is, so `\xff` on screen can mean either.
+
+Lengths and ordering stay per character, as before: `len()` of a value counts characters, and sorted-set members compare by code point.
