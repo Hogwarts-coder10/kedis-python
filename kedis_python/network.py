@@ -5,6 +5,7 @@ from .parser import IncompleteReply, KESPDecoder, ReplyProtocolError
 from .textcodec import to_bytes, to_text
 
 RECV_CHUNK = 64 * 1024
+MAX_REPLY_BYTES = 1024 * 1024 * 1024  # most bytes buffered while waiting for one reply
 
 
 class NetworkManager:
@@ -69,12 +70,13 @@ class NetworkManager:
         if not self.sock:
             raise OSError("Not connected to server.")
 
+        need = 0  # buffer length at which the pending reply can progress
         while True:
-            if self._rbuf:
+            if self._rbuf and len(self._rbuf) >= need:
                 try:
                     _, end = KESPDecoder.decode(self._rbuf)
-                except IncompleteReply:
-                    pass
+                except IncompleteReply as incomplete:
+                    need = incomplete.need
                 except ReplyProtocolError:
                     # A garbled stream can't be resynchronised, and the next
                     # reply would be read from the middle of this one: drop
@@ -93,6 +95,9 @@ class NetworkManager:
                 if not chunk:
                     raise OSError("Server silently dropped connection")
                 self._rbuf += chunk
+                if len(self._rbuf) > MAX_REPLY_BYTES:
+                    self.disconnect()  # nothing sane is this big; stop buffering
+                    raise ReplyProtocolError("reply too large")
                 if not self._sock_has_data():
                     break
 

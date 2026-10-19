@@ -9,6 +9,9 @@ from .stream import StreamError
 
 
 class CommandHandler:
+    # Bytes a pub/sub subscriber may leave unread before the server cuts it off.
+    MAX_SUBSCRIBER_BUFFER = 32 * 1024 * 1024
+
     def __init__(self, store: KedisStore):
         self.store = store
 
@@ -1099,6 +1102,19 @@ class CommandHandler:
             return
         if sub.is_closing():
             raise ConnectionError("subscriber is gone")
+        transport = getattr(sub, "transport", None)
+        if (
+            transport is not None
+            and transport.get_write_buffer_size() > self.MAX_SUBSCRIBER_BUFFER
+        ):
+            # A subscriber that isn't reading would otherwise make the server
+            # hold every message for it, without limit. Cut it off instead.
+            loop = self.event_loop
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(sub.close)
+            else:
+                sub.close()
+            raise ConnectionError("subscriber output buffer limit exceeded")
         loop = self.event_loop
         if loop is not None and loop.is_running():
             loop.call_soon_threadsafe(sub.write, payload)

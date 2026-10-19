@@ -28,6 +28,7 @@ class CommandParser:
     MAX_HEADER_LINE = 32  # more than enough for "A123456\n" / "S123456\n"
     MAX_ARRAY_LENGTH = 1024 * 1024  # cap on a declared element count
     MAX_BULK_LENGTH = 512 * 1024 * 1024  # cap on a single declared string length
+    MAX_COMMAND_BYTES = 512 * 1024 * 1024  # cap on all payload bytes in one command
 
     # Header numbers are canonical ASCII decimals: no sign, no spaces, no
     # underscores, no leading zeros, no non-ASCII digits (all of which int()
@@ -35,7 +36,7 @@ class CommandParser:
     _COUNT = re.compile(rb"(?:0|[1-9][0-9]*)")
 
     @staticmethod
-    def parse(raw_data: bytes):
+    def parse(raw_data, start: int = 0):
         """
         Parses incoming network data. Returns (tokens, bytes_consumed).
 
@@ -46,22 +47,38 @@ class CommandParser:
           which carry no command. The caller must drop n bytes.
         - (ProtocolError, n): the stream is not valid KESP. It cannot be
           resynchronised, so the caller should reply and close the connection.
+
+        raw_data may be bytes or a bytearray. Parsing starts at offset start and
+        bytes_consumed counts from there, so a caller can work through a buffer
+        holding many pipelined commands without copying or trimming it each time.
         """
-        pos = 0
-        while pos < len(raw_data):
-            tokens, end = CommandParser._parse_frame(raw_data, pos)
+        tokens, consumed, _ = CommandParser.parse_buffer(raw_data, start)
+        return tokens, consumed
+
+    @staticmethod
+    def parse_buffer(raw_data, start: int = 0):
+        """parse(), plus a hint for incomplete frames: returns (tokens, consumed,
+        need). When the next frame is incomplete, need is the length the bytes
+        from start + consumed must reach before parsing can make any progress
+        (a half-received string payload is the usual case), so the caller can
+        keep reading without re-parsing on every chunk. need is 0 otherwise."""
+        total = len(raw_data)
+        pos = start
+        while pos < total:
+            hint = [0]
+            tokens, end = CommandParser._parse_frame(raw_data, pos, hint)
             if tokens is None:  # frame incomplete
-                return [], pos  # pos > 0 only if blank frames were skipped
+                return [], pos - start, max(hint[0] - pos, 1)
             if isinstance(tokens, ProtocolError):
-                return tokens, end
+                return tokens, end - start, 0
             if tokens:
                 # Only the command name is normalised. Every other token is data
                 # (keys, values, field names) until a handler says otherwise, so
                 # handlers match their own options case-insensitively.
                 tokens[0] = tokens[0].upper()
-                return tokens, end
+                return tokens, end - start, 0
             pos = end  # blank frame: skip it and keep scanning
-        return [], pos
+        return [], pos - start, 0
 
     @staticmethod
     def _count(raw_data: bytes, start: int, end: int):
@@ -72,10 +89,11 @@ class CommandParser:
         return int(field)
 
     @staticmethod
-    def _parse_frame(raw_data: bytes, pos: int):
+    def _parse_frame(raw_data, pos: int, hint: list):
         """Parses one frame starting at pos. Returns (tokens, end), where
         tokens is a list (possibly empty), a ProtocolError, or None when the
-        frame is incomplete. For a ProtocolError, end is len(raw_data)."""
+        frame is incomplete (then hint[0] is set to the buffer length at which it
+        could progress). For a ProtocolError, end is len(raw_data)."""
         total = len(raw_data)
 
         def fail(message):
@@ -94,6 +112,7 @@ class CommandParser:
                 # buffer without limit.
                 if total - pos > CommandParser.MAX_INLINE_LENGTH:
                     return fail("-ERR Protocol error: too big inline request")
+                hint[0] = total + 1
                 return None, pos  # incomplete, wait for the newline
 
             if nl_index - pos > CommandParser.MAX_INLINE_LENGTH:
@@ -108,6 +127,7 @@ class CommandParser:
             if nl_index == -1:
                 if total - pos > CommandParser.MAX_HEADER_LINE:
                     return fail("-ERR Protocol error: invalid array header")
+                hint[0] = total + 1
                 return None, pos  # Incomplete array header, wait for more bytes
 
             if nl_index - pos > CommandParser.MAX_HEADER_LINE:
@@ -119,9 +139,11 @@ class CommandParser:
 
             pointer = nl_index + 1
             tokens = []
+            declared = 0  # payload bytes this command has asked for so far
 
             for _ in range(expected_args):
                 if pointer >= total:
+                    hint[0] = total + 1
                     return None, pos  # next element header not here yet
 
                 # Reject a wrong sigil as soon as it arrives, not after a newline.
@@ -135,6 +157,7 @@ class CommandParser:
                     # be able to buffer forever either.
                     if total - pointer > CommandParser.MAX_HEADER_LINE:
                         return fail("-ERR Protocol error: invalid bulk length")
+                    hint[0] = total + 1
                     return None, pos  # incomplete string header
 
                 if nl_idx - pointer > CommandParser.MAX_HEADER_LINE:
@@ -144,11 +167,16 @@ class CommandParser:
                 if str_len is None or str_len > CommandParser.MAX_BULK_LENGTH:
                     return fail("-ERR Protocol error: invalid bulk length")
 
+                declared += str_len
+                if declared > CommandParser.MAX_COMMAND_BYTES:
+                    return fail("-ERR Protocol error: command too large")
+
                 pointer = nl_idx + 1
                 payload_end = pointer + str_len
 
                 # Check if the full string + trailing newline has arrived yet
                 if payload_end + 1 > total:
+                    hint[0] = payload_end + 1
                     return None, pos  # incomplete payload, wait for next payload
 
                 if raw_data[payload_end : payload_end + 1] != b"\n":
@@ -196,7 +224,15 @@ class LegacyError(ErrorReply):
 
 
 class IncompleteReply(Exception):
-    """The buffer ends in the middle of a reply: read more bytes, retry."""
+    """The buffer ends in the middle of a reply: read more bytes, retry.
+
+    need is the buffer length (counted from the start of the buffer decode() was
+    given) at which retrying could make progress, so a caller waiting for a large
+    string need not decode again after every chunk. 0 means unknown."""
+
+    def __init__(self, need: int = 0):
+        super().__init__(need)
+        self.need = need
 
 
 class ReplyProtocolError(ValueError):
@@ -243,7 +279,7 @@ class KESPDecoder:
         if _depth > KESPDecoder.MAX_DEPTH:
             raise ReplyProtocolError("reply nested too deeply")
         if pos >= len(buf):
-            raise IncompleteReply
+            raise IncompleteReply(pos + 1)
 
         sigil = bytes(buf[pos : pos + 1])
         known = sigil == b"N" or sigil in (
@@ -263,7 +299,7 @@ class KESPDecoder:
         if nl == -1:
             if len(buf) - pos > limit:
                 raise ReplyProtocolError("reply line too long")
-            raise IncompleteReply
+            raise IncompleteReply(len(buf) + 1)
         if nl - pos > limit:
             raise ReplyProtocolError("reply line too long")
 
@@ -292,7 +328,7 @@ class KESPDecoder:
                 raise ReplyProtocolError("invalid bulk length")
             end = after + length
             if len(buf) < end + 1:
-                raise IncompleteReply
+                raise IncompleteReply(end + 1)
             if buf[end : end + 1] != b"\n":
                 raise ReplyProtocolError("bulk string not newline-terminated")
             return BulkString(to_text(buf[after:end])), end + 1

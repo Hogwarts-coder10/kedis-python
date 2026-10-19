@@ -24,6 +24,18 @@ global_handler = CommandHandler(global_store)
 HOST = "127.0.0.1"
 PORT = 6379
 
+# --- Per-connection budgets (see docs/limits.md) ---------------------------------
+MAX_CLIENTS = 10_000  # connections served at once; more are refused
+# A command that is only partly received must keep arriving: it is dropped if no
+# byte comes for STALL_TIMEOUT seconds, or if it is still unfinished after
+# FRAME_DEADLINE seconds plus the time FRAME_MIN_RATE bytes/second would need for
+# its size. A connection with nothing half-sent can idle for as long as it likes.
+STALL_TIMEOUT = 30.0
+FRAME_DEADLINE = 60.0
+FRAME_MIN_RATE = 256 * 1024
+YIELD_EVERY = 256  # commands run back to back before other clients get a turn
+_active_clients = 0
+
 # Replication Telemetry
 server_role = "master"
 server_host = None
@@ -459,25 +471,51 @@ class AsyncKedisSession:
         # The Surge Tank : Buffers the fragmmented TCP packets
         intake_buffer = bytearray()
         protocol_failed = False
+        loop = asyncio.get_running_loop()
+        need = 0  # buffer length at which the pending command can progress
+        frame_started = loop.time()  # when the pending (half-received) command began
+        executed = 0
+        timed_out = b"EProtocol error: timed out waiting for the rest of a command\n"
 
         while True:
             try:
+                # A half-received command must keep moving (see STALL_TIMEOUT).
+                timeout = None
+                if intake_buffer:
+                    allowed = FRAME_DEADLINE + max(need, len(intake_buffer)) / FRAME_MIN_RATE
+                    timeout = min(STALL_TIMEOUT, frame_started + allowed - loop.time())
+                    if timeout <= 0:
+                        await self.send(timed_out)
+                        break
+
                 # Widenning the intake pipe to 64KB per read
-                chunk = await self.reader.read(65536)
+                try:
+                    chunk = await asyncio.wait_for(self.reader.read(65536), timeout)
+                except asyncio.TimeoutError:
+                    await self.send(timed_out)
+                    break
                 if not chunk:
                     break
 
                 # pool the new bytes into the intake buffer
+                if not intake_buffer:
+                    frame_started = loop.time()
                 intake_buffer.extend(chunk)
 
-                # Inner loop to process pipelined commands within the buffer
-                while True:
-                    if not intake_buffer:
-                        break
+                # A big value is coming and has not all arrived: don't re-parse
+                # the buffer after every chunk, just keep reading.
+                if len(intake_buffer) < need:
+                    continue
 
+                # Inner loop to process pipelined commands within the buffer.
+                # pos walks the buffer; consumed bytes are dropped once at the end.
+                pos = 0
+                need = 0
+                while pos < len(intake_buffer):
                     try:
-                        # 🚀 FIX: Unpack the tuple
-                        tokens, consumed = CommandParser.parse(bytes(intake_buffer))
+                        tokens, consumed, hint = CommandParser.parse_buffer(
+                            intake_buffer, pos
+                        )
                     except Exception:
                         break  # Wait for next TCP packet
 
@@ -487,14 +525,20 @@ class AsyncKedisSession:
                         clean_err = tokens.message.replace("-ERR", "").strip()
                         await self.send(f"E{clean_err}\n".encode("utf-8"))
                         intake_buffer.clear()
+                        pos = 0
                         protocol_failed = True
                         break
 
                     if not tokens:
-                        if consumed:  # blank line / empty array: nothing to run
-                            del intake_buffer[:consumed]
-                            continue
-                        break  # Parser returned nothing, wait for more data
+                        # Nothing runnable: only blank frames (dropped below), then
+                        # a command that has not all arrived.
+                        pos += consumed
+                        need = hint
+                        break
+
+                    executed += 1
+                    if executed % YIELD_EVERY == 0:
+                        await asyncio.sleep(0)  # let other clients run
 
                     # Execute the fully assembled command
                     cmd = tokens[0].upper()
@@ -515,7 +559,7 @@ class AsyncKedisSession:
                             await self.send(b"+OK Replica handshake initiated\r\n")
 
                         # 🚀 FIX: Slicing
-                        del intake_buffer[:consumed]
+                        pos += consumed
                         continue
 
                     if cmd == "SYNC":
@@ -553,7 +597,7 @@ class AsyncKedisSession:
                             )
 
                         # 🚀 FIX: Slicing
-                        del intake_buffer[:consumed]
+                        pos += consumed
                         continue
 
                     if cmd in self.tx_router:
@@ -575,7 +619,7 @@ class AsyncKedisSession:
                             await self.send(
                                 b"-EREADONLY You can't write against a read-only replica.\n"
                             )
-                            del intake_buffer[:consumed]
+                            pos += consumed
                             continue
 
                         if cmd == "XREAD":
@@ -604,8 +648,11 @@ class AsyncKedisSession:
                         await broadcast_to_replicas(forwards, cmd)
 
                     # 🚀 FIX: Slicing for standard commands
-                    del intake_buffer[:consumed]
+                    pos += consumed
 
+                del intake_buffer[:pos]
+                if pos:
+                    frame_started = loop.time()  # what is left is a new command
                 if protocol_failed:
                     break  # fall through to the close below
 
@@ -633,9 +680,24 @@ async def handle_connection(reader, writer):
     """
     Spawns a new isolated session object for every incoming TCP connection.
     """
+    global _active_clients
+    if _active_clients >= MAX_CLIENTS:
+        # Refuse politely and free the socket at once; don't build a session.
+        try:
+            writer.write(b"Emax number of clients reached\n")
+            await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+        writer.close()
+        return
+
     global_handler.event_loop = asyncio.get_running_loop()  # pub/sub pushes are queued onto it
-    session = AsyncKedisSession(reader, writer)
-    await session.run()
+    _active_clients += 1
+    try:
+        session = AsyncKedisSession(reader, writer)
+        await session.run()
+    finally:
+        _active_clients -= 1
 
 
 async def main():
