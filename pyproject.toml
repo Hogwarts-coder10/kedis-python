@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -14,10 +14,15 @@ authors = [
     { name = "V SS Karthik" }
 ]
 
-# If your project actually depends on third-party packages at runtime,
-# list them here instead of leaving this empty — check requirements.txt
-# and copy the real ones over.
-dependencies = ["rich","pyfiglet"]
+keywords = ["redis", "in-memory", "key-value", "database", "streams", "pub-sub"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database",
+]
+dependencies = ["rich", "pyfiglet"]
 
 [project.urls]
 Homepage = "https://github.com/Hogwarts-coder10/kedis-python"

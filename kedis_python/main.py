@@ -35,22 +35,35 @@ from .ui import UI, console
 
 # --- The Command History Hook ---
 
+def _setup_history(readline, register, histfile):
+    """Loads the command history and arranges to save it at exit. It never
+    raises: a missing file, or one this readline can't parse (libedit rejects an
+    empty file with EINVAL, and the first launch leaves exactly that), just means
+    starting with a clean history."""
+    readline.set_history_length(1000)
+    try:
+        readline.read_history_file(histfile)
+    except OSError:
+        pass
+
+    def save():
+        try:
+            readline.write_history_file(histfile)
+        except OSError:
+            pass  # read-only home, full disk: not worth a traceback at exit
+
+    register(save)
+
+
 try:
     import atexit
     import readline
 
-    histfile = os.path.join(os.path.expanduser("~"), ".kedis_history")
-
-    try:
-        readline.read_history_file(histfile)
-
-        readline.set_history_length(1000)
-
-    except FileNotFoundError:
-        pass
-
-    atexit.register(readline.write_history_file, histfile)
-
+    _setup_history(
+        readline,
+        atexit.register,
+        os.path.join(os.path.expanduser("~"), ".kedis_history"),
+    )
 except ImportError:
     pass
 
