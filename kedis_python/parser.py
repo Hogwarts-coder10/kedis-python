@@ -267,6 +267,11 @@ class KESPDecoder:
     MAX_DEPTH = 32  # nesting guard, so a hostile reply can't blow the stack
     MAX_LINE = 64 * 1024  # a status/error line longer than this is garbage
     MAX_HEADER_LINE = 32  # I<n> / S<n> / A<n> headers are never longer
+    # Whole-reply budgets. MAX_DEPTH and the per-array/per-string caps bound one
+    # node; these bound the *sum* over a reply, so many small nodes cannot add up
+    # to an unbounded amount of memory or work. Looked up at call time.
+    MAX_REPLY_ELEMENTS = 4_194_304  # every value in the reply, containers included
+    MAX_REPLY_PAYLOAD = 1024 * 1024 * 1024  # string and text-line bytes, summed
 
     _COUNT = re.compile(rb"(?:0|[1-9][0-9]*)")
     _INTEGER = re.compile(rb"(?:0|-?[1-9][0-9]*)")
@@ -275,7 +280,12 @@ class KESPDecoder:
     _NUMERIC_SIGILS = (b"I", b"S", b"A")
 
     @staticmethod
-    def decode(buf, pos: int = 0, _depth: int = 0, lenient: bool = False):
+    def decode(
+        buf, pos: int = 0, _depth: int = 0, lenient: bool = False, _budget=None
+    ):
+        if _budget is None:
+            # [elements left, payload bytes left], shared by the whole reply.
+            _budget = [KESPDecoder.MAX_REPLY_ELEMENTS, KESPDecoder.MAX_REPLY_PAYLOAD]
         if _depth > KESPDecoder.MAX_DEPTH:
             raise ReplyProtocolError("reply nested too deeply")
         if pos >= len(buf):
@@ -309,6 +319,16 @@ class KESPDecoder:
         after = nl + 1
         rest = line[1:]
 
+        # Charge this value to the whole-reply budget. A reply that is still
+        # incomplete never gets here, so a retry is not charged twice.
+        if _budget[0] <= 0:
+            raise ReplyProtocolError("reply has too many elements")
+        _budget[0] -= 1
+        if sigil not in (b"N", b"I", b"S", b"A"):  # line-carried text
+            if len(line) > _budget[1]:
+                raise ReplyProtocolError("reply payload too large")
+            _budget[1] -= len(line)
+
         if sigil == b"N":
             if rest and not lenient:
                 raise ReplyProtocolError("invalid nil reply")
@@ -326,6 +346,10 @@ class KESPDecoder:
             length = KESPDecoder._count(rest)
             if length > CommandParser.MAX_BULK_LENGTH:
                 raise ReplyProtocolError("invalid bulk length")
+            if length > _budget[1]:
+                # Refuse on the header, before waiting for the bytes to arrive.
+                raise ReplyProtocolError("reply payload too large")
+            _budget[1] -= length
             end = after + length
             if len(buf) < end + 1:
                 raise IncompleteReply(end + 1)
@@ -337,9 +361,14 @@ class KESPDecoder:
             count = KESPDecoder._count(rest)
             if count > CommandParser.MAX_ARRAY_LENGTH:
                 raise ReplyProtocolError("invalid array length")
+            if count > _budget[0]:
+                # Every element costs at least one; refuse on the header.
+                raise ReplyProtocolError("reply has too many elements")
             items = []
             for _ in range(count):
-                item, after = KESPDecoder.decode(buf, after, _depth + 1, lenient)
+                item, after = KESPDecoder.decode(
+                    buf, after, _depth + 1, lenient, _budget
+                )
                 items.append(item)
             return items, after
 
@@ -388,8 +417,11 @@ class KESPEncoder:
         """
         Translates raw Python objects from the router into strict KESP network bytes.
         """
+        # The same whole-reply budgets the decoder enforces, so a reply that
+        # leaves the server is one the client will accept.
+        budget = [KESPDecoder.MAX_REPLY_ELEMENTS, KESPDecoder.MAX_REPLY_PAYLOAD]
         try:
-            return KESPEncoder._encode(data, 0, True)
+            return KESPEncoder._encode(data, 0, True, budget)
         except ReplyEncodeError as exc:
             return KESPEncoder._error_line(f"Internal server error: {exc}")
 
@@ -414,19 +446,27 @@ class KESPEncoder:
         return b"E" + raw + b"\n"
 
     @staticmethod
-    def _bulk(text: str) -> bytes:
+    def _bulk(text: str, budget=None) -> bytes:
         try:
             raw = to_bytes(text)
         except UnicodeEncodeError:
             raise ReplyEncodeError("string is not valid UTF-8") from None
         if len(raw) > CommandParser.MAX_BULK_LENGTH:
             raise ReplyEncodeError("string too large")
+        if budget is not None:
+            if len(raw) > budget[1]:
+                raise ReplyEncodeError("reply payload too large")
+            budget[1] -= len(raw)
         return b"S%d\n%s\n" % (len(raw), raw)
 
     @staticmethod
-    def _encode(data, depth: int, top: bool) -> bytes:
+    def _encode(data, depth: int, top: bool, budget) -> bytes:
         if depth > KESPDecoder.MAX_DEPTH:
             raise ReplyEncodeError("reply nested too deeply")
+        # One element per value, containers included (as the decoder counts).
+        if budget[0] <= 0:
+            raise ReplyEncodeError("reply has too many elements")
+        budget[0] -= 1
 
         # 1. Null / Missing Data
         if data is None:
@@ -450,7 +490,7 @@ class KESPEncoder:
         # 4. Strings & Status Messages
         if isinstance(data, str):
             if isinstance(data, BulkString) or not top:
-                return KESPEncoder._bulk(data)
+                return KESPEncoder._bulk(data, budget)
 
             if data in KESPEncoder._STATUSES:
                 val = data if data.startswith("+") else f"+{data}"
@@ -462,16 +502,18 @@ class KESPEncoder:
                     return KESPEncoder._error_line(data[len(prefix) + 1 :])
 
             # Otherwise, it's a standard Binary-Safe Bulk String
-            return KESPEncoder._bulk(data)
+            return KESPEncoder._bulk(data, budget)
 
         # 5. Arrays (Lists/Sets)
         if isinstance(data, (list, set, tuple)):
             if len(data) > CommandParser.MAX_ARRAY_LENGTH:
                 raise ReplyEncodeError("array too large")
+            if len(data) > budget[0]:
+                raise ReplyEncodeError("reply has too many elements")
             header = f"A{len(data)}\n".encode("utf-8")
             # Recursively encode every element inside the array
             elements = b"".join(
-                KESPEncoder._encode(item, depth + 1, False) for item in data
+                KESPEncoder._encode(item, depth + 1, False, budget) for item in data
             )
             return header + elements
 
@@ -480,11 +522,17 @@ class KESPEncoder:
             # A dictionary of 3 items becomes a KESP array of 6 items [k1, v1, k2, v2...]
             if len(data) * 2 > CommandParser.MAX_ARRAY_LENGTH:
                 raise ReplyEncodeError("array too large")
+            if len(data) * 2 > budget[0]:
+                raise ReplyEncodeError("reply has too many elements")
             header = f"A{len(data) * 2}\n".encode("utf-8")
-            elements = b"".join(
-                KESPEncoder._bulk(str(k)) + KESPEncoder._encode(v, depth + 1, False)
-                for k, v in data.items()
-            )
+            parts = []
+            for k, v in data.items():
+                if budget[0] <= 0:
+                    raise ReplyEncodeError("reply has too many elements")
+                budget[0] -= 1  # the key
+                parts.append(KESPEncoder._bulk(str(k), budget))
+                parts.append(KESPEncoder._encode(v, depth + 1, False, budget))
+            elements = b"".join(parts)
             return header + elements
 
         # Fallback
