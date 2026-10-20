@@ -443,6 +443,15 @@ class KESPEncoder:
             raw = to_bytes(text)
         except UnicodeEncodeError:
             raw = text.encode("utf-8", "replace")
+        # Errors often echo client input (an unknown command's name, say). A line
+        # longer than the decoder's MAX_LINE would be rejected by our own client,
+        # so cut it, at a character boundary, and say so.
+        limit = KESPDecoder.MAX_LINE - 1  # the 'E' counts towards the line
+        if len(raw) > limit:
+            cut = limit - 3
+            while cut > 0 and raw[cut] & 0xC0 == 0x80:
+                cut -= 1  # raw[cut] would be mid-character: step back to its start
+            raw = raw[:cut] + b"..."
         return b"E" + raw + b"\n"
 
     @staticmethod
