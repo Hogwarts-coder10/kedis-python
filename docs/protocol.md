@@ -93,7 +93,7 @@ The command decoder is strict about where one frame ends and the next begins:
 
 - Header lines (`A<count>`, `S<length>`) end in exactly `\n`. A `\r` before it is an error. The number is a canonical ASCII decimal: no sign, spaces, underscores or leading zeros (`A+1`, `S04`, `A1_0` are all rejected).
 - A bulk payload is exactly `<length>` bytes followed by exactly one `\n`. Anything else in that position is an error, so a wrong length can no longer shift the frame boundary silently.
-- Header lines are capped at 32 bytes, inline lines at 64 KiB, whether or not the terminator has arrived yet.
+- Header lines are capped at 32 bytes, inline lines at 64 KiB, whether or not the terminator has arrived yet. The count is of the line **without** its terminating `\n`: an inline line of exactly 65,536 bytes plus `\n` is accepted, one more byte is an error. A line that has no `\n` yet is judged by the bytes received so far, so it fails as soon as it passes the cap instead of waiting for a terminator that may never come.
 - Blank lines and empty arrays (`A0`) are ignored between commands.
 
 A frame that breaks these rules cannot be resynchronised, so the server sends one error reply (`E<message>`) and then closes the connection. A command that happens to be named `ERROR` is an ordinary command and is not treated as a framing failure.
@@ -111,7 +111,8 @@ A frame that breaks these rules cannot be resynchronised, so the server sends on
 - **Statuses and errors are replies, not data.** The magic strings (`OK`, `+OK`, `+QUEUED`, `-ERR ...`, `ERROR ...`) are only honoured for the reply itself, and an error must match the whole marker (`-ERR` or `ERROR`, then a space or the end). `ERRORS: 5` is data. The marker is removed once and the message is otherwise untouched.
 - **Strings inside arrays and dicts are always bulk strings.** A list item or hash field named `ERROR x` is data, never an error element. Handlers that return a stored value as the whole reply (`GET`, `HGET`, `LPOP`, `RPOP`) wrap it in `BulkString`, so a value such as `OK` or `-ERR y` reaches the client as data.
 - **Booleans are integers.** `True` is `I1`, `False` is `I0`.
-- **Error text is one line.** `\r` and `\n` in an error message become spaces so a message can't start a bogus reply.
+- **Collection order.** Lists and tuples keep their order. A dict is flattened to `k1, v1, k2, v2, ...` in insertion order. A set has no order: its members go out in whatever order Python iterates it, which can differ between runs of the server, so a command that needs a stable order must sort before replying (`SMEMBERS` is documented as returning members in no particular order).
+- **Error text is one line, and short enough to read back.** `\r` and `\n` in an error message become spaces so a message can't start a bogus reply. Error text often echoes client input (an unknown command's name, say), so it is cut to fit the decoder's 64 KiB line limit (the `E` counts, the `\n` does not): the cut is made at a character boundary and the text ends in `...`.
 - **Anything unencodable becomes one error reply.** Integers of more than 31 digits, arrays above 1,048,576 elements, strings above 512 MiB, nesting deeper than 32 levels, text that no byte string can produce (a lone surrogate outside `U+DC80`-`U+DCFF`) and unknown types produce a single `EInternal server error: ...` line instead of an exception or a half-written frame.
 
 ## Binary Safety

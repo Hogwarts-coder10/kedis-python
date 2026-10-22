@@ -33,6 +33,7 @@ Dive into the internal grimoire to understand how Kedis achieves microsecond lat
 * [KESP Wire Protocol](https://github.com/Hogwarts-coder10/kedis-python/blob/main/docs/protocol.md)
 * [Networking & Surge Tank](https://github.com/Hogwarts-coder10/kedis-python/blob/main/docs/networking.md)
 * [Limits & Budgets](https://github.com/Hogwarts-coder10/kedis-python/blob/main/docs/limits.md)
+* [Fuzzing the Protocol](https://github.com/Hogwarts-coder10/kedis-python/blob/main/docs/fuzzing.md)
 * [Persistence & I/O Drivetrain](https://github.com/Hogwarts-coder10/kedis-python/blob/main/docs/persistence.md)
 * [Command Spellbook](https://github.com/Hogwarts-coder10/kedis-python/blob/main/docs/commands.md)
 * [TTL & Lifespan Mechanics](https://github.com/Hogwarts-coder10/kedis-python/blob/main/docs/ttl.md)

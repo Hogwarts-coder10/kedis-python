@@ -50,8 +50,12 @@ A subscriber that stops reading may leave up to 32 MiB queued. Past that it is d
 |---|---|
 | `MAX_REPLY_BYTES` buffered for one reply | 1 GiB (the connection is dropped past it) |
 | numeric header lines | 32 bytes |
-| status / error lines | 64 KiB |
+| status / error lines | 64 KiB, counting the sigil but not the `\n` |
 | nesting depth | 32 |
+| values in one reply (`MAX_REPLY_ELEMENTS`) | 4,194,304, containers included |
+| string and text-line bytes in one reply (`MAX_REPLY_PAYLOAD`) | 1 GiB, added up |
+
+The last two are budgets for the whole reply, so many small values cannot add up to an unbounded amount of work or memory. An array that declares more elements than remain in the budget, or a string longer than the payload that remains, is refused on its header, before the bytes arrive. `KESPEncoder` applies the same two budgets, so a reply that would go over leaves the server as one `E` line instead.
 
 While waiting for a large reply, `read_reply` does not decode again until the bytes the decoder asked for have arrived.
 
