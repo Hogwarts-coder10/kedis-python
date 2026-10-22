@@ -46,3 +46,6 @@ kedis.snapshot
 *.so
 
 *.patch
+
+# hypothesis example database
+.hypothesis/
