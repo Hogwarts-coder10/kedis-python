@@ -10,6 +10,7 @@ from .commands import CommandHandler
 from .parser import CommandParser, KESPEncoder, ProtocolError
 from .store import KedisStore
 from .stream import StreamError
+from .textcodec import to_bytes
 from .ui import UI
 
 console = Console()
@@ -34,6 +35,11 @@ STALL_TIMEOUT = 30.0
 FRAME_DEADLINE = 60.0
 FRAME_MIN_RATE = 256 * 1024
 YIELD_EVERY = 256  # commands run back to back before other clients get a turn
+# One client's open MULTI block may queue at most this many commands, and at most
+# this many bytes of arguments (UTF-8), so a client that never sends EXEC cannot
+# grow the queue without bound. See docs/limits.md.
+MAX_MULTI_COMMANDS = 10_000
+MAX_MULTI_BYTES = 64 * 1024 * 1024
 _active_clients = 0
 
 # Replication Telemetry
@@ -349,6 +355,8 @@ class AsyncKedisSession:
         self.addr = writer.get_extra_info("peername")
         self.in_transaction = False
         self.tx_queue = []
+        self.tx_bytes = 0  # argument bytes held in tx_queue
+        self.tx_overflowed = False  # the queue limit was hit: EXEC will abort
 
         # Connection-specific watch state {key: expected_version}
         self.watched_keys = {}
@@ -391,12 +399,43 @@ class AsyncKedisSession:
         self.watched_keys.clear()
         await self.send(b"+OK\r\n")
 
+    def _reset_queue(self):
+        self.tx_queue = []
+        self.tx_bytes = 0
+        self.tx_overflowed = False
+
+    async def queue_command(self, tokens: list):
+        """Adds a command to the open MULTI block, within the queue limits.
+
+        Past a limit the queue is dropped and the block is poisoned: the client
+        is told, still-queued commands are refused, and EXEC aborts. The block is
+        not simply ended, or the rest of what the client meant to be atomic would
+        run one command at a time.
+        """
+        if not self.tx_overflowed:
+            size = sum(len(to_bytes(t)) for t in tokens)
+            if (
+                len(self.tx_queue) >= MAX_MULTI_COMMANDS
+                or self.tx_bytes + size > MAX_MULTI_BYTES
+            ):
+                self.tx_queue = []  # free the memory now
+                self.tx_bytes = 0
+                self.tx_overflowed = True
+            else:
+                self.tx_queue.append(tokens)
+                self.tx_bytes += size
+                await self.send(b"+OK\n")
+                return
+        await self.send(
+            b"-ERR MULTI queue limit reached; EXEC will abort the transaction\r\n"
+        )
+
     async def handle_multi(self, tokens: list):
         if self.in_transaction:
             await self.send(b"-ERR MULTI calls are not nested\r\n")
         else:
             self.in_transaction = True
-            self.tx_queue = []
+            self._reset_queue()
             await self.send(b"+OK\r\n")
 
     async def handle_discard(self, tokens: list):
@@ -405,7 +444,7 @@ class AsyncKedisSession:
             return
 
         self.in_transaction = False
-        self.tx_queue = []
+        self._reset_queue()
         self.watched_keys.clear()  # Discarding also clears watched keys
         await self.send(b"+OK\r\n")
 
@@ -427,9 +466,18 @@ class AsyncKedisSession:
         self.in_transaction = False
         self.watched_keys.clear()
 
+        # The queue overflowed: some commands were never kept, so running the rest
+        # would not be the transaction the client asked for.
+        if self.tx_overflowed:
+            self._reset_queue()
+            await self.send(
+                b"-EXECABORT Transaction discarded: the MULTI queue limit was exceeded\r\n"
+            )
+            return
+
         # If race condition detected, abort safely
         if transaction_aborted:
-            self.tx_queue.clear()
+            self._reset_queue()
             # kedis protocol returns a Null Array for aborted transactions
             await self.send(b"N\n")
             return
@@ -447,7 +495,7 @@ class AsyncKedisSession:
             )
             results.append(result)
 
-        self.tx_queue.clear()
+        self._reset_queue()
         notify_stream_waiters()
 
         # Format and send the array of results back to the client
@@ -604,8 +652,7 @@ class AsyncKedisSession:
                         await self.tx_router[cmd](tokens)
 
                     elif self.in_transaction:
-                        self.tx_queue.append(tokens)
-                        await self.send(b"+OK\n")
+                        await self.queue_command(tokens)
 
                     else:
                         # 🛡️ PHASE 4: THE READ-ONLY FIREWALL

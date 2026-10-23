@@ -68,12 +68,12 @@ Flushes all active locks on your current session, allowing transactions to proce
 * **Returns:** `+OK`
 
 ### `MULTI`
-Opens a transaction block. Subsequent commands are not executed immediately; they are queued in the session's Surge Tank.
+Opens a transaction block. Subsequent commands are not executed immediately; they are queued in the session's Surge Tank. A block holds at most 10,000 commands and 64 MiB of arguments; past that, `EXEC` aborts (see below and [limits](limits.md)).
 * **Returns:** `+OK`
 
 ### `EXEC`
 Executes all queued commands in a single, atomic block. If a `WATCH` lock was tripped by another client, the transaction aborts.
-* **Returns:** An Array of the command results, or `(nil)` if the transaction was aborted.
+* **Returns:** An Array of the command results, or `(nil)` if the transaction was aborted. If the queue limit was exceeded, `-EXECABORT Transaction discarded: the MULTI queue limit was exceeded` and nothing runs.
 
 ### `DISCARD`
 Flushes the transaction queue and exits the `MULTI` state without executing any commands.

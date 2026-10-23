@@ -35,6 +35,10 @@ A command at the cap needs several times its size in memory for a moment (the re
 | `STALL_TIMEOUT` | 30 s | A half-received command that gets no new byte for this long is dropped. |
 | `FRAME_DEADLINE` + `FRAME_MIN_RATE` | 60 s + size / 256 KiB per s | A half-received command still unfinished after this long is dropped, even if bytes keep trickling in. A 64 MiB upload is allowed about 5 minutes. |
 | `YIELD_EVERY` | 256 | Commands run back to back before other clients get a turn. |
+| `MAX_MULTI_COMMANDS` | 10,000 | Most commands one client's open `MULTI` block may queue. |
+| `MAX_MULTI_BYTES` | 64 MiB | Most bytes of arguments (UTF-8) the block may hold, summed over its commands. |
+
+Past either `MULTI` limit the queue is dropped and the block is poisoned, not ended: the command that crossed the limit, and every command after it, gets `-ERR MULTI queue limit reached; EXEC will abort the transaction` and is not queued, and `EXEC` replies `-EXECABORT Transaction discarded: the MULTI queue limit was exceeded` without running anything. `DISCARD`, or the `EXEC`, leaves the block and the next `MULTI` starts clean. Ending the block at the limit instead would run the rest of what the client meant to be atomic one command at a time. The limits are per connection.
 
 Both timeouts send `EProtocol error: timed out waiting for the rest of a command` and close the connection. They only apply while a command is half-sent: a connection with nothing pending can idle for as long as it likes, so `SUBSCRIBE` and blocking reads are not affected.
 
@@ -61,7 +65,6 @@ While waiting for a large reply, `read_reply` does not decode again until the by
 
 ## Not covered yet
 
-- **`MULTI` queues** are not capped: a client can queue commands without limit.
 - **Output to ordinary clients** is held back one reply at a time (the server waits for the socket to drain), but there is no write deadline, so a client that never reads holds its connection and counts toward `MAX_CLIENTS`.
 - **Replication:** the follower loops and the replica stream do not have these budgets.
 - **Command cost:** `KEYS` on a huge store, or a very long list operation, blocks for as long as it takes. Nothing limits it.
