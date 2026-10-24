@@ -35,6 +35,13 @@ STALL_TIMEOUT = 30.0
 FRAME_DEADLINE = 60.0
 FRAME_MIN_RATE = 256 * 1024
 YIELD_EVERY = 256  # commands run back to back before other clients get a turn
+# Replies must be read too: a client whose unread replies leave the socket full
+# is dropped once a send has waited WRITE_DEADLINE seconds plus the time
+# WRITE_MIN_RATE bytes/second would need to move what is already queued for it.
+# Without this a client that never reads holds its connection (and a MAX_CLIENTS
+# slot) for ever. See docs/limits.md.
+WRITE_DEADLINE = 30.0
+WRITE_MIN_RATE = 256 * 1024
 # One client's open MULTI block may queue at most this many commands, and at most
 # this many bytes of arguments (UTF-8), so a client that never sends EXEC cannot
 # grow the queue without bound. See docs/limits.md.
@@ -375,7 +382,15 @@ class AsyncKedisSession:
         Asynchronously flushes the bytes to the network sockets
         """
         self.writer.write(data)
-        await self.writer.drain()
+        transport = self.writer.transport
+        allowed = WRITE_DEADLINE + transport.get_write_buffer_size() / WRITE_MIN_RATE
+        try:
+            await asyncio.wait_for(self.writer.drain(), allowed)
+        except asyncio.TimeoutError:
+            # The client is not reading. Nothing more can reach it, so don't try
+            # to say why: abort the socket and let the session loop clean up.
+            transport.abort()
+            raise ConnectionAbortedError("client did not read its replies in time")
 
     # -------------------------------------
     # ASYNC TRANSACTION ROUTUING (Which will be used in dispatch table)
