@@ -34,7 +34,7 @@ A command at the cap needs several times its size in memory for a moment (the re
 | `MAX_CLIENTS` | 10,000 | The next connection gets `Emax number of clients reached` and is closed. A slot frees when a client disconnects. |
 | `STALL_TIMEOUT` | 30 s | A half-received command that gets no new byte for this long is dropped. |
 | `FRAME_DEADLINE` + `FRAME_MIN_RATE` | 60 s + size / 256 KiB per s | A half-received command still unfinished after this long is dropped, even if bytes keep trickling in. A 64 MiB upload is allowed about 5 minutes. |
-| `WRITE_DEADLINE` + `WRITE_MIN_RATE` | 30 s + queued bytes / 256 KiB per s | A client that does not read its replies is dropped once a send has waited this long for the socket to drain. Its slot is freed. |
+| `WRITE_DEADLINE` + `WRITE_MIN_RATE` | 30 s + queued bytes / 256 KiB per s | A client, or a replication follower, that does not read what it is sent is dropped once a send has waited this long for the socket to drain. A client's slot is freed. |
 | `YIELD_EVERY` | 256 | Commands run back to back before other clients get a turn. |
 | `MAX_MULTI_COMMANDS` | 10,000 | Most commands one client's open `MULTI` block may queue. |
 | `MAX_MULTI_BYTES` | 64 MiB | Most bytes of arguments (UTF-8) the block may hold, summed over its commands. |
@@ -44,6 +44,8 @@ Past either `MULTI` limit the queue is dropped and the block is poisoned, not en
 Both timeouts send `EProtocol error: timed out waiting for the rest of a command` and close the connection. They only apply while a command is half-sent: a connection with nothing pending can idle for as long as it likes, so `SUBSCRIBE` and blocking reads are not affected.
 
 The write deadline covers every reply a session sends to its own client (pub/sub pushes have their own cap, below, and the one-line `max number of clients` refusal is written before a session exists). When a reply does not fit in the socket buffers, the server waits for the client to read; if that wait passes `WRITE_DEADLINE` plus the time `WRITE_MIN_RATE` would need for the bytes still queued for that client, the socket is aborted (nothing more is sent, not even an error line), and the session ends. Commands the client had already pipelined behind that reply are not run. A client that reads promptly, or pauses for less than the deadline, is not affected, and a connection with nothing to send is never timed. Other clients keep being served while one is stuck.
+
+The master's broadcast to followers uses the same deadline. A write command's payload is queued for every follower first, then all of them are waited for together, so a follower that stops reading costs the command that wrote to it one deadline (not one per follower), and then loses its place in the live stream. That connection is closed; a follower that comes back has to `SYNC` again. Until the deadline passes, the connection that ran the write cannot run its next command, and a stuck follower holds each concurrent write up in the same way.
 
 The server also parses large values once rather than after every 64 KiB chunk: when a string is on its way, it keeps reading until the bytes have arrived. A 32 MiB `SET` took about 2.6 s of server time when every chunk re-parsed the buffer, and about 0.2 s now.
 
@@ -68,5 +70,5 @@ While waiting for a large reply, `read_reply` does not decode again until the by
 
 ## Not covered yet
 
-- **Replication:** the follower loops and the replica stream do not have these budgets, and the master's broadcast to followers has no write deadline: it waits for each follower in turn, so one follower that stops reading can hold up every write command until it disconnects.
+- **Replication:** the follower loops and the replica stream do not have these budgets.
 - **Command cost:** `KEYS` on a huge store, or a very long list operation, blocks for as long as it takes. Nothing limits it.

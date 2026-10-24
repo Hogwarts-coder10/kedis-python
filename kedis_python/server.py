@@ -105,8 +105,30 @@ def _encode_command(tokens: list) -> bytes:
     return KESPEncoder.encode_command(tokens)
 
 
+async def drain_within_deadline(writer) -> None:
+    """Waits for `writer` to drain, but not for ever (see WRITE_DEADLINE).
+
+    A peer that is not reading cannot be sent anything more, not even an error
+    line: the socket is aborted and ConnectionAbortedError raised.
+    """
+    transport = getattr(writer, "transport", None)
+    queued = transport.get_write_buffer_size() if transport is not None else 0
+    allowed = WRITE_DEADLINE + queued / WRITE_MIN_RATE
+    try:
+        await asyncio.wait_for(writer.drain(), allowed)
+    except asyncio.TimeoutError:
+        if transport is not None:
+            transport.abort()
+        raise ConnectionAbortedError("peer did not read in time")
+
+
 async def broadcast_to_replicas(forwards: list, label: str) -> None:
-    """Writes already-resolved commands to every follower; drops dead ones."""
+    """Writes already-resolved commands to every follower; drops dead ones.
+
+    The payload goes into every follower's buffer first, then the followers are
+    waited for together, so a stalled one costs one write deadline, not one each,
+    and is dropped when it runs out (it re-syncs if it comes back).
+    """
     if not forwards:
         return
     console.print(
@@ -114,18 +136,29 @@ async def broadcast_to_replicas(forwards: list, label: str) -> None:
     )
     payload = b"".join(_encode_command(forwarded) for forwarded in forwards)
     dead_replicas = []
+    waiting = []
     for rep_writer in connected_replicas:
         try:
             rep_writer.write(payload)
-            await rep_writer.drain()
         except Exception:
+            dead_replicas.append(rep_writer)
+        else:
+            waiting.append(rep_writer)
+
+    outcomes = await asyncio.gather(
+        *(drain_within_deadline(rep_writer) for rep_writer in waiting),
+        return_exceptions=True,
+    )
+    for rep_writer, outcome in zip(waiting, outcomes):
+        if isinstance(outcome, Exception):
             dead_replicas.append(rep_writer)
 
     for dead in dead_replicas:
-        connected_replicas.remove(dead)
-        console.print(
-            "[yellow]⚠️ [REPLICATION] Follower disconnected. Removed from Live Stream.[/yellow]"
-        )
+        if dead in connected_replicas:  # a concurrent broadcast may have removed it
+            connected_replicas.remove(dead)
+            console.print(
+                "[yellow]⚠️ [REPLICATION] Follower disconnected. Removed from Live Stream.[/yellow]"
+            )
 
 
 async def wait_for_stream_data(session, block_ms: int, attempt):
@@ -382,15 +415,7 @@ class AsyncKedisSession:
         Asynchronously flushes the bytes to the network sockets
         """
         self.writer.write(data)
-        transport = self.writer.transport
-        allowed = WRITE_DEADLINE + transport.get_write_buffer_size() / WRITE_MIN_RATE
-        try:
-            await asyncio.wait_for(self.writer.drain(), allowed)
-        except asyncio.TimeoutError:
-            # The client is not reading. Nothing more can reach it, so don't try
-            # to say why: abort the socket and let the session loop clean up.
-            transport.abort()
-            raise ConnectionAbortedError("client did not read its replies in time")
+        await drain_within_deadline(self.writer)
 
     # -------------------------------------
     # ASYNC TRANSACTION ROUTUING (Which will be used in dispatch table)
