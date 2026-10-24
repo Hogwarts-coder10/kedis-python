@@ -36,7 +36,7 @@ class CommandParser:
     _COUNT = re.compile(rb"(?:0|[1-9][0-9]*)")
 
     @staticmethod
-    def parse(raw_data, start: int = 0):
+    def parse(raw_data, start: int = 0, normalise: bool = True):
         """
         Parses incoming network data. Returns (tokens, bytes_consumed).
 
@@ -51,12 +51,16 @@ class CommandParser:
         raw_data may be bytes or a bytearray. Parsing starts at offset start and
         bytes_consumed counts from there, so a caller can work through a buffer
         holding many pipelined commands without copying or trimming it each time.
+
+        The first token is taken to be a command name and is uppercased. Pass
+        normalise=False for a frame that is data from its first token, such as the
+        baseline snapshot a leader sends: its JSON must reach the caller as sent.
         """
-        tokens, consumed, _ = CommandParser.parse_buffer(raw_data, start)
+        tokens, consumed, _ = CommandParser.parse_buffer(raw_data, start, normalise)
         return tokens, consumed
 
     @staticmethod
-    def parse_buffer(raw_data, start: int = 0):
+    def parse_buffer(raw_data, start: int = 0, normalise: bool = True):
         """parse(), plus a hint for incomplete frames: returns (tokens, consumed,
         need). When the next frame is incomplete, need is the length the bytes
         from start + consumed must reach before parsing can make any progress
@@ -75,7 +79,8 @@ class CommandParser:
                 # Only the command name is normalised. Every other token is data
                 # (keys, values, field names) until a handler says otherwise, so
                 # handlers match their own options case-insensitively.
-                tokens[0] = tokens[0].upper()
+                if normalise:
+                    tokens[0] = tokens[0].upper()
                 return tokens, end - start, 0
             pos = end  # blank frame: skip it and keep scanning
         return [], pos - start, 0

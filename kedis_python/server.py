@@ -322,8 +322,11 @@ async def init_replication_stream(host: str, port: int):
             intake_buffer.extend(chunk)
 
             try:
-                # 🚀 FIX: Unpack the tuple properly
-                tokens, consumed = CommandParser.parse(bytes(intake_buffer))
+                # The snapshot frame is data from its first token, not a command:
+                # leave the JSON exactly as the leader sent it.
+                tokens, consumed = CommandParser.parse(
+                    bytes(intake_buffer), normalise=False
+                )
                 if tokens:
                     # The first token parsed will be the raw JSON snapshot string
                     raw_json = tokens[0]
