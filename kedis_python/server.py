@@ -5,6 +5,7 @@ import sys
 import time
 
 from rich.console import Console
+from rich.markup import escape
 
 from .commands import CommandHandler
 from .parser import CommandParser, KESPEncoder, ProtocolError
@@ -275,6 +276,87 @@ async def housekeeping_loop(handler, interval: float = HOUSEKEEPING_INTERVAL):
             console.print(f"[bold red]❌ Housekeeping pass failed: {repr(e)}[/bold red]")
 
 
+class ReplicationError(Exception):
+    """The leader's stream cannot be followed any further (bad data, or it stalled)."""
+
+
+class LeaderStream:
+    """Frames the bytes a leader sends: the baseline snapshot, then live commands.
+
+    It applies the same budgets as a client connection: the parser's size limits,
+    and the stall/frame deadlines of STALL_TIMEOUT and FRAME_DEADLINE for a command
+    that is only partly received. A leader that is simply quiet between commands
+    can idle for as long as it likes.
+    """
+
+    def __init__(self, reader):
+        self.reader = reader
+        self.buf = bytearray()
+        self.pos = 0  # start of the bytes not yet handed out
+        self.need = 0  # unread length at which the pending frame can progress
+        self.frame_started = asyncio.get_running_loop().time()
+
+    async def next_command(self, normalise: bool = True, first_wait=None):
+        """The next complete command, or None if the leader closed between commands.
+
+        first_wait bounds the wait for a frame's first byte (None: wait for ever).
+        Raises ReplicationError for malformed data, a stall, or a cut-off frame.
+        """
+        loop = asyncio.get_running_loop()
+        while True:
+            unread = len(self.buf) - self.pos
+            if unread and unread >= self.need:
+                tokens, consumed, hint = CommandParser.parse_buffer(
+                    self.buf, self.pos, normalise
+                )
+                if isinstance(tokens, ProtocolError):
+                    # Cannot be resynchronised: nothing after this can be trusted.
+                    raise ReplicationError(f"leader sent malformed data ({tokens.message})")
+                self.pos += consumed
+                self.need = hint
+                if tokens:
+                    self.frame_started = loop.time()  # what is left is a new frame
+                    return tokens
+
+            # Need more bytes. Drop what was handed out, once, before reading.
+            if self.pos:
+                del self.buf[: self.pos]
+                self.pos = 0
+
+            timeout = first_wait
+            if self.buf:  # a half-received frame must keep moving
+                allowed = FRAME_DEADLINE + max(self.need, len(self.buf)) / FRAME_MIN_RATE
+                timeout = min(STALL_TIMEOUT, self.frame_started + allowed - loop.time())
+                if timeout <= 0:
+                    raise ReplicationError("timed out waiting for the rest of a command")
+            try:
+                chunk = await asyncio.wait_for(self.reader.read(65536), timeout)
+            except asyncio.TimeoutError:
+                raise ReplicationError("timed out waiting for the leader")
+            if not chunk:
+                if self.buf:
+                    raise ReplicationError("leader closed the connection in the middle of a command")
+                return None
+            if not self.buf:
+                self.frame_started = loop.time()
+            self.buf.extend(chunk)
+
+
+def describe_command(tokens, width: int = 120) -> str:
+    """A short, markup-safe one-line summary of a command for the log: values can
+    be megabytes, and can contain text that looks like console markup."""
+    parts = []
+    used = 0
+    for token in tokens:
+        if used >= width:
+            parts.append("...")
+            break
+        piece = token if len(token) <= 40 else f"{token[:40]}...(+{len(token) - 40} chars)"
+        parts.append(piece)
+        used += len(piece) + 1
+    return escape(" ".join(parts))
+
+
 # The stream we are following, if any. It lives here rather than in a throwaway
 # local because the event loop only keeps weak references to tasks: a task nobody
 # holds can be garbage-collected in mid-run, which silently ends replication.
@@ -330,47 +412,29 @@ async def init_replication_stream(host: str, port: int):
         writer.write(b"SYNC\n")
         await writer.drain()
 
-        # 3. Read the incoming KESP payload containing the JSON data
-        # Using a dense surge buffer to read the KESP array frame safely
-        intake_buffer = bytearray()
-        snapshot_loaded = False
+        # 3. The baseline: the first frame is the snapshot, as JSON, sent as one
+        # string. It is data from its first token, not a command (normalise=False),
+        # and the leader gets FRAME_DEADLINE to start sending it.
+        stream = LeaderStream(reader)
+        tokens = await stream.next_command(normalise=False, first_wait=FRAME_DEADLINE)
+        if tokens is None:
+            raise ConnectionError("Leader severed connection before snapshot arrived.")
+        if len(tokens) != 1:
+            raise ReplicationError("the leader's first frame is not a snapshot")
+        try:
+            parsed_data = await asyncio.to_thread(json.loads, tokens[0])
+        except ValueError as e:
+            raise ReplicationError(f"the snapshot is not valid JSON ({e})")
+        if not isinstance(parsed_data, dict):
+            raise ReplicationError("the snapshot is not a JSON object")
+        del tokens
 
-        while not snapshot_loaded:
-            chunk = await reader.read(65536)
-            if not chunk:
-                raise ConnectionError(
-                    "Leader severed connection before snapshot arrived."
-                )
-
-            intake_buffer.extend(chunk)
-
-            try:
-                # The snapshot frame is data from its first token, not a command:
-                # leave the JSON exactly as the leader sent it.
-                tokens, consumed = CommandParser.parse(
-                    bytes(intake_buffer), normalise=False
-                )
-                if tokens:
-                    # The first token parsed will be the raw JSON snapshot string
-                    raw_json = tokens[0]
-
-                    # 🚀 FIX: Restore the data using your custom loader to rebuild SkipLists
-                    parsed_data = json.loads(raw_json)
-                    global_store.restore_snapshot_state(parsed_data)
-
-                    console.print(
-                        f"[bold green]💾 [REPLICATION] Cold Boot Successful! Restored {len(global_store._data)} keys from Leader.[/bold green]"
-                    )
-                    snapshot_loaded = True
-
-                    # 🚀 FIX: Slice the buffer
-                    del intake_buffer[:consumed]
-            except Exception as e:
-                # Payload is still fragmented across packets, loop back to read more
-                console.print(
-                    f"[bold yellow]⚠️ [REPLICATION] Parser skipping chunk: {e}[/bold yellow]"
-                )
-                continue
+        # Restore using the custom loader, which rebuilds the SkipLists.
+        global_store.restore_snapshot_state(parsed_data)
+        console.print(
+            f"[bold green]💾 [REPLICATION] Cold Boot Successful! Restored {len(global_store._data)} keys from Leader.[/bold green]"
+        )
+        del parsed_data
 
         # 4. 🚀 PHASE 3 LIVE STREAM: Stay locked in the slipstream forever catching live writes
         console.print(
@@ -378,33 +442,35 @@ async def init_replication_stream(host: str, port: int):
         )
 
         while True:
-            chunk = await reader.read(65536)
-            if not chunk:
+            tokens = await stream.next_command()  # bytes that came with the snapshot first
+            if tokens is None:
                 console.print(
                     "[bold red]⚠️ [REPLICATION] Leader connection lost![/bold red]"
                 )
                 break
 
-            intake_buffer.extend(chunk)
+            try:
+                # Execute the mirrored write locally using your handler
+                await asyncio.to_thread(global_handler.execute, tokens, None)
+            except Exception as e:
+                # Retrying the same command can never succeed, and everything
+                # behind it is waiting: log it and carry on.
+                console.print(
+                    f"[bold red]❌ [REPLICATION Live] Could not apply {describe_command(tokens)}: {escape(repr(e))}[/bold red]"
+                )
+                continue
+            notify_stream_waiters()
+            console.print(
+                f"[magenta]🔄 [REPLICATION Live] Executed: {describe_command(tokens)}[/magenta]"
+            )
 
-            while True:
-                try:
-                    tokens, consumed = CommandParser.parse(bytes(intake_buffer))
-                    if not tokens:
-                        break
-
-                    # Execute the mirrored write locally using your handler
-                    await asyncio.to_thread(global_handler.execute, tokens, None)
-                    notify_stream_waiters()
-                    console.print(
-                        f"[magenta]🔄 [REPLICATION Live] Executed: {' '.join(tokens)}[/magenta]"
-                    )
-
-                    del intake_buffer[:consumed]
-                except Exception:
-                    # Partial packet handling
-                    break
-
+    except ReplicationError as e:
+        # The leader sent bad data or stalled. We cannot trust or resync the
+        # stream, so stop following. We stay a (read-only) replica: a follower
+        # never promotes itself because its leader misbehaved.
+        console.print(
+            f"[bold red]❌ [REPLICATION] Dropping the leader: {escape(str(e))}[/bold red]"
+        )
     except Exception as e:
         console.print(f"[bold red]❌ [REPLICATION] Sync Engine crashed: {e}[/bold red]")
         server_role = "master"  # Fall back to master role if cluster drivetrain breaks

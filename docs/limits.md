@@ -47,6 +47,13 @@ The write deadline covers every reply a session sends to its own client (pub/sub
 
 The master's broadcast to followers uses the same deadline. A write command's payload is queued for every follower first, then all of them are waited for together, so a follower that stops reading costs the command that wrote to it one deadline (not one per follower), and then loses its place in the live stream. That connection is closed; a follower that comes back has to `SYNC` again. Until the deadline passes, the connection that ran the write cannot run its next command, and a stuck follower holds each concurrent write up in the same way.
 
+A follower reads its leader's stream under the same rules (`LeaderStream` in `server.py`): the parser's size limits, `STALL_TIMEOUT`, and `FRAME_DEADLINE` + `FRAME_MIN_RATE` for a command that is only partly received. The leader also gets `FRAME_DEADLINE` to begin sending the baseline snapshot. A leader that is merely quiet between commands is left alone. A follower stops following, and closes the connection, when the leader:
+
+- sends bytes that are not valid KESP (the stream cannot be resynchronised), or stalls or trickles a command past the limits above, or closes in the middle of one;
+- sends a baseline that is not a single JSON object (the store is left as it was).
+
+It stays a read-only replica when that happens: a follower never promotes itself because its leader misbehaved. A command that fails to apply is logged and skipped rather than retried, since retrying it could never succeed and everything behind it would wait.
+
 The server also parses large values once rather than after every 64 KiB chunk: when a string is on its way, it keeps reading until the bytes have arrived. A 32 MiB `SET` took about 2.6 s of server time when every chunk re-parsed the buffer, and about 0.2 s now.
 
 ## Pub/sub (`CommandHandler.MAX_SUBSCRIBER_BUFFER`)
@@ -70,5 +77,4 @@ While waiting for a large reply, `read_reply` does not decode again until the by
 
 ## Not covered yet
 
-- **Replication:** the follower loops and the replica stream do not have these budgets.
 - **Command cost:** `KEYS` on a huge store, or a very long list operation, blocks for as long as it takes. Nothing limits it.
