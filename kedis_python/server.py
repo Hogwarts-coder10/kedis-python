@@ -275,6 +275,28 @@ async def housekeeping_loop(handler, interval: float = HOUSEKEEPING_INTERVAL):
             console.print(f"[bold red]❌ Housekeeping pass failed: {repr(e)}[/bold red]")
 
 
+# The stream we are following, if any. It lives here rather than in a throwaway
+# local because the event loop only keeps weak references to tasks: a task nobody
+# holds can be garbage-collected in mid-run, which silently ends replication.
+replication_task = None
+
+
+def start_replication(host: str, port: int):
+    """Follows host:port, replacing any stream already running."""
+    global replication_task
+    stop_replication()
+    replication_task = asyncio.create_task(init_replication_stream(host, port))
+    return replication_task
+
+
+def stop_replication() -> None:
+    """Stops following the current leader, if there is one (its socket is closed)."""
+    global replication_task
+    if replication_task is not None and not replication_task.done():
+        replication_task.cancel()
+    replication_task = None
+
+
 async def init_replication_stream(host: str, port: int):
     """
     Opens a permanent TCP socket to the Leader engine,
@@ -283,6 +305,7 @@ async def init_replication_stream(host: str, port: int):
     """
     global server_role, server_host, master_port
 
+    writer = None
     try:
         console.print(
             f"[cyan]🔗 [REPLICATION] Initiating handshake with Leader at {host}:{port}...[/cyan]"
@@ -385,6 +408,9 @@ async def init_replication_stream(host: str, port: int):
     except Exception as e:
         console.print(f"[bold red]❌ [REPLICATION] Sync Engine crashed: {e}[/bold red]")
         server_role = "master"  # Fall back to master role if cluster drivetrain breaks
+    finally:
+        if writer is not None:
+            writer.close()  # also when cancelled: don't leave the leader's socket open
 
 
 class AsyncKedisSession:
@@ -641,12 +667,11 @@ class AsyncKedisSession:
 
                         if r_host.upper() == "NO" and r_port.upper() == "ONE":
                             global server_role
+                            stop_replication()
                             server_role = "master"
                             await self.send(b"+OK Engine promoted to Leader\r\n")
                         else:
-                            asyncio.create_task(
-                                init_replication_stream(r_host, int(r_port))
-                            )
+                            start_replication(r_host, int(r_port))
                             await self.send(b"+OK Replica handshake initiated\r\n")
 
                         # 🚀 FIX: Slicing
