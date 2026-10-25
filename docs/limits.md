@@ -1,6 +1,40 @@
 # Limits & Budgets
 
-What one client can make the server spend, and where each cap lives. Every value is a module or class attribute, so you can change it before starting the server, for example:
+What one client can make the server spend, and where each cap lives.
+
+Every limit can be set when the server starts:
+
+```
+kedis-server --port 7001 --max-clients 500 --max-command-bytes 64MiB --stall-timeout 10s
+```
+
+`kedis-server --help` lists every flag with the default in effect. Sizes take `B`, `KiB`, `MiB`, `GiB` (or `K`, `M`, `G`; all binary, so 1 KB is 1024 bytes), durations take `s`, `ms`, `m`, `h`, and plain numbers mean bytes or seconds. A value that makes no sense (zero, negative, not a number, an unknown unit) is refused before the server starts, with status 2 and a message naming the flag; no flag is applied unless all of them are valid. The server prints the settings it was started with.
+
+| Flag | Setting | Takes |
+|---|---|---|
+| `--host` | `HOST` | address |
+| `--port` | `PORT` | 1-65535 |
+| `--max-clients` | `MAX_CLIENTS` | whole number |
+| `--stall-timeout` | `STALL_TIMEOUT` | duration |
+| `--frame-deadline` | `FRAME_DEADLINE` | duration |
+| `--frame-min-rate` | `FRAME_MIN_RATE` | size per second |
+| `--write-deadline` | `WRITE_DEADLINE` | duration |
+| `--write-min-rate` | `WRITE_MIN_RATE` | size per second |
+| `--yield-every` | `YIELD_EVERY` | whole number |
+| `--encode-chunk` | `ENCODE_CHUNK` | whole number |
+| `--max-multi-commands` | `MAX_MULTI_COMMANDS` | whole number |
+| `--max-multi-bytes` | `MAX_MULTI_BYTES` | size |
+| `--max-inline-length` | `MAX_INLINE_LENGTH` | size |
+| `--max-array-length` | `MAX_ARRAY_LENGTH` | whole number |
+| `--max-bulk-length` | `MAX_BULK_LENGTH` | size |
+| `--max-command-bytes` | `MAX_COMMAND_BYTES` | size |
+| `--max-reply-elements` | `MAX_REPLY_ELEMENTS` | whole number |
+| `--max-reply-payload` | `MAX_REPLY_PAYLOAD` | size |
+| `--max-subscriber-buffer` | `MAX_SUBSCRIBER_BUFFER` | size |
+
+The tables below give each setting's default and what it does. Lowering a limit is always safe. Raising `--max-reply-elements` or `--max-reply-payload` above the defaults only helps clients that raise the same limits in their own decoder (`KESPDecoder`); `MAX_HEADER_LINE` and the client-side limits in "The client" are not flags.
+
+Every value is also a module or class attribute, so code that embeds the server can set them directly. Pass `argv=[]` so the script's own command line is not read as flags:
 
 ```python
 from kedis_python import server
@@ -8,10 +42,8 @@ from kedis_python.parser import CommandParser
 
 server.MAX_CLIENTS = 500
 CommandParser.MAX_COMMAND_BYTES = 64 * 1024 * 1024
-server.run()
+server.run([])
 ```
-
-There are no command-line flags for these yet.
 
 ## What a command may be (`CommandParser`)
 

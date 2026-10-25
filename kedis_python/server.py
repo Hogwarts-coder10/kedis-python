@@ -943,7 +943,18 @@ async def main():
             shutdown_sequence("SIGINT")
 
 
-def run():
+def run(argv=None):
+    """Starts the server. Command-line flags (sys.argv[1:], or `argv`) override the
+    limits first; see settings.py. Embedding code that sets the limits itself
+    can pass argv=[] to keep its own command line out of it."""
+    from .settings import parse_and_apply
+
+    applied = parse_and_apply(argv)
+    if applied:
+        console.print(
+            "[cyan]⚙️  Settings:[/cyan] "
+            + "  ".join(f"--{setting.flag} {setting.show(value)}" for setting, value in applied)
+        )
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

@@ -192,6 +192,7 @@ Asyncio-based server implementation supporting:
 * many concurrent client connections on a single event loop
 * command execution over sockets via the KESP protocol
 * standalone local mode fallback
+* every limit settable at startup, e.g. `kedis-server --port 7001 --max-clients 500` (see [Limits & Budgets](https://github.com/Hogwarts-coder10/kedis-python/blob/main/docs/limits.md))
 
 ---
 
