@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.markup import escape
 
 from .commands import CommandHandler
-from .parser import CommandParser, KESPEncoder, ProtocolError
+from .parser import CommandParser, KESPEncoder, ProtocolError, ReplyEncodeError
 from .store import KedisStore
 from .stream import StreamError
 from .textcodec import to_bytes
@@ -36,6 +36,7 @@ STALL_TIMEOUT = 30.0
 FRAME_DEADLINE = 60.0
 FRAME_MIN_RATE = 256 * 1024
 YIELD_EVERY = 256  # commands run back to back before other clients get a turn
+ENCODE_CHUNK = 512  # reply elements encoded before other clients get a turn
 # Replies must be read too: a client whose unread replies leave the socket full
 # is dropped once a send has waited WRITE_DEADLINE seconds plus the time
 # WRITE_MIN_RATE bytes/second would need to move what is already queued for it.
@@ -104,6 +105,28 @@ def notify_stream_waiters():
 def _encode_command(tokens: list) -> bytes:
     """A command as the KESP array a replica reads from the slipstream."""
     return KESPEncoder.encode_command(tokens)
+
+
+async def encode_reply(data) -> list:
+    """The KESP bytes of a reply, as a list of parts, without holding the loop.
+
+    Encoding a big reply is pure Python and takes about a second per million
+    elements; done in one go on the event loop it stalls every client. Here the
+    loop gets a turn after each ENCODE_CHUNK elements (a reply that size or
+    smaller never yields). Nothing is written until the whole reply is encoded,
+    so the caller sends every part in one go: a reply that cannot be encoded
+    still becomes a single error line rather than half a frame, and a pub/sub
+    push cannot land in the middle of one.
+    """
+    parts = []
+    try:
+        for piece in KESPEncoder.encode_chunks(data, ENCODE_CHUNK):
+            if parts:
+                await asyncio.sleep(0)
+            parts.append(piece)
+    except ReplyEncodeError as exc:
+        return [KESPEncoder.failure_reply(exc)]
+    return parts
 
 
 async def drain_within_deadline(writer) -> None:
@@ -512,6 +535,12 @@ class AsyncKedisSession:
         self.writer.write(data)
         await drain_within_deadline(self.writer)
 
+    async def send_parts(self, parts: list):
+        """send() for a reply held as parts: all written at once, with no await
+        in between, so nothing else is written to this connection mid-reply."""
+        self.writer.writelines(parts)
+        await drain_within_deadline(self.writer)
+
     # -------------------------------------
     # ASYNC TRANSACTION ROUTUING (Which will be used in dispatch table)
     # -------------------------------------
@@ -634,11 +663,11 @@ class AsyncKedisSession:
         notify_stream_waiters()
 
         # Format and send the array of results back to the client
-        response = f"A{len(results)}\n".encode("utf-8")
+        parts = [f"A{len(results)}\n".encode("utf-8")]
         for res in results:
-            response += KESPEncoder.encode(res)
+            parts.extend(await encode_reply(res))
 
-        await self.send(response)
+        await self.send_parts(parts)
 
     # -------------------------------------
     # ASYNC EVENT LOOP (MAIN)
@@ -811,8 +840,7 @@ class AsyncKedisSession:
                             response, records = await asyncio.to_thread(
                                 global_handler.execute_records, tokens, self.writer
                             )
-                        kesp_bytes = KESPEncoder.encode(response)
-                        await self.send(kesp_bytes)
+                        await self.send_parts(await encode_reply(response))
 
                         if cmd in write_commands:
                             notify_stream_waiters()

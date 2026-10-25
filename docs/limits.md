@@ -36,6 +36,7 @@ A command at the cap needs several times its size in memory for a moment (the re
 | `FRAME_DEADLINE` + `FRAME_MIN_RATE` | 60 s + size / 256 KiB per s | A half-received command still unfinished after this long is dropped, even if bytes keep trickling in. A 64 MiB upload is allowed about 5 minutes. |
 | `WRITE_DEADLINE` + `WRITE_MIN_RATE` | 30 s + queued bytes / 256 KiB per s | A client, or a replication follower, that does not read what it is sent is dropped once a send has waited this long for the socket to drain. A client's slot is freed. |
 | `YIELD_EVERY` | 256 | Commands run back to back before other clients get a turn. |
+| `ENCODE_CHUNK` | 512 | Reply elements encoded before other clients get a turn (see below). |
 | `MAX_MULTI_COMMANDS` | 10,000 | Most commands one client's open `MULTI` block may queue. |
 | `MAX_MULTI_BYTES` | 64 MiB | Most bytes of arguments (UTF-8) the block may hold, summed over its commands. |
 
@@ -53,6 +54,10 @@ A follower reads its leader's stream under the same rules (`LeaderStream` in `se
 - sends a baseline that is not a single JSON object (the store is left as it was).
 
 It stays a read-only replica when that happens: a follower never promotes itself because its leader misbehaved. A command that fails to apply is logged and skipped rather than retried, since retrying it could never succeed and everything behind it would wait.
+
+A big reply is encoded in slices of `ENCODE_CHUNK` elements, with the event loop running in between. Encoding is pure Python and costs about a second per million elements; done in one go it stopped every client for that long (an `LRANGE` of a 1,000,000-item list held the loop for about 0.85 s, and now for under 50 ms, in the same total time). Nothing is written until the whole reply is encoded, and then every part is written in one call, so a reply that cannot be encoded is still a single error line (never half a frame) and a pub/sub push cannot land in the middle of one. A reply of `ENCODE_CHUNK` elements or fewer is encoded in one piece, as before. Only a flat top-level array or dict is sliced; a reply that is one huge nested value is still encoded in one go. The reply budgets are the ones the client's decoder enforces (1,048,576 elements in an array, 4,194,304 in all, 1 GiB of strings); a reply over the element limits is refused before anything is encoded.
+
+Replies are encoded after the engine lock is released, with other commands running meanwhile, so a reply must never contain a list, set, dict or deque that the store still owns. `tests/test_reply_snapshots.py` checks every command, and fails when a new command has not been classified.
 
 The server also parses large values once rather than after every 64 KiB chunk: when a string is on its way, it keeps reading until the bytes have arrived. A 32 MiB `SET` took about 2.6 s of server time when every chunk re-parsed the buffer, and about 0.2 s now.
 
@@ -77,4 +82,7 @@ While waiting for a large reply, `read_reply` does not decode again until the by
 
 ## Not covered yet
 
-- **Command cost:** `KEYS` on a huge store, or a very long list operation, blocks for as long as it takes. Nothing limits it.
+- **Whole-store commands hold the engine lock.** `SAVE` and `COMPACT` dump the whole store while holding it, so every other command waits: about 1 s for 3 million items.
+- **Replication broadcast encoding.** A write command forwarded to followers is encoded on the event loop in one go: about 0.55 s for a command with 1,000,000 arguments, once per write while a follower is attached.
+- **One huge nested reply** is encoded in one go (see `ENCODE_CHUNK`), and its memory is about the size of the reply.
+- **`KEYS`** is not a problem at the default size: the store keeps at most 1,024 keys (LRU), and `KEYS` over that takes about 13 ms. That cap is a constructor argument, not a runtime setting.

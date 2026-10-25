@@ -428,7 +428,75 @@ class KESPEncoder:
         try:
             return KESPEncoder._encode(data, 0, True, budget)
         except ReplyEncodeError as exc:
-            return KESPEncoder._error_line(f"Internal server error: {exc}")
+            return KESPEncoder.failure_reply(exc)
+
+    @staticmethod
+    def failure_reply(exc) -> bytes:
+        """The one error line that stands in for a reply that could not be encoded."""
+        return KESPEncoder._error_line(f"Internal server error: {exc}")
+
+    @staticmethod
+    def encode_chunks(data, chunk: int = 512):
+        """encode(), in pieces: b"".join(encode_chunks(x)) == encode(x) for every
+        x that encode() can encode.
+
+        A reply with more than `chunk` elements comes out as its header and then
+        one piece per `chunk` elements, so a caller can hand control back to the
+        event loop between pieces instead of holding it for the whole reply.
+        Smaller replies, and replies that are not a flat top-level array or
+        dict, come out as a single piece.
+
+        Unlike encode() this raises ReplyEncodeError when the reply cannot be
+        encoded, possibly after some pieces were produced: the caller must hold
+        every piece back until the last one is made, then send either all of
+        them or failure_reply(exc), so that a failure never leaves half a frame
+        on the wire.
+        """
+        budget = [KESPDecoder.MAX_REPLY_ELEMENTS, KESPDecoder.MAX_REPLY_PAYLOAD]
+
+        if isinstance(data, (list, set, tuple)) and len(data) > chunk:
+            # The same checks _encode makes for a top-level array.
+            if budget[0] <= 0:
+                raise ReplyEncodeError("reply has too many elements")
+            budget[0] -= 1
+            if len(data) > CommandParser.MAX_ARRAY_LENGTH:
+                raise ReplyEncodeError("array too large")
+            if len(data) > budget[0]:
+                raise ReplyEncodeError("reply has too many elements")
+            yield f"A{len(data)}\n".encode("utf-8")
+            items = data if isinstance(data, (list, tuple)) else list(data)
+            for i in range(0, len(items), chunk):
+                yield b"".join(
+                    [
+                        KESPEncoder._encode(item, 1, False, budget)
+                        for item in items[i : i + chunk]
+                    ]
+                )
+
+        elif isinstance(data, dict) and len(data) > chunk:
+            # The same checks _encode makes for a top-level dict (a flat array of
+            # alternating keys and values).
+            if budget[0] <= 0:
+                raise ReplyEncodeError("reply has too many elements")
+            budget[0] -= 1
+            if len(data) * 2 > CommandParser.MAX_ARRAY_LENGTH:
+                raise ReplyEncodeError("array too large")
+            if len(data) * 2 > budget[0]:
+                raise ReplyEncodeError("reply has too many elements")
+            yield f"A{len(data) * 2}\n".encode("utf-8")
+            entries = list(data.items())
+            for i in range(0, len(entries), chunk):
+                parts = []
+                for k, v in entries[i : i + chunk]:
+                    if budget[0] <= 0:
+                        raise ReplyEncodeError("reply has too many elements")
+                    budget[0] -= 1  # the key
+                    parts.append(KESPEncoder._bulk(str(k), budget))
+                    parts.append(KESPEncoder._encode(v, 1, False, budget))
+                yield b"".join(parts)
+
+        else:
+            yield KESPEncoder._encode(data, 0, True, budget)
 
     @staticmethod
     def encode_command(tokens) -> bytes:
