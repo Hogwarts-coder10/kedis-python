@@ -74,6 +74,7 @@ Opens a transaction block. Subsequent commands are not executed immediately; the
 ### `EXEC`
 Executes all queued commands in a single, atomic block. If a `WATCH` lock was tripped by another client, the transaction aborts.
 * **Returns:** An Array of the command results, or `(nil)` if the transaction was aborted. If the queue limit was exceeded, `-EXECABORT Transaction discarded: the MULTI queue limit was exceeded` and nothing runs.
+* **Replication:** the commands in the block run on the master and are logged to its AOF, but they are not forwarded to followers yet, so a follower will not see them.
 
 ### `DISCARD`
 Flushes the transaction queue and exits the `MULTI` state without executing any commands.
