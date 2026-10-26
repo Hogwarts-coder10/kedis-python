@@ -146,6 +146,22 @@ async def drain_within_deadline(writer) -> None:
         raise ConnectionAbortedError("peer did not read in time")
 
 
+# Internal replication command: "TXBATCH <n>" announces that the next n commands
+# are one transaction, which a follower applies as a unit. It is not a client
+# command, and the engine does not know it: only the follower's stream loop does.
+TX_BATCH = "TXBATCH"
+
+
+def transaction_frames(forwards: list) -> list:
+    """What a master sends for the commands one EXEC produced. A single command
+    is atomic on its own and goes out bare; two or more go behind a TXBATCH
+    header, in the same write (see broadcast_to_replicas), so no other command can
+    land between them on the wire."""
+    if len(forwards) < 2:
+        return forwards
+    return [[TX_BATCH, str(len(forwards))], *forwards]
+
+
 async def broadcast_to_replicas(forwards: list, label: str) -> None:
     """Writes already-resolved commands to every follower; drops dead ones.
 
@@ -365,6 +381,35 @@ class LeaderStream:
             self.buf.extend(chunk)
 
 
+async def read_transaction(stream, header: list) -> list:
+    """The commands of one TXBATCH frame, read in full before any is applied, so
+    a leader that fails half-way leaves the store as it was.
+
+    Raises ReplicationError for a bad header, a nested transaction, a leader that
+    stalls or closes in the middle, or more payload than one command may carry.
+    """
+    try:
+        count = int(header[1]) if len(header) == 2 else -1
+    except ValueError:
+        count = -1
+    if not 2 <= count <= CommandParser.MAX_ARRAY_LENGTH:
+        raise ReplicationError("leader sent a malformed transaction header")
+
+    batch: list = []
+    size = 0
+    for _ in range(count):
+        tokens = await stream.next_command(first_wait=STALL_TIMEOUT)
+        if tokens is None:
+            raise ReplicationError("leader closed the connection in the middle of a transaction")
+        if tokens[0] == TX_BATCH:
+            raise ReplicationError("leader sent a transaction inside a transaction")
+        size += sum(len(to_bytes(t)) for t in tokens)
+        if size > CommandParser.MAX_COMMAND_BYTES:
+            raise ReplicationError("leader sent a transaction larger than a command may be")
+        batch.append(tokens)
+    return batch
+
+
 def describe_command(tokens, width: int = 120) -> str:
     """A short, markup-safe one-line summary of a command for the log: values can
     be megabytes, and can contain text that looks like console markup."""
@@ -471,6 +516,21 @@ async def init_replication_stream(host: str, port: int):
                     "[bold red]⚠️ [REPLICATION] Leader connection lost![/bold red]"
                 )
                 break
+
+            if tokens[0] == TX_BATCH:
+                batch = await read_transaction(stream, tokens)
+                try:
+                    await asyncio.to_thread(global_handler.execute_batch, batch, None)
+                except Exception as e:
+                    console.print(
+                        f"[bold red]❌ [REPLICATION Live] Could not apply a transaction of {len(batch)} commands: {escape(repr(e))}[/bold red]"
+                    )
+                    continue
+                notify_stream_waiters()
+                console.print(
+                    f"[magenta]🔄 [REPLICATION Live] Executed a transaction of {len(batch)} commands[/magenta]"
+                )
+                continue
 
             try:
                 # Execute the mirrored write locally using your handler
@@ -651,13 +711,11 @@ class AsyncKedisSession:
             await self.send(b"A0\n")
             return
 
-        # Execute the payload
-        results = []
-        for cmd_args in self.tx_queue:
-            result = await asyncio.to_thread(
-                global_handler.execute, cmd_args, self.writer
-            )
-            results.append(result)
+        # Execute the payload as one unit: the engine lock is held across the whole
+        # block, so nothing else runs in between and followers see the same order.
+        results, forwards = await asyncio.to_thread(
+            global_handler.execute_batch, self.tx_queue, self.writer
+        )
 
         self._reset_queue()
         notify_stream_waiters()
@@ -668,6 +726,10 @@ class AsyncKedisSession:
             parts.extend(await encode_reply(res))
 
         await self.send_parts(parts)
+
+        # 📡 What the block changed goes to followers as one transaction.
+        if server_role == "master":
+            await broadcast_to_replicas(transaction_frames(forwards), "EXEC")
 
     # -------------------------------------
     # ASYNC EVENT LOOP (MAIN)

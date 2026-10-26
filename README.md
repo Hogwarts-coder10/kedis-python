@@ -182,7 +182,7 @@ Kedis supports master-replica replication:
 * Replicas connect to a master and perform a `SYNC` handshake to receive the initial dataset
 * The master streams subsequent writes to connected replicas in real time
 * Replicas are read-only — writes issued directly to a replica are rejected
-* Commands run inside a `MULTI`/`EXEC` block are **not** forwarded yet, so a follower can diverge from its master (see Known Limitations)
+* A `MULTI`/`EXEC` block runs as one unit on the master and reaches followers as one transaction, which a follower applies as a unit
 
 ---
 
@@ -368,7 +368,6 @@ Current limitations include:
 * limited fault tolerance compared to production databases
 * no memory-based eviction ceiling (LRU tracks usage, but isn't yet tied to a hard memory limit)
 * AOF persistence is not buffered — writes can trigger a sync depending on config
-* `MULTI`/`EXEC` is not replicated: the commands run on the master and are logged to its AOF, but are never sent to followers, so a follower's data can silently differ from the master's
 * `SAVE` and `COMPACT` hold the engine lock while they dump the store, so other commands wait (about 1 s for 3 million items); a write forwarded to followers is encoded on the event loop in one go (about 0.55 s for a command with 1,000,000 arguments). Both are listed in [Limits & Budgets](https://github.com/Hogwarts-coder10/kedis-python/blob/main/docs/limits.md#not-covered-yet)
 * consumer groups have no `XCLAIM`/`XAUTOCLAIM` yet; the full list of stream limits is in [docs/streams.md](https://github.com/Hogwarts-coder10/kedis-python/blob/main/docs/streams.md#-known-limits)
 

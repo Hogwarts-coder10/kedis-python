@@ -136,57 +136,82 @@ class CommandHandler:
         if not tokens:
             return "-ERR empty command or syntax error", []
 
-        cmd = tokens[0].upper()
-        args = tokens[
-            1:
-        ]  # (Though your current code passes tokens, let's keep your routing exact)
-
         # 🚀 TRACK A: Start the high-precision telemetry stopwatch (in nanoseconds)
         start_time = time.perf_counter_ns()
+        try:
+            with self._engine_lock:
+                return self._run_locked(tokens, client_socket)
+        finally:
+            self._record_duration(tokens, start_time)
+
+    def execute_batch(self, batch: list, client_socket=None):
+        """Runs several commands as one unit: the engine lock is taken once, so
+        no other client's command can run between them, and the AOF records
+        them back to back. Returns (results, forwards): one result per command,
+        and the commands a master must send to replicas, in order (see
+        replication_payloads). Commands are not skipped or reordered; one that
+        fails gives an error result and the rest still run, like the one-at-a-
+        time path."""
+        results: list = []
+        forwards: list = []
+        write_commands = self.WRITE_COMMANDS
+        starts: list = []
+        with self._engine_lock:
+            for tokens in batch:
+                if not tokens:
+                    results.append("-ERR empty command or syntax error")
+                    starts.append(None)
+                    continue
+                starts.append(time.perf_counter_ns())
+                result, records = self._run_locked(tokens, client_socket)
+                results.append(result)
+                if tokens[0].upper() in write_commands:
+                    forwards.extend(self.replication_payloads(tokens, result, records))
+        for tokens, started in zip(batch, starts):
+            if started is not None:
+                self._record_duration(tokens, started)
+        return results, forwards
+
+    def _run_locked(self, tokens: list[str], client_socket=None):
+        """Runs one command. The caller holds the engine lock."""
+        cmd = tokens[0].upper()
         result = None
         records = []
 
         try:
-            with self._engine_lock:
-                try:
-                    if cmd == "XGAPPLY" and client_socket is not None:
-                        # Internal replication command: a network client
-                        # must not be able to write raw group records.
-                        result = f"-ERR unknown command '{cmd}'"
-                    elif cmd in self._commands:
-                        if cmd in ["SUBSCRIBE", "PUBLISH"]:
-                            handler_function = self._commands[cmd]
-                            result = handler_function(tokens, client_socket)
-                        else:
-                            handler_function = self._commands[cmd]
-                            # Note: Depending on how your handlers are registered,
-                            # they might expect 'tokens' or 'args'. Keeping your existing call:
-                            result = handler_function(tokens)
+            try:
+                if cmd == "XGAPPLY" and client_socket is not None:
+                    # Internal replication command: a network client
+                    # must not be able to write raw group records.
+                    result = f"-ERR unknown command '{cmd}'"
+                elif cmd in self._commands:
+                    handler_function = self._commands[cmd]
+                    if cmd in ["SUBSCRIBE", "PUBLISH"]:
+                        result = handler_function(tokens, client_socket)
                     else:
-                        result = f"-ERR unknown command '{cmd}'"
-                finally:
-                    records = self.store.drain_group_records()
+                        # Handlers take the whole token list, command name included.
+                        result = handler_function(tokens)
+                else:
+                    result = f"-ERR unknown command '{cmd}'"
+            finally:
+                records = self.store.drain_group_records()
             return result, records
-
-        except TypeError as e:
-            result = f"-ERR wrong number of arguments for '{cmd}' command"
-            return result, records
+        except TypeError:
+            return f"-ERR wrong number of arguments for '{cmd}' command", records
         except Exception as e:
-            result = f"-ERR {str(e)}"
-            return result, records
+            return f"-ERR {str(e)}", records
 
-        finally:
-            # 🚀 TRACK A: Stop the stopwatch, convert nanoseconds to microseconds
-            end_time = time.perf_counter_ns()
-            duration_us = (end_time - start_time) // 1000
+    def _record_duration(self, tokens: list[str], start_time: int) -> None:
+        # 🚀 TRACK A: Stop the stopwatch, convert nanoseconds to microseconds
+        duration_us = (time.perf_counter_ns() - start_time) // 1000
 
-            # Feed the metrics to the store's slowlog ring buffer if available
-            if (
-                hasattr(self, "store")
-                and self.store
-                and hasattr(self.store, "_log_slow_command")
-            ):
-                self.store._log_slow_command(tokens, duration_us)
+        # Feed the metrics to the store's slowlog ring buffer if available
+        if (
+            hasattr(self, "store")
+            and self.store
+            and hasattr(self.store, "_log_slow_command")
+        ):
+            self.store._log_slow_command(tokens, duration_us)
 
     # ---------------------------------------------------------
     # COMMAND HANDLERS (The isolated engine components)
