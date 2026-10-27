@@ -575,6 +575,7 @@ class AsyncKedisSession:
         self.tx_queue = []
         self.tx_bytes = 0  # argument bytes held in tx_queue
         self.tx_overflowed = False  # the queue limit was hit: EXEC will abort
+        self.tx_readonly = False  # a write was refused at queue time: EXEC will abort
 
         # Connection-specific watch state {key: expected_version}
         self.watched_keys = {}
@@ -627,6 +628,7 @@ class AsyncKedisSession:
         self.tx_queue = []
         self.tx_bytes = 0
         self.tx_overflowed = False
+        self.tx_readonly = False
 
     async def queue_command(self, tokens: list):
         """Adds a command to the open MULTI block, within the queue limits.
@@ -636,6 +638,12 @@ class AsyncKedisSession:
         not simply ended, or the rest of what the client meant to be atomic would
         run one command at a time.
         """
+        # A follower takes no writes, in a block or out of it. The write is refused
+        # now and the block poisoned, so EXEC cannot run the rest of it half-done.
+        if server_role == "replica" and tokens[0].upper() in global_handler.WRITE_COMMANDS:
+            self.tx_readonly = True
+            await self.send(b"-EREADONLY You can't write against a read-only replica.\n")
+            return
         if not self.tx_overflowed:
             size = sum(len(to_bytes(t)) for t in tokens)
             if (
@@ -696,6 +704,18 @@ class AsyncKedisSession:
             self._reset_queue()
             await self.send(
                 b"-EXECABORT Transaction discarded: the MULTI queue limit was exceeded\r\n"
+            )
+            return
+
+        # A write was refused at queue time, or this node became a follower after
+        # it was queued: either way the block must not run on a read-only replica.
+        if self.tx_readonly or (
+            server_role == "replica"
+            and any(t[0].upper() in global_handler.WRITE_COMMANDS for t in self.tx_queue)
+        ):
+            self._reset_queue()
+            await self.send(
+                b"-EXECABORT Transaction discarded: writes are refused on a read-only replica\r\n"
             )
             return
 

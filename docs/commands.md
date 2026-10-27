@@ -73,7 +73,7 @@ Opens a transaction block. Subsequent commands are not executed immediately; the
 
 ### `EXEC`
 Executes all queued commands in a single, atomic block: the engine lock is held across the whole block, so no other client's command runs in between, and the AOF records them back to back. If a `WATCH` lock was tripped by another client, the transaction aborts.
-* **Returns:** An Array of the command results, or `(nil)` if the transaction was aborted. If the queue limit was exceeded, `-EXECABORT Transaction discarded: the MULTI queue limit was exceeded` and nothing runs.
+* **Returns:** An Array of the command results, or `(nil)` if the transaction was aborted. If the queue limit was exceeded, `-EXECABORT Transaction discarded: the MULTI queue limit was exceeded` and nothing runs. On a read-only replica a write is refused when it is queued (`-EREADONLY`) and `EXEC` replies `-EXECABORT Transaction discarded: writes are refused on a read-only replica` without running anything, including when the node became a replica after the write was queued.
 * **Replication:** what the block wrote goes to followers as one transaction, in order, and a follower applies it as a unit (see [limits](limits.md)). A block with a single write is sent as that write; reads are not sent.
 
 ### `DISCARD`

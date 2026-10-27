@@ -181,7 +181,7 @@ Kedis supports master-replica replication:
 
 * Replicas connect to a master and perform a `SYNC` handshake to receive the initial dataset
 * The master streams subsequent writes to connected replicas in real time
-* Replicas are read-only — writes issued directly to a replica are rejected
+* Replicas are read-only — writes issued directly to a replica are rejected, and so are writes inside a `MULTI` block: the write gets `-EREADONLY` when it is queued and `EXEC` aborts with `-EXECABORT`
 * A `MULTI`/`EXEC` block runs as one unit on the master and reaches followers as one transaction, which a follower applies as a unit
 
 ---
