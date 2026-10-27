@@ -178,11 +178,17 @@ class TestBlocking:
             await a.send("XREADGROUP", "GROUP", "g", "a", "BLOCK", "5000", "STREAMS", "s", ">")
             await b.send("XREADGROUP", "GROUP", "g", "b", "BLOCK", "5000", "STREAMS", "s", ">")
             await asyncio.sleep(0.2)
+            reads = {asyncio.ensure_future(a.read()), asyncio.ensure_future(b.read())}
             await writer.call("XADD", "s", "1-0", "k", "one")
+            # Both are woken; exactly one may take the entry. The second entry is added
+            # only once someone has it, or the first consumer to run could take both
+            # (which one runs first depends on the event loop, not on the server).
+            done, rest = await asyncio.wait(reads, timeout=3, return_when=asyncio.FIRST_COMPLETED)
+            assert len(done) == 1
             await writer.call("XADD", "s", "2-0", "k", "two")
-            got_a = await asyncio.wait_for(a.read(), 3)
-            got_b = await asyncio.wait_for(b.read(), 3)
-            delivered = sorted([got_a[0][1][0][0], got_b[0][1][0][0]])
+            done2, _ = await asyncio.wait(rest, timeout=3)
+            assert len(done2) == 1
+            delivered = sorted(t.result()[0][1][0][0] for t in done | done2)
             assert delivered == ["1-0", "2-0"]
             assert await writer.call("XPENDING", "s", "g", "-", "+", "10") != []
 

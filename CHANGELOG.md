@@ -7,6 +7,10 @@
 - The baseline is taken under the engine lock, so it can no longer be half of a `MULTI`/`EXEC` block or fail with a dictionary-changed error.
 - A follower whose baseline cannot be sent is dropped at once, not at the next write.
 - Known gap: `XREADGROUP` is not covered by this (see `docs/limits.md`).
+- `XREAD`/`XREADGROUP` now put what they changed into the followers' buffers before the client gets its reply, as plain writes and `EXEC` already did. Before, a follower that attached just after a reply could receive that read's changes, depending on the Python version's event-loop scheduling.
+
+### Packaging and CI
+- A GitHub Actions workflow runs the test suite on Python 3.9 to 3.13 and builds, checks and smoke-tests the wheel.
 
 ## 0.3.0 — 2026-10-27
 

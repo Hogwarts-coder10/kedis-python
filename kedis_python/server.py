@@ -1030,15 +1030,12 @@ class AsyncKedisSession:
                             response, records = await asyncio.to_thread(
                                 global_handler.execute_records, tokens, self.writer
                             )
-                        await self.send_parts(await encode_reply(response))
-
-                        if cmd in write_commands:
-                            notify_stream_waiters()
-
                         # 📡 PHASE 3: LIVE COMMAND FORWARDING
                         # XADD goes out with the ID this master assigned; group
                         # commands go out as the resolved records they produced
-                        # (nothing at all if they changed nothing).
+                        # (nothing at all if they changed nothing). Buffered for
+                        # followers before the client hears back, so a reply means
+                        # "already on its way to every follower there is".
                         if forwards is None:  # XREAD / XREADGROUP: not under the barrier
                             forwards = (
                                 global_handler.replication_payloads(tokens, response, records)
@@ -1046,6 +1043,13 @@ class AsyncKedisSession:
                                 else []
                             )
                             queued = enqueue_broadcast(forwards, cmd)
+
+                        await self.send_parts(await encode_reply(response))
+
+                        if cmd in write_commands:
+                            notify_stream_waiters()
+
+                        # 📡 PHASE 3: wait for the followers the change was buffered for
                         await drain_broadcast(queued)
 
                     # 🚀 FIX: Slicing for standard commands
