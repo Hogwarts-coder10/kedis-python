@@ -1,3 +1,4 @@
+import json
 import math
 import threading
 import time
@@ -143,6 +144,14 @@ class CommandHandler:
                 return self._run_locked(tokens, client_socket)
         finally:
             self._record_duration(tokens, start_time)
+
+    def snapshot_bytes(self) -> bytes:
+        """The baseline a new follower is sent, as one KESP frame. Built with the
+        engine lock held, so it is never half of a transaction and no worker thread
+        changes the data while it is read."""
+        with self._engine_lock:
+            body = json.dumps(self.store.get_snapshot_state()).encode("utf-8")
+        return b"A1\n" + f"S{len(body)}\n".encode("utf-8") + body + b"\n"
 
     def execute_batch(self, batch: list, client_socket=None):
         """Runs several commands as one unit: the engine lock is taken once, so

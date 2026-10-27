@@ -1,0 +1,360 @@
+"""A new follower's SYNC must hand it every write exactly once: in the snapshot or
+down the live stream, never both and never neither. The snapshot must also be taken
+under the engine lock, so it is never half of a transaction."""
+
+import asyncio
+import io
+import json
+import threading
+
+import pytest
+from rich.console import Console
+
+from kedis_python.parser import CommandParser
+from test_stream_server import serve  # shared wire helper
+
+
+@pytest.fixture
+def srv(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # server.py builds its global store in the cwd on import
+    from kedis_python import server
+
+    server.console = Console(file=io.StringIO(), width=200)
+    server.global_store.flushall()
+    server.stream_waiters.clear()
+    monkeypatch.setattr(server, "server_role", "master")
+    monkeypatch.setattr(server, "connected_replicas", [])
+    yield server
+    server.stream_waiters.clear()
+    server.global_store.flushall()
+
+
+async def start_sync(connect):
+    f = await connect()
+    f.w.write(b"SYNC\n")
+    await f.w.drain()
+    return f
+
+
+async def read_snapshot(f):
+    assert (await asyncio.wait_for(f.r.readline(), 10)) == b"A1\n"
+    n = int((await f.r.readline())[1:-1])
+    return json.loads((await f.r.readexactly(n + 1))[:-1])["data"]
+
+
+async def read_stream(f, settle=0.4):
+    """The commands the leader sent after the snapshot."""
+    await asyncio.sleep(settle)
+    try:
+        data = await asyncio.wait_for(f.r.read(1 << 20), 1)
+    except asyncio.TimeoutError:
+        return []
+    out = []
+    while data:
+        tokens, used = CommandParser.parse(data)
+        if not tokens:
+            break
+        out.append(tokens)
+        data = data[used:]
+    return out
+
+
+def times(snapshot, stream, key):
+    """How often a one-element write to `key` reaches the follower."""
+    held = snapshot.get(key)
+    if isinstance(held, dict):
+        held = len(held["data"])
+    else:
+        held = 1 if held is not None else 0
+    return held + sum(1 for c in stream if len(c) > 1 and c[1] == key)
+
+
+def test_a_quiet_sync_sends_the_data_once_and_then_the_stream(srv):
+    async def scenario(connect, errors):
+        w = await connect()
+        await w.call("SET", "before", "1")
+        f = await start_sync(connect)
+        snap = await read_snapshot(f)
+        await w.call("SET", "after", "1")
+        stream = await read_stream(f)
+        assert times(snap, stream, "before") == 1
+        assert times(snap, stream, "after") == 1
+
+    assert serve(srv, scenario) == []
+
+
+def test_a_write_made_while_the_snapshot_is_being_sent_is_not_lost(srv, monkeypatch):
+    async def scenario(connect, errors):
+        reached, release = asyncio.Event(), asyncio.Event()
+        armed = {"on": False}
+        real_state = srv.global_store.get_snapshot_state
+        real_drain = srv.drain_within_deadline
+
+        def state():
+            armed["on"] = True
+            return real_state()
+
+        async def drain(writer):
+            if armed["on"]:  # the first send after the snapshot was taken
+                armed["on"] = False
+                reached.set()
+                await release.wait()
+            await real_drain(writer)
+
+        monkeypatch.setattr(srv.global_store, "get_snapshot_state", state)
+        monkeypatch.setattr(srv, "drain_within_deadline", drain)
+
+        w = await connect()
+        await w.call("SET", "before", "1")
+        f = await start_sync(connect)
+        await asyncio.wait_for(reached.wait(), 10)
+        await w.call("SET", "during", "1")  # applied after the snapshot, while it is in flight
+        release.set()
+        snap = await read_snapshot(f)
+        await w.call("SET", "after", "1")
+        stream = await read_stream(f)
+        assert times(snap, stream, "before") == 1
+        assert times(snap, stream, "during") == 1
+        assert times(snap, stream, "after") == 1
+
+    assert serve(srv, scenario) == []
+
+
+def test_a_write_applied_before_the_snapshot_is_not_sent_again(srv, monkeypatch):
+    async def scenario(connect, errors):
+        applied, release = threading.Event(), threading.Event()
+        real = srv.global_handler.execute_records
+
+        def held(tokens, sock=None):
+            out = real(tokens, sock)
+            if tokens[:2] == ["RPUSH", "l"]:  # applied; not yet on its way to followers
+                applied.set()
+                release.wait(10)
+            return out
+
+        monkeypatch.setattr(srv.global_handler, "execute_records", held)
+
+        w = await connect()
+        pending = asyncio.create_task(w.call("RPUSH", "l", "1"))
+        while not applied.is_set():
+            await asyncio.sleep(0.01)
+        f = await start_sync(connect)
+        await asyncio.sleep(0.4)  # let the SYNC run as far as it can
+        release.set()
+        snap = await read_snapshot(f)
+        await pending
+        stream = await read_stream(f)
+        assert times(snap, stream, "l") == 1
+
+    assert serve(srv, scenario) == []
+
+
+def test_the_snapshot_is_taken_under_the_engine_lock(srv, monkeypatch):
+    seen = []
+    real_state = srv.global_store.get_snapshot_state
+
+    def state():
+        seen.append(srv.global_handler._engine_lock.locked())
+        return real_state()
+
+    monkeypatch.setattr(srv.global_store, "get_snapshot_state", state)
+
+    async def scenario(connect, errors):
+        f = await start_sync(connect)
+        await read_snapshot(f)
+
+    assert serve(srv, scenario) == []
+    assert seen == [True]
+
+
+# --- the barrier on its own ---------------------------------------------------------------------
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+def test_writes_do_not_wait_for_each_other():
+    from kedis_python.server import SyncBarrier
+
+    async def scenario():
+        b = SyncBarrier()
+        async with b.write():
+            async with b.write():
+                assert b.inflight == 2
+
+    run(scenario())
+
+
+def test_a_snapshot_waits_for_writes_in_flight():
+    from kedis_python.server import SyncBarrier
+
+    async def scenario():
+        b, log = SyncBarrier(), []
+
+        async def write():
+            async with b.write():
+                log.append("write applied")
+                await asyncio.sleep(0.1)
+                log.append("write buffered")
+
+        async def sync():
+            async with b.snapshot():
+                log.append("snapshot")
+
+        w = asyncio.create_task(write())
+        await asyncio.sleep(0.02)
+        await sync()
+        await w
+        assert log == ["write applied", "write buffered", "snapshot"]
+
+    run(scenario())
+
+
+def test_a_write_waits_for_a_snapshot_in_progress():
+    from kedis_python.server import SyncBarrier
+
+    async def scenario():
+        b, log = SyncBarrier(), []
+
+        async def sync():
+            async with b.snapshot():
+                log.append("snapshot start")
+                await asyncio.sleep(0.1)
+                log.append("snapshot end")
+
+        async def write():
+            async with b.write():
+                log.append("write")
+
+        s = asyncio.create_task(sync())
+        await asyncio.sleep(0.02)
+        await write()
+        await s
+        assert log == ["snapshot start", "snapshot end", "write"]
+
+    run(scenario())
+
+
+def test_snapshots_run_one_at_a_time():
+    from kedis_python.server import SyncBarrier
+
+    async def scenario():
+        b, log = SyncBarrier(), []
+
+        async def sync(name):
+            async with b.snapshot():
+                log.append(name + " in")
+                await asyncio.sleep(0.05)
+                log.append(name + " out")
+
+        await asyncio.gather(sync("a"), sync("b"))
+        assert log in (["a in", "a out", "b in", "b out"], ["b in", "b out", "a in", "a out"])
+
+    run(scenario())
+
+
+def test_a_write_that_fails_still_releases_the_barrier():
+    from kedis_python.server import SyncBarrier
+
+    async def scenario():
+        b = SyncBarrier()
+        with pytest.raises(RuntimeError):
+            async with b.write():
+                raise RuntimeError("boom")
+        assert b.inflight == 0
+        async with b.snapshot():  # would hang if the write still counted
+            pass
+
+    run(scenario())
+
+
+def test_a_cancelled_waiting_write_does_not_wedge_the_barrier():
+    from kedis_python.server import SyncBarrier
+
+    async def scenario():
+        b = SyncBarrier()
+        async with b.snapshot():
+            waiting = asyncio.create_task(b.write().__aenter__())
+            await asyncio.sleep(0.02)
+            waiting.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiting
+        async with b.write():
+            assert b.inflight == 1
+        assert b.inflight == 0
+
+    run(scenario())
+
+
+# --- a snapshot that cannot be delivered ---------------------------------------------------------
+
+
+def test_a_follower_that_never_reads_its_snapshot_is_dropped_and_writes_go_on(srv, monkeypatch):
+    monkeypatch.setattr(srv, "WRITE_DEADLINE", 0.5)
+    monkeypatch.setattr(srv, "WRITE_MIN_RATE", 1e15)  # queued size adds no time
+    big = "x" * (8 * 1024 * 1024)  # more than the kernel buffers on both ends
+    srv.global_store.set("big", big)
+
+    async def scenario(connect, errors):
+        stalled = await start_sync(connect)  # asks for the snapshot and never reads it
+        w = await connect()
+        assert await w.call("SET", "k", "v") == "OK"  # a stalled follower holds no writes up
+        for _ in range(100):
+            if not srv.connected_replicas:
+                break
+            await asyncio.sleep(0.05)
+        assert srv.connected_replicas == []
+        assert await w.call("SET", "k2", "v") == "OK"
+        stalled.close()
+
+    assert serve(srv, scenario) == []
+
+
+def test_a_block_applied_before_the_snapshot_is_not_sent_again(srv, monkeypatch):
+    async def scenario(connect, errors):
+        applied, release = threading.Event(), threading.Event()
+        real = srv.global_handler.execute_batch
+
+        def held(batch, sock=None):
+            out = real(batch, sock)
+            applied.set()  # applied; not yet on its way to followers
+            release.wait(10)
+            return out
+
+        monkeypatch.setattr(srv.global_handler, "execute_batch", held)
+
+        w = await connect()
+        await w.call("MULTI")
+        await w.call("RPUSH", "l", "1")
+        await w.call("RPUSH", "l", "2")
+        pending = asyncio.create_task(w.call("EXEC"))
+        while not applied.is_set():
+            await asyncio.sleep(0.01)
+        f = await start_sync(connect)
+        await asyncio.sleep(0.4)
+        release.set()
+        snap = await read_snapshot(f)
+        await pending
+        stream = await read_stream(f)
+        assert snap["l"]["data"] == ["1", "2"]
+        assert [c for c in stream if c[0] == "RPUSH"] == []  # nothing sent twice
+
+    assert serve(srv, scenario) == []
+
+
+def test_a_snapshot_that_cannot_be_sent_unregisters_the_follower_at_once(srv, monkeypatch):
+    monkeypatch.setattr(srv, "WRITE_DEADLINE", 0.5)
+    monkeypatch.setattr(srv, "WRITE_MIN_RATE", 1e15)
+    srv.global_store.set("big", "x" * (8 * 1024 * 1024))
+
+    async def scenario(connect, errors):
+        stalled = await start_sync(connect)  # never reads; no write follows to drop it
+        for _ in range(100):
+            if not srv.connected_replicas:
+                break
+            await asyncio.sleep(0.05)
+        assert srv.connected_replicas == []
+        stalled.close()
+
+    serve(srv, scenario)

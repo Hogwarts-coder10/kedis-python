@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import signal
 import sys
@@ -56,6 +57,77 @@ server_role = "master"
 server_host = None
 master_port = None
 connected_replicas = []  # 📡 Holds the writer sockets for all active Followers
+
+
+class SyncBarrier:
+    """Keeps a new follower's snapshot and the live stream from overlapping or
+    leaving a gap.
+
+    A write is applied in a worker thread and forwarded to followers afterwards,
+    on the event loop. A follower that joined between the two would get the write
+    twice (it is in the snapshot, and it is forwarded), and one whose snapshot was
+    taken just before a write but registered just after would never get it. So a
+    write holds the barrier from before it is applied until it is in every
+    follower's buffer, and a SYNC takes the snapshot and registers the follower
+    with no write in between. Writes do not wait for each other, only for a SYNC
+    that is in progress (a snapshot, not the send of it).
+    """
+
+    def __init__(self):
+        self.inflight = 0  # writes between "about to apply" and "buffered for followers"
+        self.syncing = False  # a SYNC is taking its snapshot
+        self._waiters = []
+
+    def _wake(self):
+        waiters, self._waiters = self._waiters, []
+        for waiter in waiters:
+            try:
+                if not waiter.done():
+                    waiter.set_result(None)
+            except RuntimeError:  # its event loop is gone
+                pass
+
+    async def _until(self, ready):
+        while not ready():
+            waiter = asyncio.get_running_loop().create_future()
+            self._waiters.append(waiter)
+            await waiter
+
+    def write(self):
+        return _WriteScope(self)  # a plain class: this is on the path of every write
+
+    @contextlib.asynccontextmanager
+    async def snapshot(self):
+        await self._until(lambda: not self.syncing)  # one SYNC at a time
+        self.syncing = True
+        try:
+            await self._until(lambda: self.inflight == 0)
+            yield
+        finally:
+            self.syncing = False
+            self._wake()
+
+
+class _WriteScope:
+    __slots__ = ("_barrier",)
+
+    def __init__(self, barrier):
+        self._barrier = barrier
+
+    async def __aenter__(self):
+        barrier = self._barrier
+        if barrier.syncing:
+            await barrier._until(lambda: not barrier.syncing)
+        barrier.inflight += 1
+
+    async def __aexit__(self, *exc):
+        barrier = self._barrier
+        barrier.inflight -= 1
+        if barrier._waiters:
+            barrier._wake()
+
+
+replication_barrier = SyncBarrier()
 
 
 async def loop_latency_monitor(store):
@@ -162,15 +234,12 @@ def transaction_frames(forwards: list) -> list:
     return [[TX_BATCH, str(len(forwards))], *forwards]
 
 
-async def broadcast_to_replicas(forwards: list, label: str) -> None:
-    """Writes already-resolved commands to every follower; drops dead ones.
-
-    The payload goes into every follower's buffer first, then the followers are
-    waited for together, so a stalled one costs one write deadline, not one each,
-    and is dropped when it runs out (it re-syncs if it comes back).
-    """
+def enqueue_broadcast(forwards: list, label: str):
+    """Puts already-resolved commands into every follower's buffer, with no await,
+    so the order they are buffered in is the order the caller reached this line.
+    Returns what drain_broadcast needs, or None when there is nothing to send."""
     if not forwards:
-        return
+        return None
     console.print(
         f"[cyan]📡 [BROADCAST] Firing {label} down the slipstream to {len(connected_replicas)} followers...[/cyan]"
     )
@@ -184,7 +253,19 @@ async def broadcast_to_replicas(forwards: list, label: str) -> None:
             dead_replicas.append(rep_writer)
         else:
             waiting.append(rep_writer)
+    return waiting, dead_replicas
 
+
+async def drain_broadcast(queued) -> None:
+    """Waits for the followers enqueue_broadcast wrote to; drops dead ones.
+
+    The followers are waited for together, so a stalled one costs one write
+    deadline, not one each, and is dropped when it runs out (it re-syncs if it
+    comes back).
+    """
+    if queued is None:
+        return
+    waiting, dead_replicas = queued
     outcomes = await asyncio.gather(
         *(drain_within_deadline(rep_writer) for rep_writer in waiting),
         return_exceptions=True,
@@ -199,6 +280,11 @@ async def broadcast_to_replicas(forwards: list, label: str) -> None:
             console.print(
                 "[yellow]⚠️ [REPLICATION] Follower disconnected. Removed from Live Stream.[/yellow]"
             )
+
+
+async def broadcast_to_replicas(forwards: list, label: str) -> None:
+    """Writes already-resolved commands to every follower; drops dead ones."""
+    await drain_broadcast(enqueue_broadcast(forwards, label))
 
 
 async def wait_for_stream_data(session, block_ms: int, attempt):
@@ -733,9 +819,16 @@ class AsyncKedisSession:
 
         # Execute the payload as one unit: the engine lock is held across the whole
         # block, so nothing else runs in between and followers see the same order.
-        results, forwards = await asyncio.to_thread(
-            global_handler.execute_batch, self.tx_queue, self.writer
-        )
+        # The block is held in the followers' buffers before any SYNC can snapshot.
+        async with replication_barrier.write():
+            results, forwards = await asyncio.to_thread(
+                global_handler.execute_batch, self.tx_queue, self.writer
+            )
+            queued = (
+                enqueue_broadcast(transaction_frames(forwards), "EXEC")
+                if server_role == "master"
+                else None
+            )
 
         self._reset_queue()
         notify_stream_waiters()
@@ -748,8 +841,7 @@ class AsyncKedisSession:
         await self.send_parts(parts)
 
         # 📡 What the block changed goes to followers as one transaction.
-        if server_role == "master":
-            await broadcast_to_replicas(transaction_frames(forwards), "EXEC")
+        await drain_broadcast(queued)
 
     # -------------------------------------
     # ASYNC EVENT LOOP (MAIN)
@@ -861,26 +953,25 @@ class AsyncKedisSession:
                                 "[cyan]📦 [REPLICATION] Follower requested baseline. Dumping RAM...[/cyan]"
                             )
 
-                            # 🚀 FIX: Use the envelope serialization
-                            safe_state = global_store.get_snapshot_state()
-                            snapshot_json = json.dumps(safe_state)
-
-                            json_bytes = snapshot_json.encode("utf-8")
-
-                            header = b"A1\n"
-                            body = (
-                                f"S{len(json_bytes)}\n".encode("utf-8")
-                                + json_bytes
-                                + b"\n"
-                            )
-                            kesp_payload = header + body
-
-                            await self.send(kesp_payload)
+                            # The snapshot is taken under the engine lock and the follower is
+                            # registered in the same step, with no write in between: every
+                            # write is then in the snapshot or in the stream, once. The slow
+                            # part, sending the snapshot, happens after, outside the barrier.
+                            async with replication_barrier.snapshot():
+                                kesp_payload = await asyncio.to_thread(
+                                    global_handler.snapshot_bytes
+                                )
+                                self.writer.write(kesp_payload)
+                                connected_replicas.append(self.writer)
+                            try:
+                                await drain_within_deadline(self.writer)
+                            except BaseException:
+                                if self.writer in connected_replicas:
+                                    connected_replicas.remove(self.writer)
+                                raise
                             console.print(
                                 "[bold green]✅ [REPLICATION] Baseline snapshot transmitted![/bold green]"
                             )
-
-                            connected_replicas.append(self.writer)
                             console.print(
                                 f"[bold magenta]📡 [REPLICATION] Follower locked into Live Stream. Total replicas: {len(connected_replicas)}[/bold magenta]"
                             )
@@ -914,10 +1005,27 @@ class AsyncKedisSession:
                             pos += consumed
                             continue
 
+                        queued = None
+                        forwards = None
                         if cmd == "XREAD":
                             response, records = await blocking_xread(self, tokens), []
                         elif cmd == "XREADGROUP":
                             response, records = await blocking_xreadgroup(self, tokens)
+                        elif cmd in write_commands:
+                            # Applied and buffered for followers under the barrier, so a
+                            # SYNC cannot snapshot between the two (see SyncBarrier).
+                            async with replication_barrier.write():
+                                response, records = await asyncio.to_thread(
+                                    global_handler.execute_records, tokens, self.writer
+                                )
+                                forwards = (
+                                    global_handler.replication_payloads(
+                                        tokens, response, records
+                                    )
+                                    if server_role == "master"
+                                    else []
+                                )
+                                queued = enqueue_broadcast(forwards, cmd)
                         else:
                             response, records = await asyncio.to_thread(
                                 global_handler.execute_records, tokens, self.writer
@@ -931,12 +1039,14 @@ class AsyncKedisSession:
                         # XADD goes out with the ID this master assigned; group
                         # commands go out as the resolved records they produced
                         # (nothing at all if they changed nothing).
-                        forwards = (
-                            global_handler.replication_payloads(tokens, response, records)
-                            if server_role == "master" and cmd in write_commands
-                            else []
-                        )
-                        await broadcast_to_replicas(forwards, cmd)
+                        if forwards is None:  # XREAD / XREADGROUP: not under the barrier
+                            forwards = (
+                                global_handler.replication_payloads(tokens, response, records)
+                                if server_role == "master" and cmd in write_commands
+                                else []
+                            )
+                            queued = enqueue_broadcast(forwards, cmd)
+                        await drain_broadcast(queued)
 
                     # 🚀 FIX: Slicing for standard commands
                     pos += consumed

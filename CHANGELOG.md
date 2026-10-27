@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Replication
+- A follower that joins now gets every write exactly once. Before, a write made while its baseline was being sent could be lost, and a write applied just before the baseline could arrive twice (in the baseline and again down the stream), which corrupts lists, counters and the like.
+- The baseline is taken under the engine lock, so it can no longer be half of a `MULTI`/`EXEC` block or fail with a dictionary-changed error.
+- A follower whose baseline cannot be sent is dropped at once, not at the next write.
+- Known gap: `XREADGROUP` is not covered by this (see `docs/limits.md`).
+
 ## 0.3.0 — 2026-10-27
 
 ### Replication
