@@ -159,5 +159,4 @@ Streams are logged and replicated as **fully resolved records**: every ID, times
 * **Names:** group and consumer names must be printable ASCII with no spaces, because they are written to the whitespace-separated AOF. Stream *field and value text* has no such limit.
 * **Exact trimming only** (see above).
 * **Consumer idle time** (`idle`, `inactive` in `XINFO CONSUMERS`) only advances when a read creates the consumer or delivers it entries. Empty reads and `NOACK` reads don't count, which keeps replicas identical to the master.
-* **`MULTI`/`EXEC` is not replicated**, so stream commands run inside a transaction change the master only. This is an existing gap for every command, not specific to streams.
 * **Inside `MULTI`, queued commands are acknowledged with `+OK`**, not `+QUEUED` as in Redis.
