@@ -34,7 +34,7 @@ class UI:
         console.print(f"[{color}]╰{'─' * inner}╯[/{color}]", highlight=False)
 
     @staticmethod
-    def print_banner(version="0.3.1", codename="Echo", subtitle="DATABASE CLIENT"):
+    def print_banner(version="0.3.2", codename="Echo", subtitle="DATABASE CLIENT"):
         # Center the subtitle inside the box (17 spaces for a 15-char subtitle).
         pad = " " * ((BOX_WIDTH - 2 - len(subtitle)) // 2 + 1)
         lines = [""]

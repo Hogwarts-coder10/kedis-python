@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 — 2026-10-28
+
+Upgrade if you run followers and consumer groups: 0.3.1 can send a joining follower a group change twice or out of order, which can move its group cursor backwards.
 
 ### Replication
 - `XREADGROUP` is now covered by the exactly-once guarantee for a joining follower. Before, a group change could reach a follower twice (in its snapshot and again down the stream) or arrive after a later one, and because those records set absolute values, a late `XGLAST` could move the follower's group cursor backwards.
