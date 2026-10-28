@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.3.3 — 2026-10-28
+
+Followers now hear writes in the order the master applied them, and a cancelled write can no longer let a joining follower see it twice. Both are rare races, reproduced by tests and never seen under load. `rich` is now bounded to `<16`.
 
 ### Replication
 - A write whose connection is cancelled while its worker thread is still applying it (this happens at shutdown) now keeps the `SyncBarrier` until the thread has finished and the write is buffered for followers. Before, the barrier was released at once, so a `SYNC` could take its snapshot with the write half done and the follower could receive it twice. A client that merely hangs up mid-write was already handled correctly.
