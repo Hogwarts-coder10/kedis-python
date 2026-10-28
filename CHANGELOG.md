@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Replication
+- Followers now hear writes in the order the master applied them. Before, a worker thread that was slow to report back after applying its write (it had released the engine lock, but not yet told the event loop) could let a later write overtake it on the way to the followers, so a follower could end with a different value or list order than the master. Plain commands, `EXEC` blocks and `XREADGROUP` passes are all covered. This was never seen under load (no reordering in about 46,000 concurrent writes), but a test reproduces it.
+
 ## 0.3.2 — 2026-10-28
 
 Upgrade if you run followers and consumer groups: 0.3.1 can send a joining follower a group change twice or out of order, which can move its group cursor backwards.

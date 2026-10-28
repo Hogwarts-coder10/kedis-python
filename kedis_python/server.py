@@ -3,6 +3,7 @@ import contextlib
 import json
 import signal
 import sys
+import threading
 import time
 
 from rich.console import Console
@@ -128,6 +129,41 @@ class _WriteScope:
 
 
 replication_barrier = SyncBarrier()
+
+
+# Taken, in a worker thread, around "apply a write, then hand it to the event loop to
+# buffer for followers". Writes are applied one at a time under the engine lock, but
+# a thread can be slow to report back once it has applied its write, and a later
+# write could then overtake it on the way to the followers. Scheduling the buffering
+# from inside this lock puts it on the loop in the order the writes were applied
+# (the loop runs what it is handed first in, first out). Always taken before the
+# engine lock, never after.
+_write_order = threading.Lock()
+
+
+async def apply_in_order(run, frames_of, label: str):
+    """Runs `run()` (a write) in a worker thread and returns (its result, queued),
+    where `queued` is what drain_broadcast needs for the frames `frames_of(result)`
+    produced, already in the followers' buffers: the buffering is scheduled onto the
+    loop from inside the write-order lock, so it runs before this coroutine resumes
+    and in the order the writes were applied. `queued` is None when there was
+    nothing to forward (or this node is not a master)."""
+    loop = asyncio.get_running_loop()
+    queued: list = []
+
+    def work():
+        with _write_order:
+            out = run()
+            if server_role == "master":
+                frames = frames_of(out)
+                if frames:
+                    loop.call_soon_threadsafe(
+                        lambda: queued.append(enqueue_broadcast(frames, label))
+                    )
+            return out
+
+    out = await asyncio.to_thread(work)
+    return out, (queued[0] if queued else None)
 
 
 async def loop_latency_monitor(store):
@@ -298,14 +334,14 @@ async def run_attempt(attempt, forward: bool):
     if not forward:
         return await asyncio.to_thread(attempt)
     async with replication_barrier.write():
-        reply, records = await asyncio.to_thread(attempt)
-        queued = (
-            enqueue_broadcast(
-                global_handler.replication_payloads(["XREADGROUP"], None, records),
-                "XREADGROUP",
-            )
-            if records and server_role == "master"
-            else None
+        (reply, records), queued = await apply_in_order(
+            attempt,
+            lambda out: (
+                global_handler.replication_payloads(["XREADGROUP"], None, out[1])
+                if out[1]
+                else []
+            ),
+            "XREADGROUP",
         )
     await drain_broadcast(queued)
     return reply, records
@@ -839,13 +875,10 @@ class AsyncKedisSession:
         # block, so nothing else runs in between and followers see the same order.
         # The block is held in the followers' buffers before any SYNC can snapshot.
         async with replication_barrier.write():
-            results, forwards = await asyncio.to_thread(
-                global_handler.execute_batch, self.tx_queue, self.writer
-            )
-            queued = (
-                enqueue_broadcast(transaction_frames(forwards), "EXEC")
-                if server_role == "master"
-                else None
+            (results, forwards), queued = await apply_in_order(
+                lambda: global_handler.execute_batch(self.tx_queue, self.writer),
+                lambda out: transaction_frames(out[1]),
+                "EXEC",
             )
 
         self._reset_queue()
@@ -1033,17 +1066,16 @@ class AsyncKedisSession:
                             # Applied and buffered for followers under the barrier, so a
                             # SYNC cannot snapshot between the two (see SyncBarrier).
                             async with replication_barrier.write():
-                                response, records = await asyncio.to_thread(
-                                    global_handler.execute_records, tokens, self.writer
+                                (response, records), queued = await apply_in_order(
+                                    lambda: global_handler.execute_records(
+                                        tokens, self.writer
+                                    ),
+                                    lambda out: global_handler.replication_payloads(
+                                        tokens, out[0], out[1]
+                                    ),
+                                    cmd,
                                 )
-                                forwards = (
-                                    global_handler.replication_payloads(
-                                        tokens, response, records
-                                    )
-                                    if server_role == "master"
-                                    else []
-                                )
-                                queued = enqueue_broadcast(forwards, cmd)
+                                forwards = []  # handled: see apply_in_order
                         else:
                             response, records = await asyncio.to_thread(
                                 global_handler.execute_records, tokens, self.writer

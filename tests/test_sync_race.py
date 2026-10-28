@@ -517,3 +517,127 @@ def test_a_group_read_drops_a_follower_that_cannot_be_written_to(srv):
         assert srv.connected_replicas == []  # ...and dropped when it could not take them
 
     assert serve(srv, scenario) == []
+
+
+# --- the order followers hear writes in ----------------------------------------------------------
+
+
+class RecordingFollower:
+    def __init__(self):
+        self.buf = bytearray()
+
+    def write(self, data):
+        self.buf.extend(data)
+
+    async def drain(self):
+        pass
+
+    def commands(self):
+        data, out = bytes(self.buf), []
+        while data:
+            tokens, used = CommandParser.parse(data)
+            if not tokens:
+                break
+            out.append(tokens)
+            data = data[used:]
+        return out
+
+
+def test_followers_hear_writes_in_the_order_they_were_applied(srv, monkeypatch):
+    follower = RecordingFollower()
+    srv.connected_replicas.append(follower)
+
+    async def scenario(connect, errors):
+        go = asyncio.Event()
+        calls = []
+        real_to_thread = asyncio.to_thread
+
+        async def slow_first(fn, *a, **k):
+            calls.append(1)
+            first = len(calls) == 1
+            out = await real_to_thread(fn, *a, **k)  # the write is applied by now
+            if first:
+                await go.wait()  # ...but its report back to the event loop is late
+            return out
+
+        monkeypatch.setattr(asyncio, "to_thread", slow_first)
+
+        slow, fast = await connect(), await connect()
+        first = asyncio.create_task(slow.call("RPUSH", "l", "a"))
+        while not calls:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.2)  # a is applied
+        await fast.call("RPUSH", "l", "b")  # applied after a; reports back first
+        go.set()
+        await first
+        assert srv.global_store.get("l") is not None
+        heard = [c[2] for c in follower.commands() if c[:2] == ["RPUSH", "l"]]
+        assert heard == ["a", "b"], f"master applied a then b; follower heard {heard}"
+
+    assert serve(srv, scenario) == []
+
+
+def test_a_write_that_stalls_after_applying_is_not_overtaken(srv, monkeypatch):
+    follower = RecordingFollower()
+    srv.connected_replicas.append(follower)
+
+    async def scenario(connect, errors):
+        applied, release = threading.Event(), threading.Event()
+        real = srv.global_handler.execute_records
+
+        def held(tokens, sock=None):
+            out = real(tokens, sock)
+            if tokens[:3] == ["RPUSH", "l", "a"]:
+                applied.set()  # applied; this thread now stalls before reporting back
+                release.wait(10)
+            return out
+
+        monkeypatch.setattr(srv.global_handler, "execute_records", held)
+
+        slow, fast = await connect(), await connect()
+        first = asyncio.create_task(slow.call("RPUSH", "l", "a"))
+        while not applied.is_set():
+            await asyncio.sleep(0.01)
+        second = asyncio.create_task(fast.call("RPUSH", "l", "b"))
+        await asyncio.sleep(0.3)  # b gets as far as it can while a is stalled
+        release.set()
+        await asyncio.gather(first, second)
+        heard = [c[2] for c in follower.commands() if c[:2] == ["RPUSH", "l"]]
+        assert heard == ["a", "b"], f"master applied a then b; follower heard {heard}"
+
+    assert serve(srv, scenario) == []
+
+
+def test_a_block_is_heard_in_the_order_it_was_applied(srv, monkeypatch):
+    follower = RecordingFollower()
+    srv.connected_replicas.append(follower)
+
+    async def scenario(connect, errors):
+        go = asyncio.Event()
+        calls = []
+        real_to_thread = asyncio.to_thread
+
+        async def slow_first(fn, *a, **k):
+            calls.append(1)
+            first = len(calls) == 1
+            out = await real_to_thread(fn, *a, **k)
+            if first:
+                await go.wait()
+            return out
+
+        monkeypatch.setattr(asyncio, "to_thread", slow_first)
+
+        slow, fast = await connect(), await connect()
+        await slow.call("MULTI")
+        await slow.call("RPUSH", "l", "a")
+        first = asyncio.create_task(slow.call("EXEC"))  # the first thing to use a worker thread
+        while not calls:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.2)
+        await fast.call("RPUSH", "l", "b")
+        go.set()
+        await first
+        heard = [c[2] for c in follower.commands() if c[:2] == ["RPUSH", "l"]]
+        assert heard == ["a", "b"], f"master applied a then b; follower heard {heard}"
+
+    assert serve(srv, scenario) == []
