@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 — 2026-10-28
+
+Upgrade if you run followers: 0.3.0 can lose a write, or deliver one twice, to a follower that joins while the master is taking writes.
 
 ### Replication
 - A follower that joins now gets every write exactly once. Before, a write made while its baseline was being sent could be lost, and a write applied just before the baseline could arrive twice (in the baseline and again down the stream), which corrupts lists, counters and the like.
