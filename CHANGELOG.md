@@ -3,7 +3,11 @@
 ## Unreleased
 
 ### Replication
+- A write whose connection is cancelled while its worker thread is still applying it (this happens at shutdown) now keeps the `SyncBarrier` until the thread has finished and the write is buffered for followers. Before, the barrier was released at once, so a `SYNC` could take its snapshot with the write half done and the follower could receive it twice. A client that merely hangs up mid-write was already handled correctly.
 - Followers now hear writes in the order the master applied them. Before, a worker thread that was slow to report back after applying its write (it had released the engine lock, but not yet told the event loop) could let a later write overtake it on the way to the followers, so a follower could end with a different value or list order than the master. Plain commands, `EXEC` blocks and `XREADGROUP` passes are all covered. This was never seen under load (no reordering in about 46,000 concurrent writes), but a test reproduces it.
+
+### Packaging
+- `rich` is now limited to `>=14,<16` and `pyfiglet` to `>=1,<2` in `pyproject.toml`, matching `requirements.txt` (which said `rich<15` while installs got `rich` 15). The test suite passes on `rich` 14.3.4 and 15.0.0. A test keeps the two files in step.
 
 ## 0.3.2 — 2026-10-28
 

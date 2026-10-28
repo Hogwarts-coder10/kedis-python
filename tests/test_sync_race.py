@@ -641,3 +641,77 @@ def test_a_block_is_heard_in_the_order_it_was_applied(srv, monkeypatch):
         assert heard == ["a", "b"], f"master applied a then b; follower heard {heard}"
 
     assert serve(srv, scenario) == []
+
+
+# --- a client that goes away in the middle of a write ----------------------------------------------
+
+
+def handler_tasks():
+    return [
+        t for t in asyncio.all_tasks()
+        if getattr(t.get_coro(), "__name__", "") == "handle_connection"
+    ]
+
+
+def stalled_write(srv, monkeypatch, key="l", value="a"):
+    """Makes the first write to `key` stall in its worker thread after applying."""
+    applied, release = threading.Event(), threading.Event()
+    real = srv.global_handler.execute_records
+
+    def held(tokens, sock=None):
+        out = real(tokens, sock)
+        if tokens[:3] == ["RPUSH", key, value]:
+            applied.set()
+            release.wait(10)
+        return out
+
+    monkeypatch.setattr(srv.global_handler, "execute_records", held)
+    return applied, release
+
+
+def test_a_client_that_hangs_up_mid_write_still_has_its_write_sent_once(srv, monkeypatch):
+    follower = RecordingFollower()
+    srv.connected_replicas.append(follower)
+    applied, release = stalled_write(srv, monkeypatch)
+
+    async def scenario(connect, errors):
+        c = await connect()
+        c.w.write(b"A3\nS5\nRPUSH\nS1\nl\nS1\na\n")
+        await c.w.drain()
+        while not applied.is_set():
+            await asyncio.sleep(0.01)
+        c.close()  # gone before it can be answered
+        await asyncio.sleep(0.2)
+        release.set()
+        await asyncio.sleep(0.5)
+        heard = [x[2] for x in follower.commands() if x[:2] == ["RPUSH", "l"]]
+        assert heard == ["a"]
+        assert srv.global_store.get("l") is not None
+        assert srv.replication_barrier.inflight == 0
+
+    assert serve(srv, scenario) == []
+
+
+def test_a_cancelled_handler_keeps_the_barrier_until_its_write_is_done(srv, monkeypatch):
+    follower = RecordingFollower()
+    srv.connected_replicas.append(follower)
+    applied, release = stalled_write(srv, monkeypatch)
+
+    async def scenario(connect, errors):
+        c = await connect()
+        c.w.write(b"A3\nS5\nRPUSH\nS1\nl\nS1\na\n")
+        await c.w.drain()
+        while not applied.is_set():
+            await asyncio.sleep(0.01)
+        for t in handler_tasks():
+            t.cancel()  # the server task dies while the worker thread is still mid-write
+        await asyncio.sleep(0.3)
+        # the thread is still applying: a SYNC must not be able to run yet
+        assert srv.replication_barrier.inflight == 1
+        release.set()
+        await asyncio.sleep(0.5)
+        heard = [x[2] for x in follower.commands() if x[:2] == ["RPUSH", "l"]]
+        assert heard == ["a"]  # applied, so every follower hears it
+        assert srv.replication_barrier.inflight == 0
+
+    serve(srv, scenario)

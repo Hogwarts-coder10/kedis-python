@@ -162,7 +162,18 @@ async def apply_in_order(run, frames_of, label: str):
                     )
             return out
 
-    out = await asyncio.to_thread(work)
+    work_task = asyncio.ensure_future(asyncio.to_thread(work))
+    try:
+        out = await asyncio.shield(work_task)
+    except asyncio.CancelledError:
+        # The worker thread cannot be stopped, and the barrier is released as this
+        # coroutine unwinds. Hold it until the thread has applied its write and the
+        # loop has buffered it for followers, so a SYNC cannot see it half done.
+        if not work_task.done():
+            await asyncio.wait({work_task})
+        if not work_task.cancelled():
+            work_task.exception()  # retrieved here; the caller is being cancelled
+        raise
     return out, (queued[0] if queued else None)
 
 
