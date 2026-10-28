@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Replication
+- `XREADGROUP` is now covered by the exactly-once guarantee for a joining follower. Before, a group change could reach a follower twice (in its snapshot and again down the stream) or arrive after a later one, and because those records set absolute values, a late `XGLAST` could move the follower's group cursor backwards.
+- A blocked `XREADGROUP` sends its group changes to followers as each pass makes them. Before, they were held back until the read ended, so a consumer registered by a read blocked with `BLOCK 0` was invisible to followers for as long as it stayed blocked.
+- Removed the known gap about `XREADGROUP` from `docs/limits.md`.
+
 ## 0.3.1 — 2026-10-28
 
 Upgrade if you run followers: 0.3.0 can lose a write, or deliver one twice, to a follower that joins while the master is taking writes.

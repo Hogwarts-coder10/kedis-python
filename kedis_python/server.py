@@ -287,21 +287,44 @@ async def broadcast_to_replicas(forwards: list, label: str) -> None:
     await drain_broadcast(enqueue_broadcast(forwards, label))
 
 
-async def wait_for_stream_data(session, block_ms: int, attempt):
+async def run_attempt(attempt, forward: bool):
+    """One pass of a read, in a worker thread. Returns (reply, records).
+
+    With `forward`, a pass that changed a group is applied and put in the
+    followers' buffers under the SyncBarrier, like any other write, so a SYNC
+    cannot fall between the two halves; and it reaches followers now, not when a
+    blocked read finally ends. The barrier is held for this one pass, never for
+    the wait between passes."""
+    if not forward:
+        return await asyncio.to_thread(attempt)
+    async with replication_barrier.write():
+        reply, records = await asyncio.to_thread(attempt)
+        queued = (
+            enqueue_broadcast(
+                global_handler.replication_payloads(["XREADGROUP"], None, records),
+                "XREADGROUP",
+            )
+            if records and server_role == "master"
+            else None
+        )
+    await drain_broadcast(queued)
+    return reply, records
+
+
+async def wait_for_stream_data(session, block_ms: int, attempt, forward: bool = False):
     """The wait loop shared by XREAD and XREADGROUP.
 
     `attempt` is a synchronous callable, run in a worker thread, that returns
     (reply, records). A reply of None means "nothing yet": park until a writer
     wakes us (or the deadline passes) and try again. Anything else, including
-    an error string, is final. Returns (reply, records); reply is None on
-    timeout.
+    an error string, is final. Returns (reply, []); reply is None on timeout.
 
-    Records from every attempt are kept, not just the last: the first pass of
-    an XREADGROUP registers its consumer even when nothing is delivered, and
-    that change has to reach replicas whatever happens next."""
+    With `forward` (XREADGROUP), the group changes of every pass are sent on as
+    they happen (see run_attempt): the first pass registers its consumer even
+    when nothing is delivered, and that change has to reach replicas whatever
+    happens next. Nothing is left to forward when the read ends."""
     loop = asyncio.get_running_loop()
     deadline = None if block_ms == 0 else loop.time() + block_ms / 1000
-    carried: list = []
 
     while True:
         # Register BEFORE reading: a write landing between the read and the
@@ -310,27 +333,19 @@ async def wait_for_stream_data(session, block_ms: int, attempt):
         stream_waiters.add(wake)
         try:
             try:
-                reply, records = await asyncio.to_thread(attempt)
+                reply, _ = await run_attempt(attempt, forward)
             except (StreamError, TypeError) as e:
-                return global_handler.error_reply(e), carried
-            carried.extend(records)
+                return global_handler.error_reply(e), []
             if reply is not None:
-                return reply, carried
+                return reply, []
             while True:
                 if session.reader.at_eof() or session.writer.is_closing():
-                    # Nobody will get a reply, but the group changes made so
-                    # far (a new consumer, say) are real: send them on.
-                    if server_role == "master":
-                        await broadcast_to_replicas(
-                            global_handler.replication_payloads(
-                                ["XREADGROUP"], None, carried
-                            ),
-                            "XREADGROUP",
-                        )
+                    # Nobody will get a reply; any group change a pass made has
+                    # already gone to the followers.
                     raise ConnectionResetError("client left while blocked")
                 remaining = None if deadline is None else deadline - loop.time()
                 if remaining is not None and remaining <= 0:
-                    return None, carried  # timed out: nil, like Redis
+                    return None, []  # timed out: nil, like Redis
                 step = _BLOCK_POLL if remaining is None else min(_BLOCK_POLL, remaining)
                 try:
                     await asyncio.wait_for(asyncio.shield(wake), step)
@@ -367,9 +382,10 @@ async def blocking_xread(session, tokens: list):
 
 
 async def blocking_xreadgroup(session, tokens: list):
-    """Runs XREADGROUP; honours BLOCK. Returns (reply, records): the records
-    are the group changes the read made, to be forwarded to replicas. A read of
-    a consumer's own history (an explicit ID) always answers at once."""
+    """Runs XREADGROUP; honours BLOCK. Returns (reply, []): the group changes
+    the read made have already been sent to the followers, pass by pass (see
+    run_attempt). A read of a consumer's own history (an explicit ID) always
+    answers at once."""
     try:
         group, consumer, count, block_ms, noack, streams = (
             global_handler.parse_xreadgroup(tokens)
@@ -377,15 +393,17 @@ async def blocking_xreadgroup(session, tokens: list):
     except StreamError:
         block_ms = None
     if block_ms is None:  # no BLOCK (or a syntax error the handler will report)
-        return await asyncio.to_thread(
-            global_handler.execute_records, tokens, session.writer
+        reply, _ = await run_attempt(
+            lambda: global_handler.execute_records(tokens, session.writer), True
         )
+        return reply, []
     return await wait_for_stream_data(
         session,
         block_ms,
         lambda: global_handler.xreadgroup_attempt(
             group, consumer, streams, count, noack
         ),
+        forward=True,
     )
 
 

@@ -358,3 +358,162 @@ def test_a_snapshot_that_cannot_be_sent_unregisters_the_follower_at_once(srv, mo
         stalled.close()
 
     serve(srv, scenario)
+
+
+# --- consumer groups: XREADGROUP is under the barrier too ----------------------------------------
+
+
+def group_frames(stream):
+    return [c for c in stream if c[0] == "XGAPPLY"]
+
+
+async def make_group(w, start):
+    await w.call("XGROUP", "CREATE", "s", "g", start, "MKSTREAM")
+
+
+def test_a_read_applied_before_the_snapshot_is_not_forwarded_again(srv, monkeypatch):
+    async def scenario(connect, errors):
+        applied, release = threading.Event(), threading.Event()
+        real = srv.global_handler.execute_records
+
+        def held(tokens, sock=None):
+            out = real(tokens, sock)
+            if tokens[0] == "XREADGROUP":  # applied; not yet on its way to followers
+                applied.set()
+                release.wait(10)
+            return out
+
+        monkeypatch.setattr(srv.global_handler, "execute_records", held)
+
+        w = await connect()
+        await make_group(w, "0")
+        await w.call("XADD", "s", "1-0", "k", "v")
+        pending = asyncio.create_task(
+            w.call("XREADGROUP", "GROUP", "g", "c", "COUNT", "1", "STREAMS", "s", ">")
+        )
+        while not applied.is_set():
+            await asyncio.sleep(0.01)
+        f = await start_sync(connect)
+        await asyncio.sleep(0.4)
+        release.set()
+        await read_snapshot(f)
+        await pending
+        stream = await read_stream(f)
+        assert group_frames(stream) == []  # the snapshot already holds the delivery
+
+    assert serve(srv, scenario) == []
+
+
+def test_a_blocking_read_applied_before_the_snapshot_is_not_forwarded_again(srv, monkeypatch):
+    async def scenario(connect, errors):
+        applied, release = threading.Event(), threading.Event()
+        real = srv.global_handler.xreadgroup_attempt
+
+        def held(*a, **k):
+            out = real(*a, **k)
+            if out[1]:  # an attempt that changed a group
+                applied.set()
+                release.wait(10)
+            return out
+
+        monkeypatch.setattr(srv.global_handler, "xreadgroup_attempt", held)
+
+        w = await connect()
+        await make_group(w, "0")
+        await w.call("XADD", "s", "1-0", "k", "v")
+        pending = asyncio.create_task(
+            w.call("XREADGROUP", "GROUP", "g", "c", "BLOCK", "2000", "STREAMS", "s", ">")
+        )
+        while not applied.is_set():
+            await asyncio.sleep(0.01)
+        f = await start_sync(connect)
+        await asyncio.sleep(0.4)
+        release.set()
+        await read_snapshot(f)
+        await pending
+        stream = await read_stream(f)
+        assert group_frames(stream) == []
+
+    assert serve(srv, scenario) == []
+
+
+def test_a_blocked_reads_new_consumer_reaches_followers_while_it_waits(srv):
+    async def scenario(connect, errors):
+        w = await connect()
+        await make_group(w, "$")
+        f = await start_sync(connect)
+        await read_snapshot(f)
+        blocked = asyncio.create_task(  # nothing to read: parks for 5 s
+            w.call("XREADGROUP", "GROUP", "g", "c", "BLOCK", "5000", "STREAMS", "s", ">")
+        )
+        stream = await read_stream(f, settle=1.0)
+        kinds = [c[1] for c in group_frames(stream)]
+        assert "XGCONS" in kinds  # not held back until the read ends
+        assert not blocked.done()
+        blocked.cancel()
+
+    serve(srv, scenario)
+
+
+def test_a_late_read_cannot_move_a_followers_group_cursor_backwards(srv, monkeypatch):
+    async def scenario(connect, errors):
+        applied, release = threading.Event(), threading.Event()
+        real = srv.global_handler.execute_records
+
+        def held(tokens, sock=None):
+            out = real(tokens, sock)
+            if tokens[0] == "XREADGROUP" and tokens[3] == "c1":
+                applied.set()  # c1 holds 1-0; its records are not yet forwarded
+                release.wait(10)
+            return out
+
+        monkeypatch.setattr(srv.global_handler, "execute_records", held)
+
+        a, b = await connect(), await connect()
+        await make_group(a, "0")
+        await a.call("XADD", "s", "1-0", "k", "v")
+        await a.call("XADD", "s", "2-0", "k", "v")
+        slow = asyncio.create_task(
+            a.call("XREADGROUP", "GROUP", "g", "c1", "COUNT", "1", "STREAMS", "s", ">")
+        )
+        while not applied.is_set():
+            await asyncio.sleep(0.01)
+        got = await b.call("XREADGROUP", "GROUP", "g", "c2", "COUNT", "1", "STREAMS", "s", ">")
+        assert got[0][1][0][0] == "2-0"  # the group cursor is now 2-0
+        f = await start_sync(connect)
+        await asyncio.sleep(0.4)
+        release.set()
+        await read_snapshot(f)
+        await slow
+        stream = await read_stream(f)
+        cursors = [c[-1] for c in group_frames(stream) if c[1] == "XGLAST"]
+        assert "1-0" not in cursors  # the snapshot's 2-0 must not be rolled back to 1-0
+
+    assert serve(srv, scenario) == []
+
+
+class DeadFollower:
+    def __init__(self):
+        self.buf = bytearray()
+
+    def write(self, data):
+        self.buf.extend(data)
+
+    async def drain(self):
+        raise ConnectionResetError("gone")
+
+
+def test_a_group_read_drops_a_follower_that_cannot_be_written_to(srv):
+    dead = DeadFollower()
+
+    async def scenario(connect, errors):
+        w = await connect()
+        await make_group(w, "0")
+        await w.call("XADD", "s", "1-0", "k", "v")
+        srv.connected_replicas.append(dead)  # only the read below can meet it
+        got = await w.call("XREADGROUP", "GROUP", "g", "c", "COUNT", "1", "STREAMS", "s", ">")
+        assert got[0][1][0][0] == "1-0"  # the reader is answered whatever happens to followers
+        assert dead.buf  # the follower was sent the group changes...
+        assert srv.connected_replicas == []  # ...and dropped when it could not take them
+
+    assert serve(srv, scenario) == []
